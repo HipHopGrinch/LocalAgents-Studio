@@ -1039,14 +1039,17 @@ export function findLeadArchitect(
     return { model, speed, score: vram * 50 + speed + roleBonus };
   };
 
+  const frontierPlanners = online.filter(n => isFrontierNode(n) && (nodeHasExplicitRole(n, 'planner') || !!n.apiKey));
   const pool =
-    explicitPlanners.length > 0
-      ? explicitPlanners
-      : highVram.length > 0
-        ? highVram
-        : local.length > 0
-          ? local
-          : online;
+    frontierPlanners.length > 0
+      ? frontierPlanners
+      : explicitPlanners.length > 0
+        ? explicitPlanners
+        : highVram.length > 0
+          ? highVram
+          : local.length > 0
+            ? local
+            : online;
   if (!pool.length) return null;
 
   let best = pool[0];

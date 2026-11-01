@@ -483,6 +483,50 @@ export function applyEdits(original: string, body: string): EditResult {
 // Prompt construction
 // ==========================================
 
+
+export function isSmallModel(modelName?: string): boolean {
+  if (!modelName) return false;
+  const m = modelName.toLowerCase();
+  if (/gemini|gpt-4|claude|grok/i.test(m)) return false;
+  const match = m.match(/(\d+(?:\.\d+)?)\s*b\b/);
+  if (match) {
+    const b = parseFloat(match[1]);
+    return b <= 14;
+  }
+  return /gemma|qwen|phi|llama|deepseek|tiny|mini|smollm/i.test(m);
+}
+
+export const SMALL_MODEL_TOOL_PROTOCOL = `## Workspace Tools
+You are an autonomous AI coding assistant. Whenever asked to build, write, edit, or test code, you MUST invoke tools.
+Do NOT just print conversational markdown code blocks. Take direct action using tool tags!
+
+### Create/Overwrite:
+<write_file path="relative/path/filename.ext">
+exact complete file content
+</write_file>
+
+### Edit existing file:
+<edit_file path="relative/path/filename.ext">
+<<<<<<< SEARCH
+exact original lines
+=======
+new replacement lines
+>>>>>>> REPLACE
+</edit_file>
+
+### Run commands or tests:
+<run_command>
+powershell command here
+</run_command>
+
+### Read/Search:
+<read_file path="file.ext"/>
+<list_dir path="."/>
+<search query="keyword"/>
+
+Rule: State your action in 1 short sentence, emit the tags, and stop.
+`;
+
 export const TOOL_PROTOCOL = `## Autonomous Workspace Tools & Protocol
 You are paired with a developer in an autonomous local IDE. You have direct filesystem access through tool tags.
 Whenever asked to build, create, modify, or run code, you MUST invoke the appropriate tool tags directly. Do NOT just print conversational markdown code blocks or describe what to do—take immediate action by emitting the tool tags!
@@ -643,9 +687,14 @@ export function buildSystemPrompt(
     }
   } else {
     if (agent.toolsEnabled) {
-      parts.push(TOOL_PROTOCOL);
-      parts.push(DELIVERY_POLICY);
-      parts.push(TOOLCHAIN_PLAYBOOK);
+      const isSmall = isSmallModel(agent.model);
+      if (isSmall) {
+        parts.push(SMALL_MODEL_TOOL_PROTOCOL);
+      } else {
+        parts.push(TOOL_PROTOCOL);
+        parts.push(DELIVERY_POLICY);
+        parts.push(TOOLCHAIN_PLAYBOOK);
+      }
     }
     if (opts?.approvedPlan) parts.push(formatApprovedPlanContext(opts.approvedPlan));
   }

@@ -283,8 +283,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const [autoApplyWrites, setAutoApplyWrites] = useState<boolean>(currentAgent.autoApproveWrites ?? true);
   const autoApplyWritesRef = useRef(currentAgent.autoApproveWrites ?? true);
   /** After each coding step: Reviewer runs; ON = auto Send to Planner→Coder / continue, OFF = wait for user */
-  const [autoReview, setAutoReview] = useState(true);
-  const autoReviewRef = useRef(true);
+  const [autoReview, setAutoReview] = useState(false);
+  const autoReviewRef = useRef(false);
   /** Resume depth when user approval is required after a post-step review */
   const pendingReviewResumeRef = useRef<{ depth: number; previousTask: string } | null>(null);
 
@@ -3799,7 +3799,8 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         approvedPlan: approvedPlanRef.current
       });
     }
-    if (!stopRequestedRef.current) await reviewAndAdvance(0);
+    // Auto-review only when explicitly requested by user
+    if (!stopRequestedRef.current && autoReviewRef.current) await reviewAndAdvance(0);
   };
 
   const handleStop = () => {

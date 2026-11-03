@@ -648,17 +648,22 @@ export type LiveSessionNode = NodeConfig & {
   error?: string;
 };
 
-/** Shared session published by the desktop window for web console clients. */
+/** Shared session published by any Studio surface (desktop or web console). */
 export interface LiveStudioSession {
   updatedAt: number;
   workspacePath: string;
   activeConversationId?: string | null;
   selectedAgentId?: string;
-  /** Full cluster mirror from the desktop window (status + models). */
+  /** Full cluster mirror — typically published by the desktop window. */
   nodes: LiveSessionNode[];
-  /** Bumps when project chats are saved so remotes reload the thread. */
+  /** Bumps when project chats are saved so peers reload the thread from disk. */
   chatsRevision?: number;
+  /** Open editor focus mirrored across clients. */
+  activeTabPath?: string | null;
+  openTabPaths?: string[];
   source?: string;
+  /** Stable per-window id so a client ignores its own echo. */
+  clientId?: string | null;
 }
 
 export type AppUpdateState =

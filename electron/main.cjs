@@ -224,18 +224,22 @@ let liveSession = {
   selectedAgentId: 'coder',
   nodes: [],
   chatsRevision: 0,
-  source: 'none'
+  activeTabPath: null,
+  openTabPaths: [],
+  source: 'none',
+  clientId: null
 };
 
 ipcMain.handle('session:get', () => ({ ...liveSession }));
 
 ipcMain.handle('session:publish', (_e, snapshot = {}) => {
   try {
+    // Remotes may omit nodes (desktop owns cluster status); never wipe with a non-array.
     const nodes = Array.isArray(snapshot.nodes) ? snapshot.nodes : liveSession.nodes;
-    const chatsRevision =
-      typeof snapshot.chatsRevision === 'number'
-        ? snapshot.chatsRevision
-        : liveSession.chatsRevision || 0;
+    const incomingRev =
+      typeof snapshot.chatsRevision === 'number' ? snapshot.chatsRevision : liveSession.chatsRevision || 0;
+    // Monotonic — a stale client must not roll chatsRevision backwards.
+    const chatsRevision = Math.max(incomingRev, liveSession.chatsRevision || 0);
     liveSession = {
       updatedAt: Date.now(),
       workspacePath:
@@ -247,9 +251,27 @@ ipcMain.handle('session:publish', (_e, snapshot = {}) => {
       selectedAgentId: snapshot.selectedAgentId || liveSession.selectedAgentId || 'coder',
       nodes,
       chatsRevision,
-      source: snapshot.source || 'renderer'
+      activeTabPath:
+        snapshot.activeTabPath !== undefined ? snapshot.activeTabPath : liveSession.activeTabPath || null,
+      openTabPaths: Array.isArray(snapshot.openTabPaths)
+        ? snapshot.openTabPaths
+        : liveSession.openTabPaths || [],
+      source: snapshot.source || 'renderer',
+      clientId: snapshot.clientId || liveSession.clientId || null
     };
     send('session:changed', { ...liveSession });
+    // Avoid flooding studio.log on rapid node/tab publishes — sample meaningfully.
+    if (
+      snapshot.chatsRevision !== undefined ||
+      snapshot.workspacePath !== undefined ||
+      snapshot.activeConversationId !== undefined ||
+      snapshot.activeTabPath !== undefined
+    ) {
+      appendLog(
+        'info',
+        `session:publish ${liveSession.source || '?'} client=${String(liveSession.clientId || '').slice(0, 12)} ws=${liveSession.workspacePath || '(none)'} chat=${liveSession.activeConversationId || '(none)'} rev=${liveSession.chatsRevision} tab=${liveSession.activeTabPath || '(none)'}`
+      );
+    }
     return { success: true, updatedAt: liveSession.updatedAt };
   } catch (err) {
     return { error: err.message || 'publish failed' };
@@ -277,7 +299,10 @@ async function ensureLiveSessionSeeded() {
       selectedAgentId: liveSession.selectedAgentId || 'coder',
       nodes,
       chatsRevision: liveSession.chatsRevision || 0,
-      source: 'seed'
+      activeTabPath: liveSession.activeTabPath || null,
+      openTabPaths: liveSession.openTabPaths || [],
+      source: 'seed',
+      clientId: null
     };
     send('session:changed', { ...liveSession });
   } catch (err) {

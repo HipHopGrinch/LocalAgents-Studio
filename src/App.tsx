@@ -142,11 +142,17 @@ export const App: React.FC = () => {
   const [uiScale, setUiScale] = useState<number>(DEFAULT_SETTINGS.uiScale || 1.0);
   const [appVersion, setAppVersion] = useState<string>('');
   const isRemoteClient = isWebConsoleClient();
+  const sessionClientIdRef = useRef(
+    `la-${isRemoteClient ? 'web' : 'desk'}-${Math.random().toString(36).slice(2, 10)}`
+  );
   const sessionAppliedAtRef = useRef(0);
   const chatsRevisionRef = useRef(0);
   const workspacePathRef = useRef(workspacePath);
   workspacePathRef.current = workspacePath;
+  const activeTabPathRef = useRef<string | undefined>(undefined);
+  const applyingRemoteRef = useRef(false);
   const publishTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const chatsBumpTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [projectPicker, setProjectPicker] = useState<{
     open: boolean;
     mode: 'open' | 'new';
@@ -154,11 +160,14 @@ export const App: React.FC = () => {
   const [remoteLive, setRemoteLive] = useState(false);
   const [chatsTick, setChatsTick] = useState(0);
 
+  /** Bump after local chat writes so every peer reloads from disk. */
   const markChatsSaved = useCallback(() => {
-    if (isRemoteClient) return;
-    chatsRevisionRef.current += 1;
-    setChatsTick(t => t + 1);
-  }, [isRemoteClient]);
+    if (chatsBumpTimerRef.current) clearTimeout(chatsBumpTimerRef.current);
+    chatsBumpTimerRef.current = setTimeout(() => {
+      chatsRevisionRef.current += 1;
+      setChatsTick(t => t + 1);
+    }, 120);
+  }, []);
 
   const toLiveSessionNodes = useCallback((list: EndpointNode[]): LiveSessionNode[] => {
     return list.map(n => ({
@@ -199,32 +208,41 @@ export const App: React.FC = () => {
 
   const applyLiveSession = useCallback((session: LiveStudioSession) => {
     if (!session || !session.updatedAt) return;
-    if (session.updatedAt < sessionAppliedAtRef.current) return;
+    // Ignore our own echo and stale snapshots.
+    if (session.clientId && session.clientId === sessionClientIdRef.current) return;
+    if (session.updatedAt <= sessionAppliedAtRef.current) return;
     sessionAppliedAtRef.current = session.updatedAt;
+    applyingRemoteRef.current = true;
+    window.setTimeout(() => {
+      applyingRemoteRef.current = false;
+    }, 350);
 
+    // Cluster status: desktop is authoritative; remotes always take node mirrors from peers that sent them.
     if (Array.isArray(session.nodes) && session.nodes.length > 0) {
-      const configs: NodeConfig[] = session.nodes.map(n => {
-        const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, ...cfg } = n as LiveSessionNode &
-          EndpointNode;
-        return cfg;
-      });
-      setSettings(prev => ({ ...prev, nodes: configs }));
-      setNodes(prev => {
-        const byId = new Map(prev.map(n => [n.id, n]));
-        return session.nodes.map(n => {
-          const existing = byId.get(n.id);
-          const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, ...cfg } = n;
-          const hasLiveModels = Array.isArray(n.models) && n.models.length > 0;
-          return {
-            ...cfg,
-            online: typeof n.online === 'boolean' ? n.online : existing?.online ?? false,
-            latency: n.latency != null ? n.latency : existing?.latency ?? null,
-            models: hasLiveModels ? n.models! : existing?.models ?? [],
-            loaded: n.loaded?.length ? n.loaded : existing?.loaded ?? [],
-            error: n.error ?? existing?.error
-          } as EndpointNode;
+      if (isRemoteClient || session.source === 'desktop' || session.source === 'seed') {
+        const configs: NodeConfig[] = session.nodes.map(n => {
+          const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, ...cfg } = n as LiveSessionNode &
+            EndpointNode;
+          return cfg;
         });
-      });
+        setSettings(prev => ({ ...prev, nodes: configs }));
+        setNodes(prev => {
+          const byId = new Map(prev.map(n => [n.id, n]));
+          return session.nodes.map(n => {
+            const existing = byId.get(n.id);
+            const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, ...cfg } = n;
+            const hasLiveModels = Array.isArray(n.models) && n.models.length > 0;
+            return {
+              ...cfg,
+              online: typeof n.online === 'boolean' ? n.online : existing?.online ?? false,
+              latency: n.latency != null ? n.latency : existing?.latency ?? null,
+              models: hasLiveModels ? n.models! : existing?.models ?? [],
+              loaded: n.loaded?.length ? n.loaded : existing?.loaded ?? [],
+              error: n.error ?? existing?.error
+            } as EndpointNode;
+          });
+        });
+      }
     }
 
     if (session.selectedAgentId) setSelectedAgentId(session.selectedAgentId);
@@ -240,7 +258,7 @@ export const App: React.FC = () => {
       typeof session.chatsRevision === 'number' && session.chatsRevision > chatsRevisionRef.current;
 
     if (typeof session.chatsRevision === 'number') {
-      chatsRevisionRef.current = session.chatsRevision;
+      chatsRevisionRef.current = Math.max(chatsRevisionRef.current, session.chatsRevision);
     }
 
     if (wsChanged) {
@@ -252,12 +270,48 @@ export const App: React.FC = () => {
         setFiles(Array.isArray(result) ? result : []);
       });
     } else if (chatsBumped && nextWs) {
-      // Same folder — reload chats from disk after desktop saved.
+      // Same folder — reload chats from disk after a peer saved.
       forceNewChatRef.current = false;
       loadedWorkspaceRef.current = '';
       setWorkspaceEpoch(n => n + 1);
     }
-  }, []);
+
+    const nextTab =
+      typeof session.activeTabPath === 'string' && session.activeTabPath
+        ? session.activeTabPath
+        : '';
+    if (nextTab && nextTab !== activeTabPathRef.current) {
+      void (async () => {
+        if (!window.electronAPI) return;
+        const alreadyOpen = openTabsSnapshotRef.current.some(t => t.path === nextTab);
+        if (!alreadyOpen) {
+          const res = await window.electronAPI.readFile(nextTab);
+          if (res.content !== undefined) {
+            const fileName = nextTab.split(/[\\/]/).pop() || 'Untitled';
+            setOpenTabs(prev => {
+              if (prev.some(t => t.path === nextTab)) return prev;
+              return [
+                ...prev,
+                {
+                  path: nextTab,
+                  name: fileName,
+                  content: res.content!,
+                  originalContent: res.content!,
+                  isDirty: false,
+                  language: getLanguageFromPath(nextTab)
+                }
+              ];
+            });
+          }
+        }
+        setActiveTabPath(nextTab);
+      })();
+    }
+  }, [isRemoteClient]);
+
+  const openTabsSnapshotRef = useRef<OpenTab[]>([]);
+  openTabsSnapshotRef.current = openTabs;
+  activeTabPathRef.current = activeTabPath;
 
   // 1. Initial Load: Settings & Workspace (+ attach to live desktop session for web console)
   useEffect(() => {
@@ -360,20 +414,21 @@ export const App: React.FC = () => {
     });
   }, [isRemoteClient]);
 
-  // Web console: host link is "live" once settings RPC works; also follow desktop session stream.
+  // Both desktop and web consoles follow the shared live session (skip own echoes in apply).
   useEffect(() => {
-    if (!isRemoteClient || !window.electronAPI) return;
+    if (!window.electronAPI) return;
 
     let cancelled = false;
     const markHostUp = () => {
-      if (!cancelled) setRemoteLive(true);
+      if (!cancelled && isRemoteClient) setRemoteLive(true);
     };
 
-    // Prove the WebSocket bridge works immediately (do not wait for desktop publish).
-    void window.electronAPI
-      .loadSettings()
-      .then(() => markHostUp())
-      .catch(() => {});
+    if (isRemoteClient) {
+      void window.electronAPI
+        .loadSettings()
+        .then(() => markHostUp())
+        .catch(() => {});
+    }
 
     const unsub = window.electronAPI.onLiveSession?.(session => {
       markHostUp();
@@ -385,7 +440,7 @@ export const App: React.FC = () => {
         markHostUp();
         if (s && s.updatedAt > 0) applyLiveSession(s);
       });
-    }, 2000);
+    }, 750);
 
     return () => {
       cancelled = true;
@@ -394,20 +449,26 @@ export const App: React.FC = () => {
     };
   }, [isRemoteClient, applyLiveSession]);
 
-  // Desktop Electron window publishes continuously for remotes to mirror workspace/chat.
+  // Every surface publishes so peers mirror workspace / chat / tab focus.
   useEffect(() => {
-    if (!window.electronAPI?.publishLiveSession || isRemoteClient) return;
+    if (!window.electronAPI?.publishLiveSession) return;
+    if (applyingRemoteRef.current) return;
     if (publishTimerRef.current) clearTimeout(publishTimerRef.current);
     publishTimerRef.current = setTimeout(() => {
+      if (applyingRemoteRef.current) return;
       void window.electronAPI.publishLiveSession?.({
         workspacePath,
         activeConversationId: activeConversationId || null,
         selectedAgentId,
-        nodes: toLiveSessionNodes(nodes),
+        // Desktop owns cluster status; remotes omit nodes so they do not clobber it.
+        nodes: isRemoteClient ? undefined : toLiveSessionNodes(nodes),
         chatsRevision: chatsRevisionRef.current,
-        source: 'desktop'
-      });
-    }, 150);
+        activeTabPath: activeTabPath || null,
+        openTabPaths: openTabs.map(t => t.path),
+        source: isRemoteClient ? 'web' : 'desktop',
+        clientId: sessionClientIdRef.current
+      } as Partial<LiveStudioSession>);
+    }, 100);
     return () => {
       if (publishTimerRef.current) clearTimeout(publishTimerRef.current);
     };
@@ -418,7 +479,9 @@ export const App: React.FC = () => {
     selectedAgentId,
     nodes,
     toLiveSessionNodes,
-    chatsTick
+    chatsTick,
+    activeTabPath,
+    openTabs
   ]);
 
   // Persist Settings whenever modified
@@ -516,7 +579,7 @@ export const App: React.FC = () => {
           conversations: conversationsForWorkspace(conversations, workspacePath),
           activeConversationId: active
         });
-        markChatsSaved();
+        // Do not markChatsSaved here — reloading from a peer would bump revision forever.
         return next;
       });
     })();
@@ -524,7 +587,7 @@ export const App: React.FC = () => {
       cancelled = true;
       if (loadedWorkspaceRef.current === key) loadedWorkspaceRef.current = '';
     };
-  }, [workspacePath, workspaceEpoch, markChatsSaved]);
+  }, [workspacePath, workspaceEpoch, selectedAgentId]);
 
   // Sidebar Drag-Resize Listeners
   useEffect(() => {

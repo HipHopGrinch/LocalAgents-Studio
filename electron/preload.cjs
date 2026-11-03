@@ -45,6 +45,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   loadProjectChats: root => ipcRenderer.invoke('project:loadChats', root),
   saveProjectChats: (root, payload) => ipcRenderer.invoke('project:saveChats', root, payload),
   selectFolder: () => ipcRenderer.invoke('workspace:select-folder'),
+  resolveWorkspacePath: dirPath => ipcRenderer.invoke('workspace:resolve-path', dirPath),
   readDir: dirPath => ipcRenderer.invoke('fs:read-dir', dirPath),
   readFile: filePath => ipcRenderer.invoke('fs:read-file', filePath),
   writeFile: (filePath, content) => ipcRenderer.invoke('fs:write-file', filePath, content),
@@ -90,5 +91,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   downloadUpdate: () => ipcRenderer.invoke('update:download'),
   installUpdate: () => ipcRenderer.invoke('update:install'),
   setUpdateBusy: busy => ipcRenderer.invoke('update:setBusy', busy),
-  onUpdateStatus: subscribe('update:status')
+  onUpdateStatus: subscribe('update:status'),
+
+  // Embedded LAN web console
+  webConsoleGetStatus: () => ipcRenderer.invoke('webConsole:getStatus'),
+  webConsoleUpdate: patch => ipcRenderer.invoke('webConsole:update', patch || {}),
+  webConsoleSetPassword: password => ipcRenderer.invoke('webConsole:setPassword', password)
 });

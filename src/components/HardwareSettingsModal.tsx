@@ -12,7 +12,11 @@ import {
   Upload,
   Lock,
   Bug,
-  ExternalLink
+  ExternalLink,
+  Globe,
+  Copy,
+  Eye,
+  EyeOff
 } from 'lucide-react';
 import { EndpointNode, NodeConfig, HardwareProfile, ModelMeta, NodeRole } from '../types';
 import { GPU_PRESETS, RAM_PRESETS } from '../config/defaults';
@@ -62,7 +66,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   searxngUrl,
   onUpdateSearxngUrl
 }) => {
-  const [activeTab, setActiveTab] = useState<'nodes' | 'hub' | 'appearance' | 'stats'>('nodes');
+  const [activeTab, setActiveTab] = useState<'nodes' | 'hub' | 'appearance' | 'stats' | 'remote'>('nodes');
   const [selectedNodeId, setSelectedNodeId] = useState<string>(nodes[0]?.id || '');
   const [selectedTask, setSelectedTask] = useState<TaskId>('agent');
   const [settingsFilePath, setSettingsFilePath] = useState('');
@@ -70,6 +74,21 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   const [logCopyNote, setLogCopyNote] = useState('');
   const [bugReportNote, setBugReportNote] = useState('');
   const [bugReportBusy, setBugReportBusy] = useState(false);
+
+  const [webEnabled, setWebEnabled] = useState(false);
+  const [webPort, setWebPort] = useState(3847);
+  const [webPassword, setWebPassword] = useState('');
+  const [webShowPassword, setWebShowPassword] = useState(false);
+  const [webStatus, setWebStatus] = useState<{
+    enabled: boolean;
+    port: number;
+    listening: boolean;
+    hasPassword: boolean;
+    urls: string[];
+    clientCount: number;
+  } | null>(null);
+  const [webBusy, setWebBusy] = useState(false);
+  const [webNote, setWebNote] = useState('');
   
   // Benchmark state
   const [benchmarkingModel, setBenchmarkingModel] = useState<string | null>(null);
@@ -163,6 +182,63 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     window.electronAPI.settingsPath().then(setSettingsFilePath).catch(() => setSettingsFilePath(''));
     window.electronAPI.logsPath?.().then(setLogsFilePath).catch(() => setLogsFilePath(''));
   }, [isOpen]);
+
+  const refreshWebConsoleStatus = async () => {
+    if (!window.electronAPI?.webConsoleGetStatus) return;
+    try {
+      const st = await window.electronAPI.webConsoleGetStatus();
+      setWebStatus(st);
+      setWebEnabled(!!st.enabled);
+      setWebPort(st.port || 3847);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  useEffect(() => {
+    if (!isOpen) return;
+    void refreshWebConsoleStatus();
+  }, [isOpen, activeTab]);
+
+  const applyWebConsole = async (patch: { enabled?: boolean; port?: number; password?: string }) => {
+    if (!window.electronAPI?.webConsoleUpdate) {
+      setWebNote('Web console API unavailable');
+      return;
+    }
+    setWebBusy(true);
+    setWebNote('');
+    try {
+      const res = await window.electronAPI.webConsoleUpdate(patch);
+      if (res.error) {
+        setWebNote(res.error);
+        await refreshWebConsoleStatus();
+        return;
+      }
+      if (res.status) {
+        setWebStatus({
+          enabled: !!res.status.enabled,
+          port: res.status.port || 3847,
+          listening: !!res.status.listening,
+          hasPassword: !!res.status.hasPassword,
+          urls: res.status.urls || [],
+          clientCount: (res.status as { clientCount?: number }).clientCount || 0
+        });
+      }
+      setWebEnabled(!!res.status?.enabled);
+      setWebPort(res.status?.port || patch.port || webPort);
+      if (patch.password) setWebPassword('');
+      setWebNote(
+        res.status?.listening
+          ? 'Web console is listening on the LAN.'
+          : res.status?.enabled
+            ? 'Enabled but not listening — set a password.'
+            : 'Web console stopped.'
+      );
+      await refreshWebConsoleStatus();
+    } finally {
+      setWebBusy(false);
+    }
+  };
 
   // After opening Hardware Settings, inspect installed models missing Ollama metadata
   useEffect(() => {
@@ -711,6 +787,15 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                 }`}
               >
                 Token Usage & Savings
+              </button>
+              <button
+                onClick={() => setActiveTab('remote')}
+                className={`flex items-center space-x-1.5 px-3 py-1 rounded transition ${
+                  activeTab === 'remote' ? 'bg-indigo-600 text-white font-medium' : 'text-zinc-400 hover:text-white'
+                }`}
+              >
+                <Globe className="w-3.5 h-3.5" />
+                <span>Web Console</span>
               </button>
             </div>
           </div>
@@ -1349,6 +1434,165 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                   )}
                 </div>
               </div>
+            </div>
+          </div>
+        )}
+
+        {/* Tab: Web Console (LAN remote UI) */}
+        {activeTab === 'remote' && (
+          <div className="flex-1 p-6 flex flex-col space-y-5 overflow-y-auto">
+            <div>
+              <h3 className="text-sm font-bold text-zinc-100 flex items-center space-x-2">
+                <Globe className="w-4 h-4 text-indigo-400" />
+                <span>Web Console</span>
+              </h3>
+              <p className="text-xs text-zinc-400 mt-1 leading-relaxed">
+                While Studio is running, open these URLs from a phone or another PC on your network to control the same
+                workspace, agents, and terminal. Off by default. Requires a password.
+              </p>
+            </div>
+
+            <div className="bg-[#121215] border border-amber-500/25 rounded-xl p-4 text-[11px] text-amber-100/90 leading-relaxed">
+              Anyone on your LAN with the password can run shell commands and edit project files on this PC. Do not enable
+              on untrusted networks. Prefer Tailscale/VPN if you need access off-LAN.
+            </div>
+
+            <div className="bg-[#121215] border border-[#272730] rounded-xl p-5 space-y-4">
+              <label className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-xs font-semibold text-zinc-200">Enable web console</div>
+                  <div className="text-[10px] text-zinc-500">
+                    {webStatus?.listening
+                      ? `Listening · ${webStatus.clientCount || 0} client(s)`
+                      : webStatus?.hasPassword
+                        ? 'Password set · not listening'
+                        : 'Set a password, then enable'}
+                  </div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={webEnabled}
+                  disabled={webBusy}
+                  onChange={e => {
+                    const on = e.target.checked;
+                    setWebEnabled(on);
+                    void applyWebConsole({ enabled: on, port: webPort });
+                  }}
+                  className="w-4 h-4 accent-indigo-500"
+                />
+              </label>
+
+              <label className="block space-y-1.5">
+                <span className="text-[11px] text-zinc-400">Port</span>
+                <div className="flex gap-2">
+                  <input
+                    type="number"
+                    min={1024}
+                    max={65535}
+                    value={webPort}
+                    onChange={e => setWebPort(parseInt(e.target.value, 10) || 3847)}
+                    className="flex-1 bg-[#1a1a20] border border-[#2a2a36] rounded px-2.5 py-1.5 text-sm font-mono outline-none focus:border-indigo-500"
+                  />
+                  <button
+                    type="button"
+                    disabled={webBusy}
+                    onClick={() => void applyWebConsole({ enabled: webEnabled, port: webPort })}
+                    className="px-3 py-1.5 text-xs rounded bg-[#1e1e24] border border-[#2c2c36] hover:bg-[#282830] text-zinc-200"
+                  >
+                    Apply port
+                  </button>
+                </div>
+              </label>
+
+              <label className="block space-y-1.5">
+                <span className="text-[11px] text-zinc-400">
+                  {webStatus?.hasPassword ? 'Change password' : 'Set password'} (min 4 characters)
+                </span>
+                <div className="flex gap-2">
+                  <div className="relative flex-1">
+                    <input
+                      type={webShowPassword ? 'text' : 'password'}
+                      value={webPassword}
+                      onChange={e => setWebPassword(e.target.value)}
+                      placeholder={webStatus?.hasPassword ? '••••••••' : 'Choose a password'}
+                      className="w-full bg-[#1a1a20] border border-[#2a2a36] rounded px-2.5 py-1.5 pr-9 text-sm outline-none focus:border-indigo-500"
+                    />
+                    <button
+                      type="button"
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300"
+                      onClick={() => setWebShowPassword(v => !v)}
+                      tabIndex={-1}
+                    >
+                      {webShowPassword ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={webBusy || webPassword.length < 4}
+                    onClick={() =>
+                      void applyWebConsole({
+                        enabled: webEnabled,
+                        port: webPort,
+                        password: webPassword
+                      })
+                    }
+                    className="px-3 py-1.5 text-xs rounded bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white"
+                  >
+                    Save
+                  </button>
+                </div>
+              </label>
+
+              {webNote && <p className="text-[11px] text-indigo-300">{webNote}</p>}
+            </div>
+
+            <div className="bg-[#121215] border border-[#272730] rounded-xl p-4 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-zinc-200">Reachable URLs</span>
+                <button
+                  type="button"
+                  onClick={() => void refreshWebConsoleStatus()}
+                  className="text-[10px] text-zinc-400 hover:text-white inline-flex items-center gap-1"
+                >
+                  <RefreshCw className="w-3 h-3" /> Refresh
+                </button>
+              </div>
+              {(webStatus?.urls || []).length === 0 ? (
+                <p className="text-[11px] text-zinc-500">Enable the console to see addresses.</p>
+              ) : (
+                <ul className="space-y-1.5">
+                  {webStatus!.urls.map(url => (
+                    <li
+                      key={url}
+                      className="flex items-center justify-between gap-2 bg-[#0e0e11] border border-[#2a2a34] rounded px-2.5 py-1.5"
+                    >
+                      <code className="text-[11px] font-mono text-indigo-300 break-all">{url}</code>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          type="button"
+                          title="Copy"
+                          onClick={() => {
+                            void navigator.clipboard.writeText(url);
+                            setWebNote(`Copied ${url}`);
+                          }}
+                          className="p-1 text-zinc-400 hover:text-white"
+                        >
+                          <Copy className="w-3.5 h-3.5" />
+                        </button>
+                        <a
+                          href={url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="p-1 text-zinc-400 hover:text-white"
+                          title="Open"
+                        >
+                          <ExternalLink className="w-3.5 h-3.5" />
+                        </a>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
             </div>
           </div>
         )}

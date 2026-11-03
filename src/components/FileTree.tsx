@@ -21,7 +21,9 @@ interface FileTreeProps {
   onCreateFolder: (dirPath: string) => void;
   onDelete: (path: string) => void;
   rootPath: string;
-  width?: number;
+  width?: number | string;
+  /** When true, tree fills the parent instead of a fixed sidebar width. */
+  fill?: boolean;
 }
 
 export const FileTree: React.FC<FileTreeProps> = ({
@@ -33,7 +35,8 @@ export const FileTree: React.FC<FileTreeProps> = ({
   onCreateFolder,
   onDelete,
   rootPath,
-  width = 240
+  width = 240,
+  fill = false
 }) => {
   const [expandedDirs, setExpandedDirs] = useState<Record<string, boolean>>({});
   const [subDirFiles, setSubDirFiles] = useState<Record<string, WorkspaceFile[]>>({});
@@ -181,7 +184,12 @@ export const FileTree: React.FC<FileTreeProps> = ({
   };
 
   return (
-    <div style={{ width }} className="h-full bg-[#18181b] border-r border-[#27272a] flex flex-col select-none shrink-0">
+    <div
+      style={fill ? undefined : { width }}
+      className={`h-full bg-[#18181b] border-r border-[#27272a] flex flex-col select-none ${
+        fill ? 'w-full min-w-0' : 'shrink-0'
+      }`}
+    >
       {/* File Tree Header */}
       <div className="h-9 px-3 border-b border-[#27272a] flex items-center justify-between text-xs text-zinc-400 font-semibold tracking-wide uppercase">
         <span>Explorer</span>

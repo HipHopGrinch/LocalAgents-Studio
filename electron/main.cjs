@@ -9,6 +9,7 @@ const fsp = require('fs/promises');
 const os = require('os');
 const crypto = require('crypto');
 const { spawn, execFile } = require('child_process');
+const webConsole = require('./webConsole.cjs');
 
 // Per-user settings live under AppData — NEVER inside the install dir or portable EXE.
 // Must be set before app.ready().
@@ -93,18 +94,54 @@ process.on('unhandledRejection', reason => {
   appendLog('error', `unhandledRejection: ${text}`);
 });
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   createWindow();
   setupAutoUpdater();
+  try {
+    const raw = await fsp.readFile(settingsPath(), 'utf-8').catch(() => null);
+    if (raw) {
+      const saved = JSON.parse(raw);
+      if (saved?.webConsole) await webConsole.applyConfig(saved.webConsole);
+    }
+  } catch (err) {
+    appendLog('warn', `web console autostart: ${err.message}`);
+  }
 });
 app.on('window-all-closed', () => {
+  webConsole.stopServer();
   killAllProcesses();
   app.quit();
 });
+app.on('before-quit', () => {
+  webConsole.stopServer();
+});
+
+/** IPC handlers registered for both Electron preload and the web console WS bridge. */
+const rpcHandlers = new Map();
+const _ipcHandle = ipcMain.handle.bind(ipcMain);
+ipcMain.handle = (channel, listener) => {
+  rpcHandlers.set(channel, listener);
+  return _ipcHandle(channel, listener);
+};
+
+async function invokeRpc(channel, args = []) {
+  const listener = rpcHandlers.get(channel);
+  if (!listener) throw new Error(`Unknown method: ${channel}`);
+  return listener({ webConsole: true }, ...(Array.isArray(args) ? args : []));
+}
 
 const send = (channel, payload) => {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
+  webConsole.broadcast(channel, payload);
 };
+
+webConsole.init({
+  invokeRpc,
+  getDistDir: () => path.join(__dirname, '../dist'),
+  getViteDevUrl: () =>
+    process.env.VITE_DEV_SERVER === 'true' && !app.isPackaged ? 'http://127.0.0.1:5173' : null,
+  appendLog: (level, message) => appendLog(level, message)
+});
 
 // ==========================================
 // SETTINGS PERSISTENCE (userData/settings.json)
@@ -113,9 +150,19 @@ const send = (channel, payload) => {
 
 const settingsPath = () => path.join(app.getPath('userData'), 'settings.json');
 
-ipcMain.handle('settings:load', async () => {
+ipcMain.handle('settings:load', async (e) => {
   try {
-    return JSON.parse(await fsp.readFile(settingsPath(), 'utf-8'));
+    const data = JSON.parse(await fsp.readFile(settingsPath(), 'utf-8'));
+    if (e?.webConsole && data?.webConsole) {
+      return {
+        ...data,
+        webConsole: {
+          enabled: !!data.webConsole.enabled,
+          port: data.webConsole.port || webConsole.DEFAULT_PORT
+        }
+      };
+    }
+    return data;
   } catch {
     return null;
   }
@@ -124,9 +171,33 @@ ipcMain.handle('settings:load', async () => {
 ipcMain.handle('settings:save', async (_e, settings) => {
   try {
     await fsp.mkdir(app.getPath('userData'), { recursive: true });
+    let existing = null;
+    try {
+      existing = JSON.parse(await fsp.readFile(settingsPath(), 'utf-8'));
+    } catch {
+      existing = null;
+    }
+    // Never let a renderer (especially the web client) wipe password hashes by omission.
+    if (settings && typeof settings === 'object') {
+      const prev = existing?.webConsole || {};
+      const next = settings.webConsole || {};
+      settings.webConsole = {
+        enabled: typeof next.enabled === 'boolean' ? next.enabled : !!prev.enabled,
+        port: Number(next.port) > 0 ? Math.floor(Number(next.port)) : prev.port || webConsole.DEFAULT_PORT,
+        passwordHash: next.passwordHash || prev.passwordHash,
+        passwordSalt: next.passwordSalt || prev.passwordSalt
+      };
+    }
     const tmp = settingsPath() + '.tmp';
     await fsp.writeFile(tmp, JSON.stringify(settings, null, 2), 'utf-8');
     await fsp.rename(tmp, settingsPath()); // atomic replace
+    if (settings?.webConsole) {
+      try {
+        await webConsole.applyConfig(settings.webConsole);
+      } catch (err) {
+        appendLog('warn', `web console apply: ${err.message}`);
+      }
+    }
     return { success: true };
   } catch (err) {
     return { error: err.message };
@@ -429,42 +500,77 @@ function validateImportedNodesPayload(payload) {
   return nodes;
 }
 
-ipcMain.handle('settings:exportNodes', async (_e, { nodes, passphrase } = {}) => {
-  try {
-    if (!passphrase || typeof passphrase !== 'string' || passphrase.length < 4) {
-      return { error: 'Passphrase must be at least 4 characters' };
-    }
-    if (!Array.isArray(nodes) || nodes.length === 0) {
-      return { error: 'No nodes to export' };
-    }
-    const sanitized = nodes.map(stripNodeForExport).filter(Boolean);
-    if (sanitized.length === 0) return { error: 'No valid nodes to export' };
+function buildNodesExportEnvelope(nodes, passphrase) {
+  if (!passphrase || typeof passphrase !== 'string' || passphrase.length < 4) {
+    return { error: 'Passphrase must be at least 4 characters' };
+  }
+  if (!Array.isArray(nodes) || nodes.length === 0) {
+    return { error: 'No nodes to export' };
+  }
+  const sanitized = nodes.map(stripNodeForExport).filter(Boolean);
+  if (sanitized.length === 0) return { error: 'No valid nodes to export' };
+  const inner = {
+    format: NODES_EXPORT_FORMAT,
+    exportedAt: new Date().toISOString(),
+    nodes: sanitized
+  };
+  const envelope = encryptNodesPayload(inner, passphrase);
+  return {
+    success: true,
+    content: JSON.stringify(envelope, null, 2),
+    fileName: 'localagents-nodes.enc',
+    nodeCount: sanitized.length
+  };
+}
 
+function importNodesFromRaw(raw, passphrase, sourcePath) {
+  if (!passphrase || typeof passphrase !== 'string') {
+    return { error: 'Passphrase required' };
+  }
+  let fileObj;
+  try {
+    fileObj = JSON.parse(raw);
+  } catch {
+    return { error: 'File is not valid JSON' };
+  }
+  let payload;
+  try {
+    payload = decryptNodesFile(fileObj, passphrase);
+  } catch {
+    return { error: 'Decryption failed (wrong passphrase or corrupt file)' };
+  }
+  const nodes = validateImportedNodesPayload(payload);
+  return { success: true, path: sourcePath || '', nodes, nodeCount: nodes.length };
+}
+
+ipcMain.handle('settings:exportNodes', async (e, { nodes, passphrase } = {}) => {
+  try {
+    const built = buildNodesExportEnvelope(nodes, passphrase);
+    if (built.error) return built;
+    if (e?.webConsole) {
+      return { success: true, content: built.content, fileName: built.fileName, nodeCount: built.nodeCount };
+    }
     const result = await dialog.showSaveDialog(mainWindow, {
       title: 'Export encrypted node setup',
-      defaultPath: 'localagents-nodes.enc',
+      defaultPath: built.fileName,
       filters: [
         { name: 'Encrypted LocalAgents nodes', extensions: ['enc'] },
         { name: 'All files', extensions: ['*'] }
       ]
     });
     if (result.canceled || !result.filePath) return { canceled: true };
-
-    const inner = {
-      format: NODES_EXPORT_FORMAT,
-      exportedAt: new Date().toISOString(),
-      nodes: sanitized
-    };
-    const envelope = encryptNodesPayload(inner, passphrase);
-    await fsp.writeFile(result.filePath, JSON.stringify(envelope, null, 2), 'utf-8');
-    return { success: true, path: result.filePath, nodeCount: sanitized.length };
+    await fsp.writeFile(result.filePath, built.content, 'utf-8');
+    return { success: true, path: result.filePath, nodeCount: built.nodeCount };
   } catch (err) {
     return { error: err.message || 'Export failed' };
   }
 });
 
-ipcMain.handle('settings:importNodes', async (_e, { passphrase } = {}) => {
+ipcMain.handle('settings:importNodes', async (e, { passphrase, fileContent } = {}) => {
   try {
+    if (e?.webConsole || typeof fileContent === 'string') {
+      return importNodesFromRaw(fileContent, passphrase, 'upload');
+    }
     if (!passphrase || typeof passphrase !== 'string') {
       return { error: 'Passphrase required' };
     }
@@ -478,25 +584,83 @@ ipcMain.handle('settings:importNodes', async (_e, { passphrase } = {}) => {
       ]
     });
     if (result.canceled || !result.filePaths?.length) return { canceled: true };
-
     const raw = await fsp.readFile(result.filePaths[0], 'utf-8');
-    let fileObj;
-    try {
-      fileObj = JSON.parse(raw);
-    } catch {
-      return { error: 'File is not valid JSON' };
-    }
-    let payload;
-    try {
-      payload = decryptNodesFile(fileObj, passphrase);
-    } catch {
-      // Wrong passphrase or tampered ciphertext — do not leak details
-      return { error: 'Decryption failed (wrong passphrase or corrupt file)' };
-    }
-    const nodes = validateImportedNodesPayload(payload);
-    return { success: true, path: result.filePaths[0], nodes, nodeCount: nodes.length };
+    return importNodesFromRaw(raw, passphrase, result.filePaths[0]);
   } catch (err) {
     return { error: err.message || 'Import failed' };
+  }
+});
+
+// ==========================================
+// WEB CONSOLE (LAN remote UI)
+// ==========================================
+
+ipcMain.handle('webConsole:getStatus', () => webConsole.getStatus());
+
+ipcMain.handle('webConsole:setPassword', async (_e, password) => {
+  const result = webConsole.setPassword(password);
+  if (result.error) return result;
+  try {
+    let settings = {};
+    try {
+      settings = JSON.parse(await fsp.readFile(settingsPath(), 'utf-8'));
+    } catch {
+      settings = {};
+    }
+    settings.webConsole = {
+      ...(settings.webConsole || {}),
+      enabled: !!(settings.webConsole && settings.webConsole.enabled),
+      port: (settings.webConsole && settings.webConsole.port) || webConsole.DEFAULT_PORT,
+      passwordHash: result.passwordHash,
+      passwordSalt: result.passwordSalt
+    };
+    await fsp.mkdir(app.getPath('userData'), { recursive: true });
+    const tmp = settingsPath() + '.tmp';
+    await fsp.writeFile(tmp, JSON.stringify(settings, null, 2), 'utf-8');
+    await fsp.rename(tmp, settingsPath());
+    await webConsole.applyConfig(settings.webConsole);
+    return { success: true, status: webConsole.getStatus() };
+  } catch (err) {
+    return { error: err.message || 'Failed to save password' };
+  }
+});
+
+ipcMain.handle('webConsole:update', async (_e, patch = {}) => {
+  try {
+    let settings = {};
+    try {
+      settings = JSON.parse(await fsp.readFile(settingsPath(), 'utf-8'));
+    } catch {
+      settings = {};
+    }
+    const prev = settings.webConsole || {};
+    const next = {
+      enabled: typeof patch.enabled === 'boolean' ? patch.enabled : !!prev.enabled,
+      port:
+        typeof patch.port === 'number' && patch.port > 0
+          ? Math.floor(patch.port)
+          : prev.port || webConsole.DEFAULT_PORT,
+      passwordHash: prev.passwordHash,
+      passwordSalt: prev.passwordSalt
+    };
+    if (typeof patch.password === 'string' && patch.password.length > 0) {
+      const rec = webConsole.setPassword(patch.password);
+      if (rec.error) return rec;
+      next.passwordHash = rec.passwordHash;
+      next.passwordSalt = rec.passwordSalt;
+    }
+    if (next.enabled && (!next.passwordHash || !next.passwordSalt)) {
+      return { error: 'Set a password before enabling the web console' };
+    }
+    settings.webConsole = next;
+    await fsp.mkdir(app.getPath('userData'), { recursive: true });
+    const tmp = settingsPath() + '.tmp';
+    await fsp.writeFile(tmp, JSON.stringify(settings, null, 2), 'utf-8');
+    await fsp.rename(tmp, settingsPath());
+    const status = await webConsole.applyConfig(next);
+    return { success: true, status, webConsole: next };
+  } catch (err) {
+    return { error: err.message || 'Failed to update web console' };
   }
 });
 
@@ -517,9 +681,24 @@ async function readDirSorted(dirPath) {
     .map(e => ({ name: e.name, path: path.join(dirPath, e.name), isDirectory: e.isDirectory() }));
 }
 
-ipcMain.handle('workspace:select-folder', async () => {
+ipcMain.handle('workspace:select-folder', async (e) => {
+  if (e?.webConsole) {
+    return null; // web clients use workspace:resolve-path after a typed path
+  }
   const result = await dialog.showOpenDialog(mainWindow, { properties: ['openDirectory', 'createDirectory'] });
   return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0];
+});
+
+ipcMain.handle('workspace:resolve-path', async (_e, dirPath) => {
+  try {
+    const resolved = path.resolve(String(dirPath || '').trim());
+    if (!resolved) return { error: 'Path required' };
+    const st = await fsp.stat(resolved);
+    if (!st.isDirectory()) return { error: 'Not a directory' };
+    return { path: resolved };
+  } catch {
+    return { error: 'Path not found' };
+  }
 });
 
 ipcMain.handle('workspace:default', () => process.cwd());

@@ -5,12 +5,15 @@ interface TerminalPanelProps {
   isOpen: boolean;
   onClose: () => void;
   workspacePath: string;
+  /** Full-height pane (mobile web console). */
+  fill?: boolean;
 }
 
 export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   isOpen,
   onClose,
-  workspacePath
+  workspacePath,
+  fill = false
 }) => {
   const [output, setOutput] = useState<string[]>([]);
   const [command, setCommand] = useState('');
@@ -87,7 +90,11 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   };
 
   return (
-    <div className="h-64 bg-[#121215] border-t border-[#27272a] flex flex-col font-mono text-xs select-none">
+    <div
+      className={`${
+        fill ? 'h-full border-t-0' : 'h-64 border-t'
+      } bg-[#121215] border-[#27272a] flex flex-col font-mono text-xs select-text`}
+    >
       {/* Terminal Title Bar */}
       <div className="h-8 bg-[#18181c] border-b border-[#27272a] px-3 flex items-center justify-between text-zinc-400">
         <div className="flex items-center space-x-2">

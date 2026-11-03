@@ -6,6 +6,7 @@ import { TerminalPanel } from './components/TerminalPanel';
 import { AgentChat } from './components/AgentChat';
 import { HardwareSettingsModal } from './components/HardwareSettingsModal';
 import { UpdateBanner } from './components/UpdateBanner';
+import { MessageSquare, FolderTree, Code2, Terminal as TerminalIcon, MoreHorizontal } from 'lucide-react';
 
 import {
   EndpointNode,
@@ -72,6 +73,20 @@ export const App: React.FC = () => {
   // Modals & Drawers
   const [isTerminalOpen, setIsTerminalOpen] = useState(false);
   const [isHardwareModalOpen, setIsHardwareModalOpen] = useState(false);
+  /** Mobile / narrow web-console pane (desktop keeps the 3-column layout). */
+  type MobilePane = 'chat' | 'files' | 'code' | 'term' | 'more';
+  const [mobilePane, setMobilePane] = useState<MobilePane>('chat');
+  const [isNarrow, setIsNarrow] = useState(() =>
+    typeof window !== 'undefined' ? window.matchMedia('(max-width: 767px)').matches : false
+  );
+
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 767px)');
+    const apply = () => setIsNarrow(mq.matches);
+    apply();
+    mq.addEventListener('change', apply);
+    return () => mq.removeEventListener('change', apply);
+  }, []);
 
   // Resizable Sidebar Widths
   const [explorerWidth, setExplorerWidth] = useState<number>(DEFAULT_SETTINGS.explorerWidth || 240);
@@ -768,115 +783,196 @@ export const App: React.FC = () => {
     void window.electronAPI?.setUpdateBusy?.(busy);
   }, []);
 
+  const agentChatProps = {
+    agents: settings.agents,
+    selectedAgentId,
+    onSelectAgent: setSelectedAgentId,
+    nodes,
+    activeTab: openTabs.find(t => t.path === activeTabPath),
+    workspacePath,
+    workspaceFiles: files,
+    controlWidth: agentControlWidth,
+    onControlWidthChange: (w: number) => {
+      setAgentControlWidth(w);
+      updateSettings({ agentControlWidth: w });
+    },
+    onSelectNodeModel: handleSelectNodeModel,
+    onApplyFileWrite: handleApplyFileWrite,
+    onExecuteToolCommand: handleExecuteToolCommand,
+    onOpenFileInEditor: (path: string) => {
+      handleOpenFileInEditor(path);
+      if (isNarrow) setMobilePane('code');
+    },
+    onRecordTokens: handleRecordTokens,
+    onNoteFreeTierCall: handleNoteFreeTierCall,
+    maxAgentSteps: settings.maxAgentSteps || 12,
+    conversation: activeConversation,
+    workspaceConversations,
+    onMessagesChange: handleMessagesChange,
+    onConversationPatch: handleConversationPatch,
+    onNewChat: handleNewChat,
+    onSelectConversation: handleSelectConversation,
+    onDeleteConversation: handleDeleteConversation,
+    onToggleModelThinking: handleToggleModelThinking,
+    searxngUrl: settings.searxngUrl || '',
+    onBusyChange: handleAgentBusyChange
+  };
+
+  const mobileNavBtn = (id: MobilePane, label: string, Icon: typeof MessageSquare) => (
+    <button
+      key={id}
+      type="button"
+      onClick={() => {
+        setMobilePane(id);
+        if (id === 'term') setIsTerminalOpen(true);
+        if (id === 'more') setIsHardwareModalOpen(true);
+      }}
+      className={`flex-1 flex flex-col items-center justify-center gap-0.5 py-2 text-[10px] font-medium transition ${
+        mobilePane === id || (id === 'more' && isHardwareModalOpen)
+          ? 'text-indigo-300'
+          : 'text-zinc-500'
+      }`}
+    >
+      <Icon className="w-5 h-5" />
+      <span>{label}</span>
+    </button>
+  );
+
   return (
-    <div className="flex flex-col h-screen w-screen bg-[#18181b] text-zinc-100 overflow-hidden font-sans select-none">
-      {/* Top Header */}
+    <div
+      className={`flex flex-col h-[100dvh] w-screen bg-[#18181b] text-zinc-100 overflow-hidden font-sans ${
+        isNarrow ? 'select-text' : 'select-none'
+      }`}
+    >
+      {/* Top Header — hide dense chrome on very small screens */}
+      <div className={isNarrow ? 'shrink-0' : undefined}>
         <Header
-        workspacePath={workspacePath}
-        recentWorkspaces={settings.recentWorkspaces || []}
-        onSelectFolder={handleSelectFolder}
-        onOpenRecent={handleOpenRecent}
-        onNewProject={handleNewProject}
-        nodes={nodes}
-        onRefreshNodes={refreshNodes}
-        isTerminalOpen={isTerminalOpen}
-        onToggleTerminal={() => setIsTerminalOpen(!isTerminalOpen)}
-        onOpenHardwareModal={() => setIsHardwareModalOpen(true)}
-        localTokens={settings.localTokensGenerated || 0}
-        frontierTokens={settings.frontierTokensUsed || 0}
-        uiScale={uiScale}
-        onUpdateUiScale={handleUpdateUiScale}
-        appVersion={appVersion}
-      />
-      <UpdateBanner />
-
-      {/* Main Studio Body */}
-      <div className="flex-1 flex overflow-hidden">
-        {/* Explorer */}
-        <FileTree
-          files={files}
-          activeFilePath={activeTabPath}
-          onFileSelect={handleFileSelect}
-          onRefresh={() => loadDirectory(workspacePath)}
-          onCreateFile={handleCreateFile}
-          onCreateFolder={handleCreateFolder}
-          onDelete={handleDeleteTarget}
-          rootPath={workspacePath}
-          width={explorerWidth}
-        />
-
-        {/* Explorer Drag Resize Handle */}
-        <div
-          onMouseDown={() => setResizingSide('explorer')}
-          title="Drag to resize Explorer sidebar"
-          className={`w-1 cursor-col-resize transition-colors shrink-0 ${
-            resizingSide === 'explorer' ? 'bg-indigo-500' : 'bg-transparent hover:bg-indigo-500/60'
-          }`}
-        />
-
-        {/* Center Monaco Editor & Terminal */}
-        <div className="flex-1 flex flex-col overflow-hidden min-w-[260px]">
-          <EditorView
-            tabs={openTabs}
-            activeTabPath={activeTabPath}
-            onSelectTab={setActiveTabPath}
-            onCloseTab={handleCloseTab}
-            onContentChange={handleContentChange}
-            onSaveTab={handleSaveTab}
-          />
-
-          <TerminalPanel
-            isOpen={isTerminalOpen}
-            onClose={() => setIsTerminalOpen(false)}
-            workspacePath={workspacePath}
-          />
-        </div>
-
-        {/* Agent Conductor Drag Resize Handle */}
-        <div
-          onMouseDown={() => setResizingSide('chat')}
-          title="Drag to resize Agent Conductor sidebar"
-          className={`w-1 cursor-col-resize transition-colors shrink-0 ${
-            resizingSide === 'chat' ? 'bg-indigo-500' : 'bg-transparent hover:bg-indigo-500/60'
-          }`}
-        />
-
-        {/* Right AI Agent Pane */}
-        <AgentChat
-          agents={settings.agents}
-          selectedAgentId={selectedAgentId}
-          onSelectAgent={setSelectedAgentId}
-          nodes={nodes}
-          activeTab={openTabs.find(t => t.path === activeTabPath)}
           workspacePath={workspacePath}
-          workspaceFiles={files}
-          width={chatWidth}
-          controlWidth={agentControlWidth}
-          onControlWidthChange={w => {
-            setAgentControlWidth(w);
-            updateSettings({ agentControlWidth: w });
+          recentWorkspaces={settings.recentWorkspaces || []}
+          onSelectFolder={handleSelectFolder}
+          onOpenRecent={handleOpenRecent}
+          onNewProject={handleNewProject}
+          nodes={nodes}
+          onRefreshNodes={refreshNodes}
+          isTerminalOpen={isTerminalOpen}
+          onToggleTerminal={() => {
+            setIsTerminalOpen(!isTerminalOpen);
+            if (isNarrow) setMobilePane('term');
           }}
-          onSelectNodeModel={handleSelectNodeModel}
-          onApplyFileWrite={handleApplyFileWrite}
-          onExecuteToolCommand={handleExecuteToolCommand}
-          onOpenFileInEditor={handleOpenFileInEditor}
-          onRecordTokens={handleRecordTokens}
-          onNoteFreeTierCall={handleNoteFreeTierCall}
-          maxAgentSteps={settings.maxAgentSteps || 12}
-          conversation={activeConversation}
-          workspaceConversations={workspaceConversations}
-          onMessagesChange={handleMessagesChange}
-          onConversationPatch={handleConversationPatch}
-          onNewChat={handleNewChat}
-          onSelectConversation={handleSelectConversation}
-          onDeleteConversation={handleDeleteConversation}
-          onToggleModelThinking={handleToggleModelThinking}
-          searxngUrl={settings.searxngUrl || ''}
-          onBusyChange={handleAgentBusyChange}
+          onOpenHardwareModal={() => setIsHardwareModalOpen(true)}
+          localTokens={settings.localTokensGenerated || 0}
+          frontierTokens={settings.frontierTokensUsed || 0}
+          uiScale={uiScale}
+          onUpdateUiScale={handleUpdateUiScale}
+          appVersion={appVersion}
         />
       </div>
+      <UpdateBanner />
 
-      {/* Hardware Settings, Benchmarks & Frontier Config Modal */}
+      {isNarrow ? (
+        <div className="flex-1 flex flex-col overflow-hidden min-h-0">
+          <div className="flex-1 overflow-hidden min-h-0">
+            {mobilePane === 'files' && (
+              <FileTree
+                files={files}
+                activeFilePath={activeTabPath}
+                onFileSelect={path => {
+                  void handleFileSelect(path);
+                  setMobilePane('code');
+                }}
+                onRefresh={() => loadDirectory(workspacePath)}
+                onCreateFile={handleCreateFile}
+                onCreateFolder={handleCreateFolder}
+                onDelete={handleDeleteTarget}
+                rootPath={workspacePath}
+                fill
+              />
+            )}
+            {mobilePane === 'code' && (
+              <div className="h-full flex flex-col overflow-hidden">
+                <EditorView
+                  tabs={openTabs}
+                  activeTabPath={activeTabPath}
+                  onSelectTab={setActiveTabPath}
+                  onCloseTab={handleCloseTab}
+                  onContentChange={handleContentChange}
+                  onSaveTab={handleSaveTab}
+                />
+              </div>
+            )}
+            {mobilePane === 'term' && (
+              <div className="h-full flex flex-col overflow-hidden">
+                <TerminalPanel
+                  isOpen
+                  fill
+                  onClose={() => setMobilePane('chat')}
+                  workspacePath={workspacePath}
+                />
+              </div>
+            )}
+            {(mobilePane === 'chat' || mobilePane === 'more') && (
+              <AgentChat {...agentChatProps} fill />
+            )}
+          </div>
+          <nav className="shrink-0 flex border-t border-[#27272a] bg-[#121215] pb-[env(safe-area-inset-bottom)]">
+            {mobileNavBtn('chat', 'Chat', MessageSquare)}
+            {mobileNavBtn('files', 'Files', FolderTree)}
+            {mobileNavBtn('code', 'Code', Code2)}
+            {mobileNavBtn('term', 'Term', TerminalIcon)}
+            {mobileNavBtn('more', 'More', MoreHorizontal)}
+          </nav>
+        </div>
+      ) : (
+        <div className="flex-1 flex overflow-hidden">
+          <FileTree
+            files={files}
+            activeFilePath={activeTabPath}
+            onFileSelect={handleFileSelect}
+            onRefresh={() => loadDirectory(workspacePath)}
+            onCreateFile={handleCreateFile}
+            onCreateFolder={handleCreateFolder}
+            onDelete={handleDeleteTarget}
+            rootPath={workspacePath}
+            width={explorerWidth}
+          />
+
+          <div
+            onMouseDown={() => setResizingSide('explorer')}
+            title="Drag to resize Explorer sidebar"
+            className={`w-1 cursor-col-resize transition-colors shrink-0 ${
+              resizingSide === 'explorer' ? 'bg-indigo-500' : 'bg-transparent hover:bg-indigo-500/60'
+            }`}
+          />
+
+          <div className="flex-1 flex flex-col overflow-hidden min-w-[260px]">
+            <EditorView
+              tabs={openTabs}
+              activeTabPath={activeTabPath}
+              onSelectTab={setActiveTabPath}
+              onCloseTab={handleCloseTab}
+              onContentChange={handleContentChange}
+              onSaveTab={handleSaveTab}
+            />
+
+            <TerminalPanel
+              isOpen={isTerminalOpen}
+              onClose={() => setIsTerminalOpen(false)}
+              workspacePath={workspacePath}
+            />
+          </div>
+
+          <div
+            onMouseDown={() => setResizingSide('chat')}
+            title="Drag to resize Agent Conductor sidebar"
+            className={`w-1 cursor-col-resize transition-colors shrink-0 ${
+              resizingSide === 'chat' ? 'bg-indigo-500' : 'bg-transparent hover:bg-indigo-500/60'
+            }`}
+          />
+
+          <AgentChat {...agentChatProps} width={chatWidth} />
+        </div>
+      )}
+
       <HardwareSettingsModal
         isOpen={isHardwareModalOpen}
         onClose={() => setIsHardwareModalOpen(false)}
@@ -884,7 +980,7 @@ export const App: React.FC = () => {
         onUpdateNodes={handleUpdateNodes}
         onRefreshNodes={refreshNodes}
         estimateContext={settings.estimateContext || 16384}
-        onUpdateEstimateContext={(ctx) => updateSettings({ estimateContext: ctx })}
+        onUpdateEstimateContext={ctx => updateSettings({ estimateContext: ctx })}
         localTokens={settings.localTokensGenerated || 0}
         frontierTokens={settings.frontierTokensUsed || 0}
         uiScale={uiScale}

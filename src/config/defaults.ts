@@ -137,7 +137,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
   recentWorkspaces: [],
   conversations: [],
   activeConversationId: undefined,
-  searxngUrl: ''
+  searxngUrl: '',
+  webConsole: {
+    enabled: false,
+    port: 3847
+  }
 };
 
 /** Merge persisted settings over defaults so new fields added in later versions get sane values. */
@@ -171,6 +175,11 @@ export function mergeSettings(saved: Partial<AppSettings> | null): AppSettings {
         systemPrompt: refreshPrompt ? def.systemPrompt : a.systemPrompt || def.systemPrompt
       };
     }),
-    conversations: Array.isArray(saved.conversations) ? saved.conversations : []
+    conversations: Array.isArray(saved.conversations) ? saved.conversations : [],
+    webConsole: {
+      enabled: false,
+      port: 3847,
+      ...(saved.webConsole || {})
+    }
   };
 }

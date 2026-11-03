@@ -258,6 +258,17 @@ export interface AppSettings {
   /** Persisted chat threads (scoped by workspacePath at runtime) */
   conversations?: ChatConversation[];
   activeConversationId?: string;
+  /**
+   * Embedded LAN web console (served by the running Studio process).
+   * Password hashes are stored only in the settings file on the host; the web client
+   * receives enabled/port only.
+   */
+  webConsole?: {
+    enabled: boolean;
+    port: number;
+    passwordHash?: string;
+    passwordSalt?: string;
+  };
 }
 
 // ==========================================
@@ -486,10 +497,19 @@ export interface ElectronAPI {
   exportNodes: (
     nodes: NodeConfig[],
     passphrase: string
-  ) => Promise<{ success?: boolean; canceled?: boolean; path?: string; nodeCount?: number; error?: string }>;
+  ) => Promise<{
+    success?: boolean;
+    canceled?: boolean;
+    path?: string;
+    content?: string;
+    fileName?: string;
+    nodeCount?: number;
+    error?: string;
+  }>;
   /** Decrypt a node export file; returns NodeConfig[] for the renderer to merge/replace. */
   importNodes: (
-    passphrase: string
+    passphrase: string,
+    fileContent?: string
   ) => Promise<{
     success?: boolean;
     canceled?: boolean;
@@ -508,6 +528,8 @@ export interface ElectronAPI {
     payload: { conversations: ChatConversation[]; activeConversationId?: string | null }
   ) => Promise<{ success?: boolean; error?: string }>;
   selectFolder: () => Promise<string | null>;
+  /** Resolve a typed folder path on the Studio host (web console). */
+  resolveWorkspacePath?: (dirPath: string) => Promise<{ path?: string; error?: string }>;
   readDir: (dirPath: string) => Promise<WorkspaceFile[] | { error: string }>;
   readFile: (filePath: string) => Promise<{ content?: string; error?: string }>;
   writeFile: (filePath: string, content: string) => Promise<{ success?: boolean; error?: string }>;
@@ -570,6 +592,36 @@ export interface ElectronAPI {
   installUpdate: () => Promise<AppUpdateStatus>;
   setUpdateBusy: (busy: boolean) => Promise<{ busy: boolean; idle: boolean }>;
   onUpdateStatus: (cb: (status: AppUpdateStatus) => void) => () => void;
+
+  /** Embedded web console (LAN remote UI). */
+  webConsoleGetStatus?: () => Promise<{
+    enabled: boolean;
+    port: number;
+    listening: boolean;
+    hasPassword: boolean;
+    urls: string[];
+    lanAddresses: string[];
+    clientCount: number;
+  }>;
+  webConsoleUpdate?: (patch: {
+    enabled?: boolean;
+    port?: number;
+    password?: string;
+  }) => Promise<{
+    success?: boolean;
+    error?: string;
+    status?: {
+      enabled: boolean;
+      port: number;
+      listening: boolean;
+      hasPassword: boolean;
+      urls: string[];
+    };
+    webConsole?: AppSettings['webConsole'];
+  }>;
+  webConsoleSetPassword?: (
+    password: string
+  ) => Promise<{ success?: boolean; error?: string; status?: unknown }>;
 }
 
 export type AppUpdateState =

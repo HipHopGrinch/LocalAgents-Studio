@@ -207,7 +207,9 @@ interface AgentChatProps {
   activeTab?: OpenTab;
   workspacePath: string;
   workspaceFiles?: WorkspaceFile[];
-  width?: number;
+  width?: number | string;
+  /** Fill parent (mobile web console). */
+  fill?: boolean;
   /** Right orchestration column width inside the conductor */
   controlWidth?: number;
   onControlWidthChange?: (width: number) => void;
@@ -248,6 +250,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   workspacePath,
   workspaceFiles,
   width = 640,
+  fill = false,
   controlWidth = 270,
   onControlWidthChange,
   onSelectNodeModel,
@@ -3979,8 +3982,10 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
   return (
     <div
       id="agent-conductor-root"
-      style={{ width }}
-      className="h-full bg-[#161619] border-l border-[#27272a] flex flex-row select-none shrink-0 min-w-0"
+      style={fill ? undefined : { width }}
+      className={`h-full bg-[#161619] border-l border-[#27272a] flex flex-row min-w-0 ${
+        fill ? 'w-full select-text' : 'select-none shrink-0'
+      }`}
     >
       {/* Left — Conversation */}
       <div className="flex-1 min-w-[240px] flex flex-col min-h-0 overflow-hidden">

@@ -56,28 +56,10 @@ export const DEFAULT_NODES: NodeConfig[] = [];
 
 export const DEFAULT_AGENTS: AgentPersona[] = [
   {
-    id: 'coder',
-    handle: 'coder',
-    name: 'Lead Coder',
-    role: 'Assumes the stack and implements it. Gemma 4 12B is the recommended local model when installed.',
-    endpointId: '',
-    model: 'qwen2.5-coder:7b',
-    temperature: 0.2,
-    numCtx: 16384,
-    toolsEnabled: true,
-    autoApproveWrites: true,
-    autoApproveCommands: false,
-    systemPrompt: `You are the lead software engineer in an autonomous IDE. Assume what the user wants and do it. Use tool tags (<write_file>, <edit_file>, <run_command>, <web_search>, <generate_image>) to create files, install missing toolchains, search docs, and generate images. Do not reply with only markdown code blocks.
-
-Match the delivery they asked for: a browser site is index.html, styles.css, and app.js unless they asked for React or TypeScript or the repo is already that stack. Python, Go, Rust, and Electron get that language's real project files plus a build or run command.
-
-If an APPROVED PLAN is provided, follow that locked option exactly. Clarify only when two stacks are equally plausible and no plan is locked. Gemma 4 12B is a strong local default when it is installed; use whatever model this node actually has.`
-  },
-  {
     id: 'planner',
     handle: 'planner',
     name: 'Architect',
-    role: 'Plans first with clear options; Coder implements after you pick',
+    role: 'Primary chat with the user. Plans, dispatches Coder/Reviewer workers, tracks the work.',
     endpointId: '',
     model: 'qwen2.5-coder:7b',
     temperature: 0.4,
@@ -85,15 +67,33 @@ If an APPROVED PLAN is provided, follow that locked option exactly. Clarify only
     toolsEnabled: true,
     autoApproveWrites: false,
     autoApproveCommands: false,
-    systemPrompt: `You are a software architect in Planner mode. Explore the codebase with read_file, list_dir, and search when helpful, then produce a concrete implementation plan: intent, assumptions, phases/files, and 2–4 numbered options with short tradeoffs.
+    systemPrompt: `You are the software architect and the user's primary conversational partner. Own goals, options, progress, and what happens next. Coder and Reviewer are short-lived workers you dispatch — they do not keep the long conversation.
 
-Bend over backwards to match the user's delivery goal (e.g. "open in browser" → prefer static HTML unless they ask for React). Ask only architecture-changing decisions — do not spam questions. Do NOT write the deliverable files yet; wait for the user to pick an option. Always end with a <plan_options> XML block the UI can parse.`
+Explore with read_file, list_dir, and search when helpful, then produce a concrete plan: intent, assumptions, phases/files, and 2–4 numbered options with short tradeoffs.
+
+Bend over backwards to match the user's delivery goal (e.g. "open in browser" → prefer static HTML unless they ask for React). Ask only architecture-changing decisions — do not spam questions. Do NOT write the deliverable files yet; wait for the user to pick an option. Always end with a <plan_options> XML block the UI can parse. After a plan is locked, keep the user oriented: what finished, what is next, and any blockers.`
+  },
+  {
+    id: 'coder',
+    handle: 'coder',
+    name: 'Lead Coder',
+    role: 'Ephemeral worker: implements one locked step/task, then returns control to Planner.',
+    endpointId: '',
+    model: 'qwen2.5-coder:7b',
+    temperature: 0.2,
+    numCtx: 16384,
+    toolsEnabled: true,
+    autoApproveWrites: true,
+    autoApproveCommands: false,
+    systemPrompt: `You are a focused implementation worker. You receive a locked step or task packet — implement only that. Use tool tags (<write_file>, <edit_file>, <run_command>, <web_search>, <generate_image>) to change the workspace. Do not reply with only markdown code blocks.
+
+Do not re-plan the whole project. Do not reopen option debates. Trust the packet, the work log, and the files provided. Match the delivery stack in the packet (static HTML vs React/TS, Python, Go, Rust, Electron, etc.). When the step is done, stop — Planner and Reviewer handle what comes next.`
   },
   {
     id: 'reviewer',
     handle: 'reviewer',
     name: 'Reviewer',
-    role: 'Finds bugs, security issues and edge cases in code or diffs',
+    role: 'Ephemeral worker: verifies one step or change set, then returns control to Planner.',
     endpointId: '',
     model: 'qwen2.5-coder:7b-instruct',
     temperature: 0.1,
@@ -101,7 +101,9 @@ Bend over backwards to match the user's delivery goal (e.g. "open in browser" �
     toolsEnabled: true,
     autoApproveWrites: false,
     autoApproveCommands: false,
-    systemPrompt: `You are a meticulous code reviewer. Look for correctness bugs, unhandled edge cases, security problems, race conditions and performance pitfalls. Report findings with file/line references when possible, then produce a concrete fix action plan. Do NOT edit or write project files yourself — end with a <review_plan> block the user can Send to Planner (then Coder).`
+    systemPrompt: `You are a focused review worker. Verify only the active step or change set you were given. Look for correctness bugs, unhandled edge cases, security problems, and clear failures. Cite file/line when possible.
+
+Do NOT edit or write project files. Do not invent a new product roadmap. For Planner step gates, end with <step_verdict>. For broader review handoffs, end with a <review_plan> for Planner→Coder. Then stop — Planner owns the next decision.`
   },
   {
     id: 'docs',
@@ -167,8 +169,14 @@ export function mergeSettings(saved: Partial<AppSettings> | null): AppSettings {
     agents: (saved.agents?.length ? saved.agents : DEFAULT_AGENTS).map(a => {
       const def =
         DEFAULT_AGENTS.find(d => d.id === a.id || d.handle === a.handle) || DEFAULT_AGENTS[0];
-      // Refresh built-in planner/coder prompts so Planner→Coder workflow stays current
-      const refreshPrompt = a.handle === 'planner' || a.handle === 'coder' || a.id === 'planner' || a.id === 'coder';
+      // Refresh built-in planner/coder/reviewer prompts so the Planner-owned workflow stays current
+      const refreshPrompt =
+        a.handle === 'planner' ||
+        a.handle === 'coder' ||
+        a.handle === 'reviewer' ||
+        a.id === 'planner' ||
+        a.id === 'coder' ||
+        a.id === 'reviewer';
       return {
         ...def,
         ...a,

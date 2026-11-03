@@ -308,6 +308,11 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const autoReviewRef = useRef(false);
   /** Resume depth when user approval is required after a post-step review */
   const pendingReviewResumeRef = useRef<{ depth: number; previousTask: string } | null>(null);
+  /**
+   * When true, Coder/Reviewer model calls get a cleared context (system + task packet only).
+   * Planner keeps durable state via plan/work log; workers do not inherit the full chat.
+   */
+  const ephemeralWorkerRef = useRef(false);
 
   const [input, setInput] = useState('');
   const [pendingImages, setPendingImages] = useState<string[]>([]);
@@ -912,6 +917,14 @@ export const AgentChat: React.FC<AgentChatProps> = ({
 
   const progressForPrompt = () => (hasWorkLog(progressRef.current) ? renderWorkLog(progressRef.current) : '');
 
+  /** Hand control back to Planner after an ephemeral Coder/Reviewer worker finishes. */
+  const restorePlannerControl = (notice?: string) => {
+    ephemeralWorkerRef.current = false;
+    onSelectAgent(plannerAgent.id);
+    onConversationPatch?.({ agentId: plannerAgent.id });
+    if (notice) setExecutingPlanNotice(notice);
+  };
+
   const fitContext = (numCtx: number, force = false) => {
     const current = messagesRef.current;
     if (current.length < 6) return;
@@ -1024,6 +1037,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       stepVerdictMode?: boolean;
       lockPlanMode?: boolean;
       reviewMode?: boolean;
+      /** Cleared-context worker continue (only this turn + tool feedback). */
+      freshContext?: boolean;
     }
   ) => {
     const budget = opts?.budget;
@@ -1151,7 +1166,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       const readOnlyContinue =
         planModeContinue || reviewModeContinue || lockPlanContinue;
       const stepVerdictContinue = !!opts?.stepVerdictMode || originMsg.stepVerdict != null;
-      fitContext(modelMaxCtx(routeNode, routeModel));
+      const freshContinue = !!(opts?.freshContext || ephemeralWorkerRef.current);
+      if (!freshContinue) fitContext(modelMaxCtx(routeNode, routeModel));
       const systemPrompt = buildSystemPrompt(continueAgent, workspacePath, workspaceOverview, {
         planMode: planModeContinue,
         reviewMode: reviewModeContinue,
@@ -1165,10 +1181,16 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         nodes,
         inferenceNodeId: routeNode.id
       });
-      const snap = messagesRef.current;
+      // Ephemeral workers: only this turn + tool feedback. Planner keeps full chat memory.
+      const historySlice = freshContinue
+        ? []
+        : historyForModel(
+            messagesRef.current.filter(m => m.id !== followUpId),
+            stripThinking
+          );
       const conversationPayload = [
         { role: 'system', content: systemPrompt },
-        ...historyForModel(snap.filter(m => m.id !== followUpId), stripThinking),
+        ...historySlice,
         {
           role: 'assistant',
           content: stripThinking(originMsg.raw || 'I inspected the project / terminal.')
@@ -2175,6 +2197,11 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     notice?: string;
     /** Keep a fix on the review model instead of the worker that wrote the files. */
     pinRoute?: { node: EndpointNode; model: string };
+    /**
+     * Cleared model context: system + this task packet only (no prior chat).
+     * Use for Coder/Reviewer workers under Planner control.
+     */
+    freshContext?: boolean;
   }): Promise<ChatMessage | undefined> => {
     const {
       userText,
@@ -2190,9 +2217,11 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       userMsgExtra,
       skipUserAppend,
       notice,
-      pinRoute
+      pinRoute,
+      freshContext
     } = opts;
     const readOnlyMode = !!planMode || !!reviewMode || !!lockPlanMode || !!stepVerdictMode;
+    const useFreshContext = !!(freshContext || ephemeralWorkerRef.current);
 
     const route = pinRoute
       ? {
@@ -2267,7 +2296,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     let originOut: ChatMessage | undefined;
     try {
       const routedMaxCtx = modelMaxCtx(routedNode, routedModel);
-      fitContext(routedMaxCtx);
+      if (!useFreshContext) fitContext(routedMaxCtx);
       const systemPrompt = buildSystemPrompt(agent, workspacePath, workspaceOverview, {
         planMode: !!planMode,
         reviewMode: !!reviewMode,
@@ -2294,13 +2323,14 @@ export const AgentChat: React.FC<AgentChatProps> = ({
                   : `${fullPrompt}\n\n[EXECUTION DIRECTIVE: If this request asks to create, build, or modify an application, script, or file, you MUST emit <write_file path="filename.ext">...complete code...</write_file> tags so the files are written directly to the user's computer. Do NOT just reply with conversational instructions.]`;
       const ollamaImages = attachedImages.map(toOllamaBase64);
 
-      const history = historyForModel(messagesRef.current, stripThinking);
+      // Cleared worker context: do not send the Planner brainstorm / prior turns.
+      const history = useFreshContext ? [] : historyForModel(messagesRef.current, stripThinking);
       const draftTokens = estimateTokens(
         [systemPrompt, ...history.map(m => m.content), actionableUserPrompt].join('\n')
       );
       let userContent = actionableUserPrompt;
       let historySent = history;
-      if (!routedIsFrontier && contextOverflow(draftTokens, routedMaxCtx)) {
+      if (!useFreshContext && !routedIsFrontier && contextOverflow(draftTokens, routedMaxCtx)) {
         try {
           const brief = await requestFreeTierBrief(
             `The local model max context is ${routedMaxCtx} tokens and this job does not fit. Brief the coder.`,
@@ -2528,7 +2558,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           role: continueRole,
           lockPlanMode: !!lockPlanMode,
           reviewMode: !!reviewMode || !!stepVerdictMode,
-          stepVerdictMode: !!stepVerdictMode
+          stepVerdictMode: !!stepVerdictMode,
+          freshContext: useFreshContext
         });
       } else if (readOnlyMode && shouldContinueFromTools(tools, turnContinueOpts)) {
         // Planner/Reviewer: bounded explore continues, then they must emit the plan
@@ -2539,7 +2570,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           role: continueRole,
           lockPlanMode: !!lockPlanMode,
           reviewMode: !!reviewMode || !!stepVerdictMode,
-          stepVerdictMode: !!stepVerdictMode
+          stepVerdictMode: !!stepVerdictMode,
+          freshContext: useFreshContext
         });
         // After tool continuations, refresh reviewPlan from latest follow-up if reviewer
         if (reviewMode && !stepVerdictMode) {
@@ -2688,6 +2720,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       plannerMsg?.display || ''
     );
 
+    ephemeralWorkerRef.current = true;
     onSelectAgent(coderAgent.id);
     onConversationPatch?.({ agentId: coderAgent.id });
     if (coderAgent.autoApproveWrites !== undefined) {
@@ -2710,11 +2743,13 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       reviewMode: false,
       contractMode: false,
       approvedPlan: approvedPlanRef.current,
-      notice: `Coder implementing task #${task.id}`
+      notice: `Coder implementing task #${task.id}`,
+      freshContext: true
     });
     if (!stopRequestedRef.current) {
       await reviewAndAdvance(depth + 1, `Task #${task.id}: ${task.title}`);
     }
+    restorePlannerControl();
   };
 
   /** User approved a clean review — resume next-step continuation. */
@@ -3131,6 +3166,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     const planPrefix = approvedPlanRef.current
       ? `${formatApprovedPlanContext(approvedPlanRef.current)}\n\n`
       : '';
+    ephemeralWorkerRef.current = true;
     await runSingleNodeTurn({
       userText: `Continue: ${nextTask}`,
       fullPrompt: stuckTarget
@@ -3146,10 +3182,15 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         : pinFix
           ? `Fixing on ${node.name} — ${nextTask.slice(0, 120)}`
           : `Continuing automatically — ${nextTask.slice(0, 140)}`,
+      freshContext: true,
       ...(stuckTarget ? { pinRoute: stuckTarget } : pinFix ? { pinRoute: { node, model } } : {})
     });
-    if (stopRequestedRef.current) return;
+    if (stopRequestedRef.current) {
+      restorePlannerControl('Stopped — talk to Planner about what to do next.');
+      return;
+    }
     await reviewAndAdvance(depth + 1, nextTask);
+    restorePlannerControl();
   };
 
   /**
@@ -3256,6 +3297,7 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
         : 'Reviewer checking — waiting for your approval after'
     );
 
+    ephemeralWorkerRef.current = true;
     const reviewMsg = await runSingleNodeTurn({
       userText: deltaMode
         ? `Verify task #${activeTask!.id}: ${activeTask!.title}`
@@ -3265,10 +3307,14 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
       reviewMode: true,
       skipUserAppend: true,
       notice: `Reviewer checking on ${target.node.name}`,
-      pinRoute: target
+      pinRoute: target,
+      freshContext: true
     });
 
-    if (stopRequestedRef.current) return;
+    if (stopRequestedRef.current) {
+      restorePlannerControl('Stopped — talk to Planner about what to do next.');
+      return;
+    }
 
     const latestReview =
       reviewMsg ||
@@ -3468,6 +3514,7 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
     commitPlannerPlan(plan);
     step = getActiveStep(plan)!;
 
+    ephemeralWorkerRef.current = true;
     onSelectAgent(coderAgent.id);
     onConversationPatch?.({ agentId: coderAgent.id });
     if (coderAgent.autoApproveWrites !== undefined) {
@@ -3481,44 +3528,53 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
     const coderPrompt = formatStepForCoders(plan, step);
     setExecutingPlanNotice(`Coder(s) on step #${step.id}: ${step.title}…`);
 
-    if (isPipelineMode) {
-      const synthetic: ApprovedPlan = {
-        summary: `${plan.summary} — step ${step.id}`,
-        chosenOptionId: plan.chosenOptionId || 'plan-step',
-        chosenOptionTitle: step.title,
-        chosenOptionDescription: step.tasks.map(t => `${t.id}. ${t.title}: ${t.description}`).join('\n'),
-        allOptions: [],
-        originalUserRequest: `Plan step #${step.id}: ${step.title}`,
-        approvedAt: Date.now(),
-        planMarkdown: coderPrompt
-      };
-      approvedPlanRef.current = synthetic;
-      onConversationPatch?.({ approvedPlan: synthetic });
-      await handleSendPipelineMessage(`Plan step #${step.id}: ${step.title}`, coderPrompt, {
-        approvedPlan: synthetic,
-        skipUserAppend: true
-      });
-    } else {
-      await runSingleNodeTurn({
-        userText: `Implement plan step #${step.id}: ${step.title}`,
-        fullPrompt: coderPrompt,
-        agent: coderAgent,
-        planMode: false,
-        approvedPlan: approvedPlanRef.current,
-        skipUserAppend: true,
-        notice: `Coder implementing step #${step.id}`
-      });
-    }
+    try {
+      if (isPipelineMode) {
+        const synthetic: ApprovedPlan = {
+          summary: `${plan.summary} — step ${step.id}`,
+          chosenOptionId: plan.chosenOptionId || 'plan-step',
+          chosenOptionTitle: step.title,
+          chosenOptionDescription: step.tasks.map(t => `${t.id}. ${t.title}: ${t.description}`).join('\n'),
+          allOptions: [],
+          originalUserRequest: `Plan step #${step.id}: ${step.title}`,
+          approvedAt: Date.now(),
+          planMarkdown: coderPrompt
+        };
+        approvedPlanRef.current = synthetic;
+        onConversationPatch?.({ approvedPlan: synthetic });
+        await handleSendPipelineMessage(`Plan step #${step.id}: ${step.title}`, coderPrompt, {
+          approvedPlan: synthetic,
+          skipUserAppend: true
+        });
+      } else {
+        await runSingleNodeTurn({
+          userText: `Implement plan step #${step.id}: ${step.title}`,
+          fullPrompt: coderPrompt,
+          agent: coderAgent,
+          planMode: false,
+          approvedPlan: approvedPlanRef.current,
+          skipUserAppend: true,
+          notice: `Coder implementing step #${step.id}`,
+          freshContext: true
+        });
+      }
 
-    if (stopRequestedRef.current) return;
+      if (stopRequestedRef.current) {
+        restorePlannerControl('Stopped — talk to Planner about what to do next.');
+        return;
+      }
 
-    // Mark step tasks done for coder pass; Reviewer Yay/Nay is the real gate.
-    plan = plannerPlanRef.current;
-    if (plan && step) {
-      plan = markAllStepTasks(plan, step.id, 'completed');
-      commitPlannerPlan(plan);
+      // Mark step tasks done for coder pass; Reviewer Yay/Nay is the real gate.
+      plan = plannerPlanRef.current;
+      if (plan && step) {
+        plan = markAllStepTasks(plan, step.id, 'completed');
+        commitPlannerPlan(plan);
+      }
+      await reviewActiveStep();
+    } catch (err: any) {
+      restorePlannerControl(`Coder step failed: ${err?.message || err}`);
+      throw err;
     }
-    await reviewActiveStep();
   };
 
   /** Reviewer Yay/Nay on the active Planner step. */
@@ -3560,6 +3616,9 @@ ${progressForPrompt() || '(empty)'}
 
 After reviewing the files above, emit <step_verdict> immediately. Do not re-read the same paths.`;
 
+    ephemeralWorkerRef.current = true;
+    onSelectAgent(reviewerAgent.id);
+    onConversationPatch?.({ agentId: reviewerAgent.id });
     setExecutingPlanNotice(
       autoReviewRef.current
         ? `Reviewer Yay/Nay on step #${step.id}…`
@@ -3574,10 +3633,14 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       stepVerdictMode: true,
       skipUserAppend: true,
       notice: `Reviewer on ${target.node.name} — step #${step.id}`,
-      pinRoute: target
+      pinRoute: target,
+      freshContext: true
     });
 
-    if (stopRequestedRef.current) return;
+    if (stopRequestedRef.current) {
+      restorePlannerControl('Stopped — talk to Planner about what to do next.');
+      return;
+    }
 
     const latest =
       reviewMsg ||
@@ -3631,9 +3694,9 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     }
 
     if (!autoReviewRef.current) {
-      setExecutingPlanNotice(
+      restorePlannerControl(
         packed.result === 'yay'
-          ? `Step #${step.id} Yay — click Accept to continue`
+          ? `Step #${step.id} Yay — click Accept to continue (Planner owns next)`
           : `Step #${step.id} Nay — click Accept to send fixes to Coder`
       );
       return;
@@ -3643,6 +3706,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       latest ? { ...latest, stepVerdict: packed } : null,
       packed
     );
+    restorePlannerControl();
   };
 
   /** Apply Yay/Nay to durable plan, then next step or rework. */
@@ -3677,7 +3741,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     }
 
     if (plan.status === 'completed') {
-      setExecutingPlanNotice('All plan steps complete.');
+      restorePlannerControl('All plan steps complete — ask Planner what to build next.');
       return;
     }
 
@@ -3693,7 +3757,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       setExecutingPlanNotice(`Step Yay — starting step #${next.id}: ${next.title}`);
       await dispatchActiveStep();
     } else {
-      setExecutingPlanNotice('Planner plan complete.');
+      restorePlannerControl('Planner plan complete — ask Planner what to build next.');
     }
   };
 
@@ -3871,6 +3935,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       setExecutingPlanNotice('Paid solution is in the chat. No local model is online to apply it.');
       return;
     }
+    ephemeralWorkerRef.current = true;
     await runSingleNodeTurn({
       userText: 'Continue: apply the paid API solution',
       fullPrompt: `Apply this solution from the paid API. Do not repeat the failed approach.\n\n${brief}`,
@@ -3878,9 +3943,11 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       planMode: false,
       approvedPlan: approvedPlanRef.current,
       notice: `Applying the paid solution on ${big.node.name} · ${big.model}`,
-      pinRoute: big
+      pinRoute: big,
+      freshContext: true
     });
     if (!stopRequestedRef.current) await reviewAndAdvance(0, brief);
+    restorePlannerControl();
   };
 
   const handleSelectPlanOption = (option: PlanOption, planMsg: ChatMessage) => {
@@ -3932,6 +3999,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
     resetAgentLoopBudget();
     stopRequestedRef.current = false;
     stuckRef.current = { key: '', stage: 'none' };
+    ephemeralWorkerRef.current = false;
 
     let fullPrompt = userText;
     if (includeActiveFile && activeTab) {
@@ -3947,7 +4015,29 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       }
     }
 
-    // New request clears a prior locked plan / review queue unless we're mid-option-match
+    const planActive = isPlanActive(plannerPlanRef.current);
+
+    // During an active plan, the user talks to Planner (workers are ephemeral).
+    if (planActive) {
+      if (!isPlannerSelected) {
+        onSelectAgent(plannerAgent.id);
+        onConversationPatch?.({ agentId: plannerAgent.id });
+      }
+      setExecutingPlanNotice(null);
+      const step = getActiveStep(plannerPlanRef.current);
+      const planHint = step
+        ? `\n\n[ACTIVE PLAN — step #${step.id}: ${step.title}. Advise the user, clarify, or replan only if they ask. Do not emit a fresh <plan_options> unless they want to replan. Do not implement files — Coders are dispatched automatically.]`
+        : `\n\n[ACTIVE PLAN IN PROGRESS. Advise the user or replan only if they ask. Do not implement files yourself.]`;
+      return runSingleNodeTurn({
+        userText,
+        fullPrompt: `${fullPrompt}${planHint}`,
+        attachedImages,
+        agent: plannerAgent,
+        planMode: false
+      });
+    }
+
+    // Fresh Planner ask clears a prior finished/stale approved plan (not while executing).
     if (approvedPlanRef.current && isPlannerSelected) {
       approvedPlanRef.current = null;
       executionQueueRef.current = null;
@@ -3956,10 +4046,9 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       setExecutingPlanNotice(null);
     }
 
-    // Planner selected → plan + options (no Swarm fan-out until option chosen)
+    // Planner → propose options (Coder/Reviewer run later as workers)
     if (isPlannerSelected) {
       setExecutingPlanNotice(null);
-      // Disable older unchosen option cards so only the new proposal is active
       setMessages(prev => {
         const next = prev.map(m =>
           m.planOptions?.length && !m.selectedPlanOptionId
@@ -3978,7 +4067,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       });
     }
 
-    // Reviewer selected → findings + review_plan only (Send to Planner → Coder)
+    // Explicit Reviewer (power-user) → findings + review_plan only
     if (isReviewerSelected) {
       setExecutingPlanNotice(null);
       return runSingleNodeTurn({
@@ -3990,7 +4079,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       });
     }
 
-    // Image paste skips parallel pipeline — vision needs a single multimodal turn
+    // Explicit Coder / Docs (power-user shortcuts)
     if (isPipelineMode && !hasImages) {
       await handleSendPipelineMessage(userText, fullPrompt, {
         approvedPlan: approvedPlanRef.current
@@ -4005,17 +4094,21 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         approvedPlan: approvedPlanRef.current
       });
     }
-    // Auto-review only when explicitly requested by user
     if (!stopRequestedRef.current && autoReviewRef.current) await reviewAndAdvance(0);
   };
 
   const handleStop = () => {
     stopRequestedRef.current = true;
     pendingReviewResumeRef.current = null;
+    ephemeralWorkerRef.current = false;
     activeAbortsRef.current.forEach(abort => abort());
     activeAbortsRef.current = [];
     setIsStreaming(false);
-    setExecutingPlanNotice(null);
+    if (isPlanActive(plannerPlanRef.current)) {
+      restorePlannerControl('Stopped — talk to Planner about what to do next.');
+    } else {
+      setExecutingPlanNotice(null);
+    }
   };
 
   const handleApplyAllTools = async (msg: ChatMessage) => {
@@ -4712,6 +4805,12 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       {/* Input Composer */}
       <div className="p-3 border-t border-[#27272a] bg-[#121215]">
         {showStreamingUi && <ActivityIndicator label={activityLabel} />}
+        {isPlanActive(plannerPlanView) && (
+          <div className="mb-2 px-2 py-1.5 rounded-md bg-indigo-600/15 border border-indigo-500/30 text-[10px] text-indigo-100/90 leading-snug">
+            Talk to <span className="font-semibold">Planner</span> — Coder and Reviewer run as short-lived
+            workers with a cleared context for each step.
+          </div>
+        )}
         {activeTab && (
           <div className="flex items-center justify-between mb-2 px-1 text-[11px] text-zinc-400">
             <label className="flex items-center space-x-1.5 cursor-pointer hover:text-zinc-200">
@@ -4796,13 +4895,15 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
               placeholder={
                 findPendingPlanMessage(messages)
                   ? 'Pick an option (click or type option 1)…'
-                  : isPlannerSelected
-                    ? 'Describe what you want — Planner will propose options…'
-                    : isPipelineMode
-                      ? 'Dispatch task in parallel across all GPUs...'
-                      : selectedSupportsVision
-                        ? `Ask ${currentAgent.name}… (Ctrl+V to paste a screenshot)`
-                        : `Ask ${currentAgent.name}...`
+                  : isPlanActive(plannerPlanView)
+                    ? 'Tell Planner what to change, skip, or do next…'
+                    : isPlannerSelected
+                      ? 'Describe what you want — Planner will propose options…'
+                      : isPipelineMode
+                        ? 'Dispatch task in parallel across all GPUs...'
+                        : selectedSupportsVision
+                          ? `Ask ${currentAgent.name}… (Ctrl+V to paste a screenshot)`
+                          : `Ask ${currentAgent.name}...`
               }
               rows={2}
               className="w-full bg-[#1a1a20] border border-[#2a2a34] focus:border-indigo-500 text-zinc-200 placeholder-zinc-500 text-xs rounded-lg p-2.5 pr-10 outline-none resize-none transition font-sans"

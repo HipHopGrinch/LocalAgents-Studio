@@ -107,7 +107,10 @@ export const App: React.FC = () => {
       loaded: []
     }))
   );
-  const [selectedAgentId, setSelectedAgentId] = useState<string>(DEFAULT_SETTINGS.agents[0].id);
+  const [selectedAgentId, setSelectedAgentId] = useState<string>(
+    DEFAULT_SETTINGS.agents.find(a => a.handle === 'planner' || a.id === 'planner')?.id ||
+      DEFAULT_SETTINGS.agents[0].id
+  );
   const [activeConversationId, setActiveConversationId] = useState<string | undefined>(undefined);
   const loadedWorkspaceRef = useRef('');
   const forceNewChatRef = useRef(false);

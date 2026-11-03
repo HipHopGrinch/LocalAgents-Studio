@@ -308,6 +308,13 @@ function attachWebSocket() {
     socket.__token = token;
     clients.add(socket);
     socket.send(JSON.stringify({ type: 'hello', status: getStatus() }));
+    if (typeof deps?.onClientConnected === 'function') {
+      try {
+        deps.onClientConnected();
+      } catch {
+        /* ignore */
+      }
+    }
 
     socket.on('message', raw => {
       handleWsMessage(socket, raw).catch(err => {
@@ -480,12 +487,18 @@ function clearPassword() {
 }
 
 function init(options) {
-  deps = options;
+  deps = { ...(deps || {}), ...(options || {}) };
+}
+
+/** Register/replace hooks after init (e.g. live-session seed when a browser connects). */
+function setHooks(hooks = {}) {
+  deps = { ...(deps || {}), ...hooks };
 }
 
 module.exports = {
   DEFAULT_PORT,
   init,
+  setHooks,
   applyConfig,
   setPassword,
   clearPassword,

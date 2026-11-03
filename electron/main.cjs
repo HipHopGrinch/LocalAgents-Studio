@@ -264,6 +264,41 @@ ipcMain.handle('session:publish', (_e, snapshot = {}) => {
   }
 });
 
+/** If the Electron window has not published yet, seed from settings.json for web clients. */
+async function ensureLiveSessionSeeded() {
+  try {
+    if (liveSession.updatedAt > 0 && Array.isArray(liveSession.nodes) && liveSession.nodes.length > 0) {
+      send('session:changed', { ...liveSession });
+      return;
+    }
+    let settings = {};
+    try {
+      settings = JSON.parse(await fsp.readFile(settingsPath(), 'utf-8'));
+    } catch {
+      settings = {};
+    }
+    const nodes = Array.isArray(settings.nodes) ? settings.nodes : [];
+    liveSession = {
+      updatedAt: Date.now(),
+      workspacePath: settings.lastWorkspace || liveSession.workspacePath || '',
+      activeConversationId: settings.activeConversationId || liveSession.activeConversationId || null,
+      selectedAgentId: liveSession.selectedAgentId || 'coder',
+      nodes,
+      chatsRevision: liveSession.chatsRevision || 0,
+      source: 'seed'
+    };
+    send('session:changed', { ...liveSession });
+  } catch (err) {
+    appendLog('warn', `live session seed: ${err.message}`);
+  }
+}
+
+webConsole.setHooks({
+  onClientConnected: () => {
+    void ensureLiveSessionSeeded();
+  }
+});
+
 ipcMain.handle('settings:path', () => settingsPath());
 
 ipcMain.handle('settings:openFolder', async () => {

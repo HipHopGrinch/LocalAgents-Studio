@@ -171,19 +171,22 @@ export const App: React.FC = () => {
         return cfg;
       });
       setSettings(prev => ({ ...prev, nodes: configs }));
-      setNodes(
-        session.nodes.map(n => {
+      setNodes(prev => {
+        const byId = new Map(prev.map(n => [n.id, n]));
+        return session.nodes.map(n => {
+          const existing = byId.get(n.id);
           const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, ...cfg } = n;
+          const hasLiveModels = Array.isArray(n.models) && n.models.length > 0;
           return {
             ...cfg,
-            online: !!n.online,
-            latency: n.latency ?? null,
-            models: n.models || [],
-            loaded: n.loaded || [],
-            error: n.error
+            online: typeof n.online === 'boolean' ? n.online : existing?.online ?? false,
+            latency: n.latency != null ? n.latency : existing?.latency ?? null,
+            models: hasLiveModels ? n.models! : existing?.models ?? [],
+            loaded: n.loaded?.length ? n.loaded : existing?.loaded ?? [],
+            error: n.error ?? existing?.error
           } as EndpointNode;
-        })
-      );
+        });
+      });
     }
 
     if (session.selectedAgentId) setSelectedAgentId(session.selectedAgentId);
@@ -308,32 +311,52 @@ export const App: React.FC = () => {
       if (typeof live?.chatsRevision === 'number') chatsRevisionRef.current = live.chatsRevision;
       setWorkspacePath(defaultPath);
       loadDirectory(defaultPath);
+      if (isRemoteClient) setRemoteLive(true);
     }
-    init();
+    init().catch(err => {
+      console.error('init failed', err);
+      void window.electronAPI?.writeLog?.(
+        'error',
+        `init failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    });
   }, [isRemoteClient]);
 
-  // Web console: stream live session (event + short poll backup). No manual resync.
+  // Web console: host link is "live" once settings RPC works; also follow desktop session stream.
   useEffect(() => {
-    if (!isRemoteClient || !window.electronAPI?.onLiveSession) return;
-    const unsub = window.electronAPI.onLiveSession(session => {
-      setRemoteLive(true);
+    if (!isRemoteClient || !window.electronAPI) return;
+
+    let cancelled = false;
+    const markHostUp = () => {
+      if (!cancelled) setRemoteLive(true);
+    };
+
+    // Prove the WebSocket bridge works immediately (do not wait for desktop publish).
+    void window.electronAPI
+      .loadSettings()
+      .then(() => markHostUp())
+      .catch(() => {});
+
+    const unsub = window.electronAPI.onLiveSession?.(session => {
+      markHostUp();
       applyLiveSession(session);
     });
+
     const poll = window.setInterval(() => {
       void window.electronAPI.getLiveSession?.().then(s => {
-        if (s?.updatedAt) {
-          setRemoteLive(true);
-          applyLiveSession(s);
-        }
+        markHostUp();
+        if (s && s.updatedAt > 0) applyLiveSession(s);
       });
-    }, 1500);
+    }, 2000);
+
     return () => {
-      unsub();
+      cancelled = true;
+      unsub?.();
       window.clearInterval(poll);
     };
   }, [isRemoteClient, applyLiveSession]);
 
-  // Desktop publishes full live cluster + workspace continuously.
+  // Desktop Electron window publishes continuously for remotes to mirror workspace/chat.
   useEffect(() => {
     if (!window.electronAPI?.publishLiveSession || isRemoteClient) return;
     if (publishTimerRef.current) clearTimeout(publishTimerRef.current);
@@ -540,12 +563,11 @@ export const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    // Remote clients mirror online/models from the desktop live session stream.
-    if (isRemoteClient) return;
+    // Web + desktop both ping through the host — remotes must not wait solely on live session.
     refreshNodes();
     const interval = setInterval(refreshNodes, (settings.pollIntervalSec || 15) * 1000);
     return () => clearInterval(interval);
-  }, [settings.pollIntervalSec, refreshNodes, isRemoteClient]);
+  }, [settings.pollIntervalSec, refreshNodes]);
 
   // 4. File Tree
   const loadDirectory = async (dirPath: string) => {
@@ -1067,7 +1089,9 @@ export const App: React.FC = () => {
             }`}
           />
           <span className="truncate">
-            {remoteLive ? 'Live — controlling Studio on this PC' : 'Connecting to Studio session…'}
+            {remoteLive
+              ? 'Connected to Studio host — cluster status is live'
+              : 'Connecting to Studio host…'}
           </span>
         </div>
       )}

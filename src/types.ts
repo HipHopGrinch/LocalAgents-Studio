@@ -12,7 +12,10 @@ export interface ModelThinkingInfo {
 export interface ModelPref {
   /** Top-level Ollama `think` value; null = use model default */
   think?: boolean | string | null;
-  /** Ollama `options.num_ctx` for this model on this node; omit = agent/default */
+  /**
+   * Maximum Ollama `options.num_ctx` for this model on this node.
+   * Each request uses a smaller dynamic window capped by this value. Omit = agent/default.
+   */
   numCtx?: number;
 }
 

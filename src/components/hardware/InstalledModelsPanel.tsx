@@ -259,68 +259,68 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
                 </div>
               </div>
 
-              {/* Context window (num_ctx) — per-model on this node */}
+              {/* Max context ceiling — per-model on this node; requests use a smaller dynamic num_ctx */}
               {!isEmbed && onSetModelNumCtx && currentNode.type !== 'openai' && (() => {
-                const maxCtx = resolveModelMaxContext(m.name, m);
-                const storedCtx = resolveModelNumCtx(currentNode, m.name, DEFAULT_MODEL_NUM_CTX);
-                const currentCtx = snapNumCtxToOption(storedCtx, maxCtx);
-                const options = ctxSizeOptions(maxCtx, currentCtx);
-                const fit = estimateContextFit(currentCtx);
-                const vramFit = estimateInstalledModelFit(m, currentNode.hardware, currentCtx);
+                const modelNativeMax = resolveModelMaxContext(m.name, m);
+                const storedMax = resolveModelNumCtx(currentNode, m.name, DEFAULT_MODEL_NUM_CTX);
+                const currentMax = snapNumCtxToOption(storedMax, modelNativeMax);
+                const options = ctxSizeOptions(modelNativeMax, currentMax);
+                const fit = estimateContextFit(currentMax);
+                const vramFit = estimateInstalledModelFit(m, currentNode.hardware, currentMax);
                 const spills = fitSpillsToSystemRam(vramFit.kind);
-                const overMax = maxCtx != null && currentCtx > maxCtx;
+                const overMax = modelNativeMax != null && currentMax > modelNativeMax;
                 const spillTitle =
                   vramFit.kind === 'none'
-                    ? "Won't fit in VRAM + system RAM at this context size"
-                    : 'May spill into system RAM (slower)';
+                    ? "Won't fit in VRAM + system RAM at this max context"
+                    : 'May spill into system RAM (slower) at this max';
                 return (
                   <div className="pt-1.5 border-t border-[#252530] space-y-1.5">
                     <div className="flex items-center justify-between gap-2 flex-wrap">
                       <div className="flex items-center space-x-1.5 text-[11px] text-indigo-300 font-medium min-w-0">
                         <Gauge className="w-3.5 h-3.5 shrink-0" />
-                        <span>Context size</span>
-                        <HelpTip title="Context window (num_ctx)" align="left">
+                        <span>Max context</span>
+                        <HelpTip title="Maximum context (num_ctx ceiling)" align="left">
                           <p>
-                            How many tokens Ollama keeps in the prompt window for this model on this node.
-                            Larger context uses more VRAM.
+                            Ceiling for this model on this node. Each Planner/Coder/Reviewer request uses the
+                            <strong> smallest </strong>
+                            num_ctx that fits that turn&apos;s system prompt, history, tools, and expected
+                            output — never larger than this max.
                           </p>
                           <p>
-                            VRAM totals are approximate: model weights + KV cache for this context size
-                            (scaled by this node&apos;s KV cache type). Spill warnings use usable VRAM after
-                            reserved VRAM.
+                            VRAM totals below assume the model is loaded at this <em>maximum</em> (weights +
+                            KV cache). Smaller live windows use less KV in practice. Spill warnings use usable
+                            VRAM after reserved VRAM.
                           </p>
-                          <p>
-                            Rough estimates for English text; code and images differ:
-                          </p>
+                          <p>Rough estimates for English text; code and images differ:</p>
                           <ul className="list-disc pl-3.5 space-y-0.5">
                             <li>1 token ≈ 0.75 English words</li>
                             <li>1 page ≈ 500 words ≈ 667 tokens</li>
                             <li>1 short website ≈ 2,500 tokens</li>
                             <li>1 medium source file ≈ 1,500 tokens</li>
                           </ul>
-                          {!maxCtx && (
+                          {!modelNativeMax && (
                             <p className="text-amber-400/90">
-                              Max context unknown for this model — oversized values waste VRAM and may fail to load.
+                              Model max unknown — a huge ceiling wastes VRAM if a request ever needs it.
                             </p>
                           )}
                         </HelpTip>
-                        {maxCtx != null && (
+                        {modelNativeMax != null && (
                           <span className="text-[9px] text-zinc-500 font-normal">
-                            max {formatCtxLabel(maxCtx)}
+                            model {formatCtxLabel(modelNativeMax)}
                           </span>
                         )}
                       </div>
                       <select
-                        value={currentCtx}
+                        value={currentMax}
                         onChange={(e) => {
                           onSetModelNumCtx(
                             currentNode,
                             m.name,
-                            clampNumCtx(parseInt(e.target.value, 10), maxCtx)
+                            clampNumCtx(parseInt(e.target.value, 10), modelNativeMax)
                           );
                         }}
                         className="bg-[#1a1a20] border border-[#2a2a36] focus:border-indigo-500 text-zinc-200 rounded px-1.5 py-0.5 outline-none font-mono text-[11px] shrink-0"
-                        title="Ollama options.num_ctx"
+                        title="Maximum Ollama options.num_ctx (requests use a smaller dynamic window)"
                       >
                         {options.map(sz => (
                           <option key={sz} value={sz}>
@@ -330,13 +330,13 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
                       </select>
                     </div>
                     <p className={`text-[10px] font-mono leading-snug ${overMax ? 'text-amber-400' : 'text-zinc-500'}`}>
-                      {fit.label}
+                      Ceiling · {fit.label}
                       {overMax ? ' · exceeds model max' : ''}
-                      {!maxCtx ? ' · max unknown — large ctx burns VRAM' : ''}
+                      {!modelNativeMax ? ' · model max unknown' : ''}
                     </p>
                     <p className="text-[10px] font-mono leading-snug text-zinc-400 flex items-center flex-wrap gap-x-1.5 gap-y-0.5">
                       <span>
-                        Model ~{formatGB(vramFit.weightsGB)} · Context ~{formatGB(vramFit.kvGB)} · Total ~
+                        Model ~{formatGB(vramFit.weightsGB)} · Max ctx KV ~{formatGB(vramFit.kvGB)} · Total ~
                         {formatGB(vramFit.totalGB)}
                       </span>
                       {spills && (

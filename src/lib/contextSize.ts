@@ -100,6 +100,10 @@ export function snapNumCtxToOption(value: number, maxCtx?: number): number {
   return best;
 }
 
+/**
+ * User-configured **maximum** context for this model on this node.
+ * Requests use a smaller dynamic num_ctx capped by this value.
+ */
 export function resolveModelNumCtx(
   node: Pick<EndpointNode, 'modelPrefs'> | undefined,
   model: string,
@@ -110,9 +114,93 @@ export function resolveModelNumCtx(
   return fallback > 0 ? Math.floor(fallback) : DEFAULT_MODEL_NUM_CTX;
 }
 
+/** Alias for clarity at call sites that mean "ceiling", not the request size. */
+export const resolveModelMaxNumCtx = resolveModelNumCtx;
+
 export function clampNumCtx(value: number, maxCtx?: number): number {
   let n = Math.floor(value);
   if (!Number.isFinite(n) || n < 512) n = 512;
   if (maxCtx && maxCtx > 0) n = Math.min(n, maxCtx);
   return n;
+}
+
+export type DynamicCtxRole = 'coder' | 'planner' | 'reviewer' | 'docs' | 'assist' | 'generic';
+
+/** Rough token estimate (chars/4) — same scheme as free-tier assist. */
+export function estimateTextTokens(text: string): number {
+  return Math.ceil((text || '').length / 4);
+}
+
+export function estimateChatPayloadTokens(
+  messages: Array<{ role?: string; content?: unknown }>
+): number {
+  let total = 0;
+  for (const m of messages) {
+    total += 4; // role / message framing
+    if (typeof m.content === 'string') {
+      total += estimateTextTokens(m.content);
+    } else if (Array.isArray(m.content)) {
+      for (const part of m.content) {
+        if (typeof part === 'string') total += estimateTextTokens(part);
+        else if (part && typeof part === 'object' && 'text' in part) {
+          total += estimateTextTokens(String((part as { text?: string }).text || ''));
+        } else if (part && typeof part === 'object') {
+          // image_url / other parts — coarse budget
+          total += 768;
+        }
+      }
+    }
+  }
+  return total;
+}
+
+/** Reserved room for the model's reply (and tool XML). */
+export function expectedOutputTokens(
+  role: DynamicCtxRole = 'generic',
+  opts?: { createIntent?: boolean }
+): number {
+  switch (role) {
+    case 'coder':
+      return opts?.createIntent === false ? 3072 : 6144;
+    case 'planner':
+      return 3072;
+    case 'reviewer':
+      return 2048;
+    case 'docs':
+      return 3072;
+    case 'assist':
+      return 512;
+    default:
+      return 2048;
+  }
+}
+
+/** Round up for Ollama num_ctx (256-token steps, minimum 1024). */
+export function roundUpNumCtx(tokens: number): number {
+  const step = 256;
+  const n = Math.ceil(Math.max(0, tokens) / step) * step;
+  return Math.max(1024, n);
+}
+
+/**
+ * Smallest practical num_ctx for this request, capped by the user's max.
+ * Accounts for messages (system + history + user), expected output, and a small margin.
+ */
+export function pickDynamicNumCtx(opts: {
+  messages: Array<{ role?: string; content?: unknown }>;
+  maxCtx: number;
+  role?: DynamicCtxRole;
+  createIntent?: boolean;
+  /** Extra tokens for tool schemas / sticky directives (default 256). */
+  toolOverhead?: number;
+}): number {
+  const maxCtx = clampNumCtx(opts.maxCtx || DEFAULT_MODEL_NUM_CTX);
+  const input = estimateChatPayloadTokens(opts.messages || []);
+  const output = expectedOutputTokens(opts.role || 'generic', {
+    createIntent: opts.createIntent
+  });
+  const overhead = typeof opts.toolOverhead === 'number' ? opts.toolOverhead : 256;
+  const margin = Math.ceil(input * 0.08);
+  const needed = input + output + overhead + margin;
+  return clampNumCtx(roundUpNumCtx(needed), maxCtx);
 }

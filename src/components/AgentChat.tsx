@@ -92,7 +92,11 @@ import { StepVerdictCard } from './agent/StepVerdictCard';
 import { HelpTip } from './agent/HelpTip';
 import { ActivityIndicator, streamingActivityLabel } from './agent/ActivityIndicator';
 import { modelSupportsThinking, resolveThinkOption, thinkingToggleLabel } from '../lib/thinking';
-import { resolveModelNumCtx } from '../lib/contextSize';
+import {
+  pickDynamicNumCtx,
+  resolveModelNumCtx,
+  type DynamicCtxRole
+} from '../lib/contextSize';
 import {
   ASSIST_MAX_PREDICT,
   contextOverflow,
@@ -629,9 +633,38 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     return { ...body, think };
   };
 
-  /** Per-model num_ctx from Hardware Settings; falls back to agent persona. */
-  const chatNumCtx = (node: EndpointNode | undefined, model: string) =>
+  /** User max context ceiling for this model (Hardware Settings). */
+  const modelMaxCtx = (node: EndpointNode | undefined, model: string) =>
     resolveModelNumCtx(node, model, currentAgent.numCtx);
+
+  const roleForDynamicCtx = (handle?: string): DynamicCtxRole => {
+    const h = (handle || '').toLowerCase();
+    if (h === 'planner') return 'planner';
+    if (h === 'reviewer') return 'reviewer';
+    if (h === 'docs') return 'docs';
+    if (h === 'coder') return 'coder';
+    return 'generic';
+  };
+
+  /**
+   * Live Ollama num_ctx for this request: smallest window that fits the payload,
+   * capped by the user's max. Pass the exact messages array about to be sent.
+   */
+  const chatNumCtx = (
+    node: EndpointNode | undefined,
+    model: string,
+    messages?: Array<{ role?: string; content?: unknown }>,
+    opts?: { role?: DynamicCtxRole; createIntent?: boolean }
+  ) => {
+    const maxCtx = modelMaxCtx(node, model);
+    if (!messages?.length) return maxCtx;
+    return pickDynamicNumCtx({
+      messages,
+      maxCtx,
+      role: opts?.role,
+      createIntent: opts?.createIntent
+    });
+  };
 
   const freeTierUsageFor = (node: EndpointNode): FreeTierUsage | undefined => {
     const saved = node.freeTierUsage;
@@ -768,31 +801,35 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     // A clean stop just forgot the closing tag — save the body as-is.
     // Keep going only when the API cut the reply off.
     if (/^(stop|end_turn|end)$/i.test(doneReason || '')) return content;
+    const continueMsgs = [
+      {
+        role: 'system',
+        content:
+          'A file write was cut off. Continue from the exact cutoff. Output only the missing remainder of that file, then a closing </' +
+          open.name +
+          '> tag. Do not repeat text already written. Do not open a new file tag.'
+      },
+      { role: 'assistant', content: content.slice(-6000) },
+      {
+        role: 'user',
+        content:
+          'Continue the unfinished <' +
+          open.name +
+          ' path="' +
+          open.path +
+          '"> from the last characters above. End with </' +
+          open.name +
+          '>.'
+      }
+    ];
     const body = withThink(
       {
         model,
-        messages: [
-          {
-            role: 'system',
-            content:
-              'A file write was cut off. Continue from the exact cutoff. Output only the missing remainder of that file, then a closing </' +
-              open.name +
-              '> tag. Do not repeat text already written. Do not open a new file tag.'
-          },
-          { role: 'assistant', content: content.slice(-6000) },
-          {
-            role: 'user',
-            content:
-              'Continue the unfinished <' +
-              open.name +
-              ' path="' +
-              open.path +
-              '"> from the last characters above. End with </' +
-              open.name +
-              '>.'
-          }
-        ],
-        options: { temperature: 0.2, num_ctx: chatNumCtx(node, model) }
+        messages: continueMsgs,
+        options: {
+          temperature: 0.2,
+          num_ctx: chatNumCtx(node, model, continueMsgs, { role: 'coder', createIntent: true })
+        }
       },
       node,
       model
@@ -981,7 +1018,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       const readOnlyContinue =
         planModeContinue || reviewModeContinue || lockPlanContinue;
       const stepVerdictContinue = !!opts?.stepVerdictMode || originMsg.stepVerdict != null;
-      fitContext(chatNumCtx(routeNode, routeModel));
+      fitContext(modelMaxCtx(routeNode, routeModel));
       const systemPrompt = buildSystemPrompt(continueAgent, workspacePath, workspaceOverview, {
         planMode: planModeContinue,
         reviewMode: reviewModeContinue,
@@ -1022,7 +1059,10 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         messages: conversationPayload,
         options: {
           temperature: continueAgent.temperature,
-          num_ctx: chatNumCtx(routeNode, routeModel)
+          num_ctx: chatNumCtx(routeNode, routeModel, conversationPayload, {
+            role: roleForDynamicCtx(continueAgent.handle),
+            createIntent: !readOnlyContinue
+          })
         }
       }, routeNode, routeModel);
 
@@ -1162,7 +1202,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     opts?: { approvedPlan?: ApprovedPlan | null; skipUserAppend?: boolean }
   ) => {
     resetAgentLoopBudget();
-    fitContext(chatNumCtx(selectedNode, activeTargetModel));
+    fitContext(modelMaxCtx(selectedNode, activeTargetModel));
     const lockedPlan = opts?.approvedPlan ?? approvedPlanRef.current;
     const userMsg: ChatMessage = {
       id: `msg-${Date.now()}`,
@@ -1255,14 +1295,18 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         nodes,
         inferenceNodeId: node.id
       });
+      const workerMsgs = [
+        { role: 'system', content: workerSystemPrompt },
+        { role: 'user', content: userPrompt }
+      ];
       const body = withThink(
         {
           model,
-          messages: [
-            { role: 'system', content: workerSystemPrompt },
-            { role: 'user', content: userPrompt }
-          ],
-          options: { temperature: currentAgent.temperature, num_ctx: chatNumCtx(node, model) }
+          messages: workerMsgs,
+          options: {
+            temperature: currentAgent.temperature,
+            num_ctx: chatNumCtx(node, model, workerMsgs, { role: 'coder', createIntent: true })
+          }
         },
         node,
         model
@@ -1487,17 +1531,24 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           progressForPrompt() || null,
           swarmDevHost
         );
+        const architectMsgs = [
+          {
+            role: 'system',
+            content:
+              'You are the Lead Architect (@coder). Respond ONLY with a valid JSON object for the Swarm manifest. No markdown outside JSON. Workspace/installs/run_command target the Dev PC where Studio is open — not necessarily this inference host.'
+          },
+          { role: 'user', content: architectPrompt }
+        ];
         const architectBody: Record<string, unknown> = {
           model: architect.model,
-          messages: [
-            {
-              role: 'system',
-              content:
-                'You are the Lead Architect (@coder). Respond ONLY with a valid JSON object for the Swarm manifest. No markdown outside JSON. Workspace/installs/run_command target the Dev PC where Studio is open — not necessarily this inference host.'
-            },
-            { role: 'user', content: architectPrompt }
-          ],
-          options: { temperature: 0.1, num_ctx: 8192 }
+          messages: architectMsgs,
+          options: {
+            temperature: 0.1,
+            num_ctx: chatNumCtx(architect.node, architect.model, architectMsgs, {
+              role: 'coder',
+              createIntent: true
+            })
+          }
         };
         if (!isFrontierNode(architect.node)) architectBody.format = 'json';
         const decompHandle = streamChat(
@@ -1561,16 +1612,23 @@ export const AgentChat: React.FC<AgentChatProps> = ({
               manifest,
               check.output || check.error || 'unknown tsc error'
             );
+            const repairMsgs = [
+              {
+                role: 'system',
+                content: 'Fix the Swarm JSON manifest so contractCode typechecks. JSON only.'
+              },
+              { role: 'user', content: repairPrompt }
+            ];
             const repairBody: Record<string, unknown> = {
               model: architect.model,
-              messages: [
-                {
-                  role: 'system',
-                  content: 'Fix the Swarm JSON manifest so contractCode typechecks. JSON only.'
-                },
-                { role: 'user', content: repairPrompt }
-              ],
-              options: { temperature: 0.1, num_ctx: 8192 }
+              messages: repairMsgs,
+              options: {
+                temperature: 0.1,
+                num_ctx: chatNumCtx(architect.node, architect.model, repairMsgs, {
+                  role: 'coder',
+                  createIntent: true
+                })
+              }
             };
             if (!isFrontierNode(architect.node)) repairBody.format = 'json';
             const repairHandle = streamChat(
@@ -2075,7 +2133,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
 
     let originOut: ChatMessage | undefined;
     try {
-      fitContext(chatNumCtx(routedNode, routedModel));
+      const routedMaxCtx = modelMaxCtx(routedNode, routedModel);
+      fitContext(routedMaxCtx);
       const systemPrompt = buildSystemPrompt(agent, workspacePath, workspaceOverview, {
         planMode: !!planMode,
         reviewMode: !!reviewMode,
@@ -2108,10 +2167,10 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       );
       let userContent = actionableUserPrompt;
       let historySent = history;
-      if (!routedIsFrontier && contextOverflow(draftTokens, chatNumCtx(routedNode, routedModel))) {
+      if (!routedIsFrontier && contextOverflow(draftTokens, routedMaxCtx)) {
         try {
           const brief = await requestFreeTierBrief(
-            `The local model context is ${chatNumCtx(routedNode, routedModel)} tokens and this job does not fit. Brief the coder.`,
+            `The local model max context is ${routedMaxCtx} tokens and this job does not fit. Brief the coder.`,
             [systemPrompt, ...history.map(m => `${m.role}: ${m.content}`), actionableUserPrompt].join('\n\n')
           );
           if (brief) {
@@ -2135,13 +2194,23 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         }
       ];
 
+      const turnRole = roleForDynamicCtx(
+        stepVerdictMode || reviewMode
+          ? 'reviewer'
+          : planMode || lockPlanMode || contractMode
+            ? 'planner'
+            : agent.handle
+      );
       const body = withThink(
         {
           model: routedModel,
           messages: conversationPayload,
           options: {
             temperature: agent.temperature,
-            num_ctx: chatNumCtx(routedNode, routedModel)
+            num_ctx: chatNumCtx(routedNode, routedModel, conversationPayload, {
+              role: turnRole,
+              createIntent: !readOnlyMode
+            })
           }
         },
         routedNode,
@@ -2613,20 +2682,24 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     let handledLoop = false;
     try {
       const askModel = async (content: string, prior: { role: string; content: string }[]) => {
+        const askMsgs = [
+          {
+            role: 'system',
+            content:
+              CONTINUATION_REVIEW_SYSTEM +
+              '\n\nDo NOT use <edit_file> or <write_file>. Reviewer already checked the files; only emit <next_step>.'
+          },
+          ...prior,
+          { role: 'user', content }
+        ];
         const body = withThink(
           {
             model,
-            messages: [
-              {
-                role: 'system',
-                content:
-                  CONTINUATION_REVIEW_SYSTEM +
-                  '\n\nDo NOT use <edit_file> or <write_file>. Reviewer already checked the files; only emit <next_step>.'
-              },
-              ...prior,
-              { role: 'user', content }
-            ],
-            options: { temperature: 0.2, num_ctx: chatNumCtx(node, model) }
+            messages: askMsgs,
+            options: {
+              temperature: 0.2,
+              num_ctx: chatNumCtx(node, model, askMsgs, { role: 'planner', createIntent: false })
+            }
           },
           node,
           model
@@ -3514,7 +3587,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
 
     const confirmDisplay = confirmationText.trim() || `Option ${option.id}: ${option.title}`;
     updateProgress(log => noteUserTurn(log, `${option.title}. ${option.description}`));
-    fitContext(chatNumCtx(selectedNode, activeTargetModel));
+    fitContext(modelMaxCtx(selectedNode, activeTargetModel));
     const userConfirm: ChatMessage = {
       id: `msg-${Date.now()}`,
       role: 'user',
@@ -3722,7 +3795,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
     setInput('');
     setPendingImages([]);
     updateProgress(log => noteUserTurn(log, userText));
-    fitContext(chatNumCtx(selectedNode, activeTargetModel));
+    fitContext(modelMaxCtx(selectedNode, activeTargetModel));
     resetAgentLoopBudget();
     stopRequestedRef.current = false;
     stuckRef.current = { key: '', stage: 'none' };
@@ -3977,7 +4050,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
 
             <button
               type="button"
-              onClick={() => fitContext(chatNumCtx(selectedNode, activeTargetModel), true)}
+              onClick={() => fitContext(modelMaxCtx(selectedNode, activeTargetModel), true)}
               disabled={isStreaming || messages.length < 6}
               className="flex items-center space-x-1 px-1.5 py-1 rounded text-[11px] font-medium text-zinc-300 hover:text-white hover:bg-[#202026] border border-transparent hover:border-[#2a2a36] transition disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-zinc-300"
               title="Compact this chat. The work log keeps the finished steps and the next step."

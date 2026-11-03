@@ -175,6 +175,7 @@ import {
 import {
   activateNextStep,
   applyStepVerdict,
+  collectStepFilePaths,
   createPlanFromParsed,
   formatStepForCoders,
   formatStepForReviewer,
@@ -345,6 +346,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const [plannerPlanView, setPlannerPlanView] = useState<PlannerPlan | null>(
     conversation?.plannerPlan ?? null
   );
+  /** Auto-review Nay reworks per step id — caps infinite Coder↔Reviewer loops. */
+  const stepReworkCountRef = useRef<Record<string, number>>({});
   const stopRequestedRef = useRef(false);
 
   const commitExecutionQueue = (next: ExecutionQueue | null) => {
@@ -433,6 +436,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       executionQueueRef.current = conversation?.executionQueue ?? null;
       plannerPlanRef.current = conversation?.plannerPlan ?? null;
       setPlannerPlanView(conversation?.plannerPlan ?? null);
+      stepReworkCountRef.current = {};
       setExecutingPlanNotice(null);
       setInput('');
       setPendingImages([]);
@@ -3525,7 +3529,28 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
     resetAgentLoopBudget();
     stopRequestedRef.current = false;
 
-    const coderPrompt = formatStepForCoders(plan, step);
+    // Cleared-context Coders need the named file bodies (e.g. app.js) in the packet —
+    // titles alone caused incomplete edits → Reviewer Nay → infinite rework loops.
+    const stepFiles = collectStepFilePaths(step);
+    const recentWrites = collectWrittenPaths(messagesRef.current);
+    const filesBody = await buildTouchedFilesContext(
+      workspacePath,
+      [...stepFiles, ...recentWrites],
+      {
+        maxFiles: 10,
+        maxCharsPerFile: 12000,
+        maxTotalChars: 48000
+      }
+    );
+    const coderPrompt = `${formatStepForCoders(plan, step)}
+
+${
+  filesBody ||
+  '(No file bodies preloaded — call read_file once for each path you must change, then edit_file/write_file.)'
+}
+
+Work log:
+${progressForPrompt() || '(empty)'}`;
     setExecutingPlanNotice(`Coder(s) on step #${step.id}: ${step.title}…`);
 
     try {
@@ -3595,14 +3620,16 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
       return;
     }
 
+    const stepFiles = collectStepFilePaths(step);
     const touchedPaths = collectWrittenPaths(messagesRef.current);
-    const filesHint = touchedPaths.length
-      ? `Files just written/edited:\n${touchedPaths.slice(0, 16).join('\n')}`
+    const reviewPaths = [...touchedPaths, ...stepFiles];
+    const filesHint = reviewPaths.length
+      ? `Files to verify:\n${reviewPaths.slice(0, 16).join('\n')}`
       : 'Review from chat context and the step task list.';
-    const filesBody = await buildTouchedFilesContext(workspacePath, touchedPaths, {
-      maxFiles: 8,
-      maxCharsPerFile: 5000,
-      maxTotalChars: 20000
+    const filesBody = await buildTouchedFilesContext(workspacePath, reviewPaths, {
+      maxFiles: 10,
+      maxCharsPerFile: 12000,
+      maxTotalChars: 48000
     });
 
     const reviewPrompt = `${formatStepForReviewer(plan, step)}
@@ -3741,17 +3768,32 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     }
 
     if (plan.status === 'completed') {
+      stepReworkCountRef.current = {};
       restorePlannerControl('All plan steps complete — ask Planner what to build next.');
       return;
     }
 
     if (v.result === 'nay') {
-      setExecutingPlanNotice(`Reworking step #${v.stepId} from Reviewer Nay…`);
+      const sid = String(v.stepId || '');
+      const prior = stepReworkCountRef.current[sid] || 0;
+      const nextCount = prior + 1;
+      stepReworkCountRef.current[sid] = nextCount;
+      const MAX_STEP_REWORKS = 2;
+      if (nextCount > MAX_STEP_REWORKS) {
+        restorePlannerControl(
+          `Step #${sid} failed review ${nextCount} times — talk to Planner (or fix Auto-review) before another Coder pass.`
+        );
+        return;
+      }
+      setExecutingPlanNotice(
+        `Reworking step #${sid} from Reviewer Nay (${nextCount}/${MAX_STEP_REWORKS})…`
+      );
       await dispatchActiveStep();
       return;
     }
 
-    // Yay — next step already activated by applyStepVerdict
+    // Yay — clear rework counter for this step, then next
+    if (v.stepId) delete stepReworkCountRef.current[String(v.stepId)];
     const next = getActiveStep(plan);
     if (next) {
       setExecutingPlanNotice(`Step Yay — starting step #${next.id}: ${next.title}`);
@@ -3772,13 +3814,13 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     const approved = buildApprovedPlan(planMsg, option, original);
     approvedPlanRef.current = approved;
     executionQueueRef.current = null;
-    commitPlannerPlan(null);
+    stepReworkCountRef.current = {};
+    // Keep the previous plan visible under Conductor until the new lock commits.
 
     onSelectAgent(plannerAgent.id);
     onConversationPatch?.({
       approvedPlan: approved,
       executionQueue: null,
-      plannerPlan: null,
       agentId: plannerAgent.id
     });
 
@@ -4037,12 +4079,12 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       });
     }
 
-    // Fresh Planner ask clears a prior finished/stale approved plan (not while executing).
+    // Fresh Planner ask clears a prior finished approvedPlan — keep plannerPlan on the panel
+    // until a new execution_plan locks (so the task list does not vanish under Conductor).
     if (approvedPlanRef.current && isPlannerSelected) {
       approvedPlanRef.current = null;
       executionQueueRef.current = null;
-      commitPlannerPlan(null);
-      onConversationPatch?.({ approvedPlan: null, executionQueue: null, plannerPlan: null });
+      onConversationPatch?.({ approvedPlan: null, executionQueue: null });
       setExecutingPlanNotice(null);
     }
 

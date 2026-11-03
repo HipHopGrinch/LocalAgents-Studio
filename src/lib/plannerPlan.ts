@@ -212,6 +212,33 @@ export function formatPlanForPanel(plan: PlannerPlan): string {
   return `Plan (${plan.status}): ${plan.summary}\n${lines.join('\n')}`;
 }
 
+/** Paths named on a step’s tasks (plus light scan of titles/descriptions). */
+export function collectStepFilePaths(step: PlannerStep): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (raw: string | undefined) => {
+    const p = (raw || '').replace(/\\/g, '/').trim();
+    if (!p) return;
+    const key = p.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(p);
+  };
+  for (const t of step.tasks) {
+    push(t.file);
+    const blob = `${t.title}\n${t.description}`;
+    for (const m of blob.matchAll(/`([^`\n]+\.[a-zA-Z0-9]+)`/g)) push(m[1]);
+    for (const m of blob.matchAll(
+      /(?:^|[\s(/])((?:[\w.-]+\/)*[\w.-]+\.(?:js|jsx|ts|tsx|mjs|cjs|css|html|json|md|py|rs|go|java|cs|php|rb|vue|svelte))\b/g
+    )) {
+      push(m[1]);
+    }
+  }
+  const stepBlob = `${step.title}\n${step.description || ''}`;
+  for (const m of stepBlob.matchAll(/`([^`\n]+\.[a-zA-Z0-9]+)`/g)) push(m[1]);
+  return out;
+}
+
 /** Prompt for Coders working the active step. */
 export function formatStepForCoders(plan: PlannerPlan, step: PlannerStep): string {
   const tasks = step.tasks
@@ -232,7 +259,7 @@ ${step.description ? `${step.description}\n` : ''}${note}
 ### Tasks
 ${tasks.join('\n') || '(no open tasks)'}
 
-Implement every open task above. Use edit_file/write_file. Do not start later plan steps.`;
+Implement every open task above. Use edit_file/write_file on the files listed (and any others you must touch). Prefer edit_file when the current file body is provided below. Do not start later plan steps.`;
 }
 
 /** Prompt for Reviewer verifying one step. */

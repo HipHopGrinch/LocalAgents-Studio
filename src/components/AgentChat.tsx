@@ -29,7 +29,8 @@ import {
   Brain,
   ImagePlus,
   X,
-  Shrink
+  Shrink,
+  SlidersHorizontal
 } from 'lucide-react';
 import { formatConversationTime } from '../lib/conversations';
 import {
@@ -304,6 +305,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     return () => onBusyChange?.(false);
   }, [isStreaming, onBusyChange]);
   const [historyOpen, setHistoryOpen] = useState(false);
+  /** Mobile fill mode: full-screen Conductor sheet */
+  const [mobileControlsOpen, setMobileControlsOpen] = useState(false);
   /** Banner after user picks a plan option — Coder is running the locked plan */
   const [executingPlanNotice, setExecutingPlanNotice] = useState<string | null>(null);
   const chatBottomRef = useRef<HTMLDivElement>(null);
@@ -3979,16 +3982,243 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
     };
   }, [resizingControl, onControlWidthChange]);
 
+  const conductorColumn = (
+      <div
+        style={fill ? undefined : { width: controlColWidth }}
+        className={`flex flex-col min-h-0 bg-[#121215] ${
+          fill ? 'w-full h-full' : 'shrink-0 min-w-[220px] border-l border-[#27272a]'
+        }`}
+      >
+        <div className="p-2.5 border-b border-[#27272a] shrink-0 space-y-2">
+          <div className="flex items-center justify-between gap-1">
+            <div className="flex items-center gap-1.5 text-[10px] uppercase font-bold tracking-wider text-zinc-300">
+              <Cpu className="w-3 h-3 text-indigo-400" />
+              <span>Conductor</span>
+            </div>
+            {fill ? (
+              <button
+                type="button"
+                onClick={() => setMobileControlsOpen(false)}
+                className="p-1 text-zinc-400 hover:text-white rounded"
+                title="Close"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            ) : (
+              <HelpTip title="Agent personas" align="right">
+                <p>Left column is the conversation. This column is personas, the durable plan/task list, and routing.</p>
+                <ul className="list-disc pl-3.5 space-y-1">
+                  <li><b className="text-zinc-300">coder</b> — build & edit files</li>
+                  <li><b className="text-zinc-300">planner</b> — options then locks steps/tasks</li>
+                  <li><b className="text-zinc-300">reviewer</b> — Yay/Nay per plan step</li>
+                  <li><b className="text-zinc-300">docs</b> — explanations / docs</li>
+                </ul>
+              </HelpTip>
+            )}
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {agents.map(a => (
+              <button
+                key={a.id}
+                onClick={() => onSelectAgent(a.id)}
+                title={`${a.name}: ${a.role}`}
+                className={`px-2 py-0.5 text-[11px] font-medium rounded transition ${
+                  selectedAgentId === a.id
+                    ? 'bg-indigo-600 text-white shadow-sm'
+                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-[#202026]'
+                }`}
+              >
+                {a.handle}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="px-2.5 pt-2 space-y-1.5 shrink-0">
+          {(progressLog.next || progressLog.done.length > 0) && (
+            <div className="text-[10px] text-zinc-400 truncate" title={renderWorkLog(progressLog)}>
+              <span className="text-emerald-300/90 font-medium">Next:</span> {progressLog.next || '—'}
+              <span className="text-zinc-500"> · {progressLog.done.length} done</span>
+            </div>
+          )}
+          {executingPlanNotice && (
+            <div className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-md bg-emerald-600/15 border border-emerald-500/30 text-[10px] text-emerald-200">
+              <span className="font-medium truncate">{executingPlanNotice}</span>
+              <button
+                type="button"
+                className="shrink-0 text-zinc-400 hover:text-zinc-200"
+                onClick={() => setExecutingPlanNotice(null)}
+                title="Dismiss"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          )}
+        </div>
+
+        <div className="flex-1 min-h-0 flex flex-col px-2.5 py-2 overflow-y-auto">
+          {plannerPlanView && plannerPlanView.steps.length > 0 ? (
+            <PlannerPlanPanel plan={plannerPlanView} />
+          ) : (
+            <div className="rounded-md border border-dashed border-[#2a2a36] bg-[#0e0e12] px-2.5 py-3 text-[10px] text-zinc-500 leading-relaxed">
+              No active plan — pick a Planner option to lock steps and tasks here.
+            </div>
+          )}
+        </div>
+
+        <div className="p-2.5 border-t border-[#27272a] space-y-2 shrink-0 text-[10px] overflow-y-auto max-h-[45%]">
+          <div className="grid grid-cols-1 gap-2">
+            <div className="flex flex-col space-y-1">
+              <span className="text-zinc-500 font-medium flex items-center space-x-1">
+                {isFrontier ? <Cloud className="w-3 h-3 text-sky-400 shrink-0" /> : <Cpu className="w-3 h-3 text-emerald-400 shrink-0" />}
+                <span>Hardware Target</span>
+              </span>
+              <select
+                value={nodes.some(n => n.id === targetNodeId) ? targetNodeId : ''}
+                onChange={(e) => {
+                  const newNodeId = e.target.value;
+                  setTargetNodeId(newNodeId);
+                  setAutoSelectEndpoint(false);
+                  const nextNode = nodes.find(n => n.id === newNodeId);
+                  if (nextNode) setTargetModel(getPreferredModelForNode(nextNode));
+                }}
+                disabled={nodes.length === 0}
+                className="bg-[#1c1c24] border border-[#2a2a36] text-zinc-200 rounded px-2 py-1 outline-none text-[11px] truncate disabled:opacity-50"
+              >
+                {nodes.length === 0 ? (
+                  <option value="">No endpoints — open Hardware Settings</option>
+                ) : (
+                  nodes.map(n => (
+                    <option key={n.id} value={n.id} disabled={!n.online}>
+                      {n.name} {n.online ? `(${n.latency}ms)` : '(Offline)'}
+                    </option>
+                  ))
+                )}
+              </select>
+            </div>
+            <div className="flex flex-col space-y-1">
+              <span className="text-zinc-500 font-medium flex items-center justify-between">
+                <span>Node Model</span>
+                {benchmarkStat && (
+                  <span className="text-amber-400 font-mono text-[9px] flex items-center space-x-0.5">
+                    <Zap className="w-2.5 h-2.5" />
+                    <span>{benchmarkStat.evalTokPerSec} t/s</span>
+                  </span>
+                )}
+              </span>
+              <select
+                value={activeTargetModel}
+                onChange={(e) => {
+                  const newModel = e.target.value;
+                  if (!newModel) return;
+                  setTargetModel(newModel);
+                  if (selectedNode) onSelectNodeModel?.(selectedNode.id, newModel);
+                }}
+                disabled={effectiveModels.length === 0}
+                className="bg-[#1c1c24] border border-[#2a2a36] text-zinc-200 rounded px-2 py-1 outline-none text-[11px] truncate disabled:opacity-50"
+              >
+                {effectiveModels.length === 0 ? (
+                  <option value="">
+                    {!selectedNode
+                      ? 'Add an endpoint in Hardware Settings'
+                      : selectedNode.online
+                        ? 'No models installed — pull in Hardware Settings'
+                        : 'Node offline / no models'}
+                  </option>
+                ) : (
+                  effectiveModels.map(m => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))
+                )}
+              </select>
+              {selectedSupportsThink && onToggleModelThinking && selectedNode && activeTargetModel && (
+                <button
+                  type="button"
+                  onClick={() => onToggleModelThinking(selectedNode.id, activeTargetModel, !selectedThinkOn)}
+                  className={`w-full flex items-center justify-center space-x-1.5 px-2 py-1 rounded border text-[10px] font-medium transition ${
+                    selectedThinkOn
+                      ? 'bg-violet-600/25 border-violet-500/40 text-violet-200'
+                      : 'bg-[#18181d] border-[#2a2a34] text-zinc-400 hover:text-zinc-200'
+                  }`}
+                  title="Qwen3-style thinking: ON = deeper/slower, OFF = faster direct answers"
+                >
+                  <Brain className={`w-3 h-3 ${selectedThinkOn ? 'text-violet-300' : 'text-zinc-500'}`} />
+                  <span>{thinkingToggleLabel(!!selectedThinkOn)}</span>
+                </button>
+              )}
+            </div>
+          </div>
+
+          <button
+            onClick={() => setIsPipelineMode(!isPipelineMode)}
+            className={`w-full flex items-center justify-center space-x-1.5 px-2 py-1 rounded border transition ${
+              isPipelineMode
+                ? 'bg-amber-500/20 border-amber-500/40 text-amber-300 font-semibold'
+                : 'bg-[#18181d] border-[#2a2a34] text-zinc-400 hover:text-zinc-200'
+            }`}
+            title={isPipelineMode ? 'Conductor Swarm is ON' : 'Enable multi-GPU file distribution'}
+          >
+            <Share2 className="w-3 h-3 text-amber-400 shrink-0" />
+            <span className="truncate">
+              Swarm ({onlineLocalNodes.length} local
+              {nodes.filter(n => n.online && isFrontierNode(n) && getEnabledModelsForNode(n).length > 0).length
+                ? ' + frontier'
+                : ''}
+              )
+            </span>
+          </button>
+
+          <div className="flex flex-col gap-1.5 text-zinc-400">
+            <label className="flex items-center space-x-1.5 cursor-pointer hover:text-zinc-200">
+              <input
+                type="checkbox"
+                checked={autoSelectEndpoint}
+                onChange={(e) => setAutoSelectEndpoint(e.target.checked)}
+                className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
+              />
+              <span>Auto-Node</span>
+            </label>
+            <label className="flex items-center space-x-1.5 cursor-pointer hover:text-zinc-200">
+              <input
+                type="checkbox"
+                checked={autoApplyWrites}
+                onChange={(e) => {
+                  autoApplyWritesRef.current = e.target.checked;
+                  setAutoApplyWrites(e.target.checked);
+                }}
+                className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
+              />
+              <span>Auto-apply</span>
+            </label>
+            <label className="flex items-center space-x-1.5 cursor-pointer hover:text-zinc-200">
+              <input
+                type="checkbox"
+                checked={autoReview}
+                onChange={(e) => {
+                  autoReviewRef.current = e.target.checked;
+                  setAutoReview(e.target.checked);
+                }}
+                className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
+              />
+              <span>Auto-review</span>
+            </label>
+          </div>
+        </div>
+      </div>
+  );
+
   return (
     <div
       id="agent-conductor-root"
       style={fill ? undefined : { width }}
-      className={`h-full bg-[#161619] border-l border-[#27272a] flex flex-row min-w-0 ${
-        fill ? 'w-full select-text' : 'select-none shrink-0'
+      className={`h-full bg-[#161619] border-l border-[#27272a] flex min-w-0 relative ${
+        fill ? 'w-full flex-col select-text' : 'flex-row select-none shrink-0'
       }`}
     >
       {/* Left — Conversation */}
-      <div className="flex-1 min-w-[240px] flex flex-col min-h-0 overflow-hidden">
+      <div className="flex-1 min-w-0 flex flex-col min-h-0 overflow-hidden">
       <div className="p-3 border-b border-[#27272a] bg-[#121215] flex flex-col space-y-2 shrink-0">
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center space-x-1.5 text-xs font-bold text-zinc-200 min-w-0">
@@ -3999,6 +4229,21 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
           </div>
 
           <div className="flex items-center space-x-1 shrink-0">
+            {fill && (
+              <button
+                type="button"
+                onClick={() => setMobileControlsOpen(true)}
+                className={`flex items-center gap-1 px-1.5 py-1 rounded text-[11px] font-medium border transition ${
+                  mobileControlsOpen
+                    ? 'bg-indigo-600/30 text-indigo-200 border-indigo-500/40'
+                    : 'text-zinc-300 hover:text-white hover:bg-[#202026] border-transparent hover:border-[#2a2a36]'
+                }`}
+                title="Conductor controls"
+              >
+                <SlidersHorizontal className="w-3.5 h-3.5 text-indigo-400" />
+                <span>Controls</span>
+              </button>
+            )}
             <div className="relative">
               <button
                 type="button"
@@ -4074,6 +4319,25 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
             </button>
           </div>
         </div>
+
+        {fill && (
+          <div className="flex flex-wrap gap-1">
+            {agents.map(a => (
+              <button
+                key={a.id}
+                type="button"
+                onClick={() => onSelectAgent(a.id)}
+                className={`px-2 py-0.5 text-[11px] font-medium rounded transition ${
+                  selectedAgentId === a.id
+                    ? 'bg-indigo-600 text-white shadow-sm'
+                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-[#202026]'
+                }`}
+              >
+                {a.handle}
+              </button>
+            ))}
+          </div>
+        )}
 
       </div>
 
@@ -4438,227 +4702,24 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       </div>
       </div>
 
-      {/* Inner split resize */}
-      <div
-        onMouseDown={() => setResizingControl(true)}
-        title="Drag to resize Conductor column"
-        className={`w-1 cursor-col-resize transition-colors shrink-0 ${
-          resizingControl ? 'bg-indigo-500' : 'bg-[#22222a] hover:bg-indigo-500/60'
-        }`}
-      />
-
-      {/* Right — Orchestration */}
-      <div
-        style={{ width: controlColWidth }}
-        className="shrink-0 flex flex-col min-h-0 min-w-[220px] bg-[#121215] border-l border-[#27272a]"
-      >
-        <div className="p-2.5 border-b border-[#27272a] shrink-0 space-y-2">
-          <div className="flex items-center justify-between gap-1">
-            <div className="flex items-center gap-1.5 text-[10px] uppercase font-bold tracking-wider text-zinc-300">
-              <Cpu className="w-3 h-3 text-indigo-400" />
-              <span>Conductor</span>
-            </div>
-            <HelpTip title="Agent personas" align="right">
-              <p>Left column is the conversation. This column is personas, the durable plan/task list, and routing.</p>
-              <ul className="list-disc pl-3.5 space-y-1">
-                <li><b className="text-zinc-300">coder</b> — build & edit files</li>
-                <li><b className="text-zinc-300">planner</b> — options then locks steps/tasks</li>
-                <li><b className="text-zinc-300">reviewer</b> — Yay/Nay per plan step</li>
-                <li><b className="text-zinc-300">docs</b> — explanations / docs</li>
-              </ul>
-            </HelpTip>
-          </div>
-          <div className="flex flex-wrap gap-1">
-            {agents.map(a => (
-              <button
-                key={a.id}
-                onClick={() => onSelectAgent(a.id)}
-                title={`${a.name}: ${a.role}`}
-                className={`px-2 py-0.5 text-[11px] font-medium rounded transition ${
-                  selectedAgentId === a.id
-                    ? 'bg-indigo-600 text-white shadow-sm'
-                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-[#202026]'
-                }`}
-              >
-                {a.handle}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="px-2.5 pt-2 space-y-1.5 shrink-0">
-          {(progressLog.next || progressLog.done.length > 0) && (
-            <div className="text-[10px] text-zinc-400 truncate" title={renderWorkLog(progressLog)}>
-              <span className="text-emerald-300/90 font-medium">Next:</span> {progressLog.next || '—'}
-              <span className="text-zinc-500"> · {progressLog.done.length} done</span>
-            </div>
-          )}
-          {executingPlanNotice && (
-            <div className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-md bg-emerald-600/15 border border-emerald-500/30 text-[10px] text-emerald-200">
-              <span className="font-medium truncate">{executingPlanNotice}</span>
-              <button
-                type="button"
-                className="shrink-0 text-zinc-400 hover:text-zinc-200"
-                onClick={() => setExecutingPlanNotice(null)}
-                title="Dismiss"
-              >
-                <X className="w-3 h-3" />
-              </button>
-            </div>
-          )}
-        </div>
-
-        <div className="flex-1 min-h-0 flex flex-col px-2.5 py-2">
-          {plannerPlanView && plannerPlanView.steps.length > 0 ? (
-            <PlannerPlanPanel plan={plannerPlanView} />
-          ) : (
-            <div className="rounded-md border border-dashed border-[#2a2a36] bg-[#0e0e12] px-2.5 py-3 text-[10px] text-zinc-500 leading-relaxed">
-              No active plan — pick a Planner option to lock steps and tasks here.
-            </div>
-          )}
-        </div>
-
-        <div className="p-2.5 border-t border-[#27272a] space-y-2 shrink-0 text-[10px]">
-          <div className="grid grid-cols-1 gap-2">
-            <div className="flex flex-col space-y-1">
-              <span className="text-zinc-500 font-medium flex items-center space-x-1">
-                {isFrontier ? <Cloud className="w-3 h-3 text-sky-400 shrink-0" /> : <Cpu className="w-3 h-3 text-emerald-400 shrink-0" />}
-                <span>Hardware Target</span>
-              </span>
-              <select
-                value={nodes.some(n => n.id === targetNodeId) ? targetNodeId : ''}
-                onChange={(e) => {
-                  const newNodeId = e.target.value;
-                  setTargetNodeId(newNodeId);
-                  setAutoSelectEndpoint(false);
-                  const nextNode = nodes.find(n => n.id === newNodeId);
-                  if (nextNode) setTargetModel(getPreferredModelForNode(nextNode));
-                }}
-                disabled={nodes.length === 0}
-                className="bg-[#1c1c24] border border-[#2a2a36] text-zinc-200 rounded px-2 py-1 outline-none text-[11px] truncate disabled:opacity-50"
-              >
-                {nodes.length === 0 ? (
-                  <option value="">No endpoints — open Hardware Settings</option>
-                ) : (
-                  nodes.map(n => (
-                    <option key={n.id} value={n.id} disabled={!n.online}>
-                      {n.name} {n.online ? `(${n.latency}ms)` : '(Offline)'}
-                    </option>
-                  ))
-                )}
-              </select>
-            </div>
-            <div className="flex flex-col space-y-1">
-              <span className="text-zinc-500 font-medium flex items-center justify-between">
-                <span>Node Model</span>
-                {benchmarkStat && (
-                  <span className="text-amber-400 font-mono text-[9px] flex items-center space-x-0.5">
-                    <Zap className="w-2.5 h-2.5" />
-                    <span>{benchmarkStat.evalTokPerSec} t/s</span>
-                  </span>
-                )}
-              </span>
-              <select
-                value={activeTargetModel}
-                onChange={(e) => {
-                  const newModel = e.target.value;
-                  if (!newModel) return;
-                  setTargetModel(newModel);
-                  if (selectedNode) onSelectNodeModel?.(selectedNode.id, newModel);
-                }}
-                disabled={effectiveModels.length === 0}
-                className="bg-[#1c1c24] border border-[#2a2a36] text-zinc-200 rounded px-2 py-1 outline-none text-[11px] truncate disabled:opacity-50"
-              >
-                {effectiveModels.length === 0 ? (
-                  <option value="">
-                    {!selectedNode
-                      ? 'Add an endpoint in Hardware Settings'
-                      : selectedNode.online
-                        ? 'No models installed — pull in Hardware Settings'
-                        : 'Node offline / no models'}
-                  </option>
-                ) : (
-                  effectiveModels.map(m => (
-                    <option key={m} value={m}>
-                      {m}
-                    </option>
-                  ))
-                )}
-              </select>
-              {selectedSupportsThink && onToggleModelThinking && selectedNode && activeTargetModel && (
-                <button
-                  type="button"
-                  onClick={() => onToggleModelThinking(selectedNode.id, activeTargetModel, !selectedThinkOn)}
-                  className={`w-full flex items-center justify-center space-x-1.5 px-2 py-1 rounded border text-[10px] font-medium transition ${
-                    selectedThinkOn
-                      ? 'bg-violet-600/25 border-violet-500/40 text-violet-200'
-                      : 'bg-[#18181d] border-[#2a2a34] text-zinc-400 hover:text-zinc-200'
-                  }`}
-                  title="Qwen3-style thinking: ON = deeper/slower, OFF = faster direct answers"
-                >
-                  <Brain className={`w-3 h-3 ${selectedThinkOn ? 'text-violet-300' : 'text-zinc-500'}`} />
-                  <span>{thinkingToggleLabel(!!selectedThinkOn)}</span>
-                </button>
-              )}
-            </div>
-          </div>
-
-          <button
-            onClick={() => setIsPipelineMode(!isPipelineMode)}
-            className={`w-full flex items-center justify-center space-x-1.5 px-2 py-1 rounded border transition ${
-              isPipelineMode
-                ? 'bg-amber-500/20 border-amber-500/40 text-amber-300 font-semibold'
-                : 'bg-[#18181d] border-[#2a2a34] text-zinc-400 hover:text-zinc-200'
+      {!fill && (
+        <>
+          <div
+            onMouseDown={() => setResizingControl(true)}
+            title="Drag to resize Conductor column"
+            className={`w-1 cursor-col-resize transition-colors shrink-0 ${
+              resizingControl ? 'bg-indigo-500' : 'bg-[#22222a] hover:bg-indigo-500/60'
             }`}
-            title={isPipelineMode ? 'Conductor Swarm is ON' : 'Enable multi-GPU file distribution'}
-          >
-            <Share2 className="w-3 h-3 text-amber-400 shrink-0" />
-            <span className="truncate">
-              Swarm ({onlineLocalNodes.length} local
-              {nodes.filter(n => n.online && isFrontierNode(n) && getEnabledModelsForNode(n).length > 0).length
-                ? ' + frontier'
-                : ''}
-              )
-            </span>
-          </button>
+          />
+          {conductorColumn}
+        </>
+      )}
 
-          <div className="flex flex-col gap-1.5 text-zinc-400">
-            <label className="flex items-center space-x-1.5 cursor-pointer hover:text-zinc-200">
-              <input
-                type="checkbox"
-                checked={autoSelectEndpoint}
-                onChange={(e) => setAutoSelectEndpoint(e.target.checked)}
-                className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
-              />
-              <span>Auto-Node</span>
-            </label>
-            <label className="flex items-center space-x-1.5 cursor-pointer hover:text-zinc-200">
-              <input
-                type="checkbox"
-                checked={autoApplyWrites}
-                onChange={(e) => {
-                  autoApplyWritesRef.current = e.target.checked;
-                  setAutoApplyWrites(e.target.checked);
-                }}
-                className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
-              />
-              <span>Auto-apply</span>
-            </label>
-            <label className="flex items-center space-x-1.5 cursor-pointer hover:text-zinc-200">
-              <input
-                type="checkbox"
-                checked={autoReview}
-                onChange={(e) => {
-                  autoReviewRef.current = e.target.checked;
-                  setAutoReview(e.target.checked);
-                }}
-                className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
-              />
-              <span>Auto-review</span>
-            </label>
-          </div>
+      {fill && mobileControlsOpen && (
+        <div className="absolute inset-0 z-50 flex flex-col bg-[#121215]">
+          {conductorColumn}
         </div>
-      </div>
+      )}
     </div>
   );
 };

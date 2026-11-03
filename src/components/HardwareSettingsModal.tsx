@@ -745,7 +745,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
 
   return (
     <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4">
-      <div className="bg-[#161619] border border-[#2e2e38] w-full max-w-4xl rounded-xl shadow-2xl overflow-hidden flex flex-col h-[85vh]">
+      <div className="bg-[#161619] border border-[#2e2e38] w-full max-w-4xl sm:rounded-xl shadow-2xl overflow-hidden flex flex-col h-[100dvh] sm:h-[85vh] max-h-[100dvh] sm:max-h-[85vh] rounded-none">
         {/* Header */}
         <div className="h-12 bg-[#121215] border-b border-[#27272a] px-4 flex items-center justify-between">
           <div className="flex items-center space-x-3">

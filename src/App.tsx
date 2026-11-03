@@ -865,6 +865,7 @@ export const App: React.FC = () => {
           uiScale={uiScale}
           onUpdateUiScale={handleUpdateUiScale}
           appVersion={appVersion}
+          compact={isNarrow}
         />
       </div>
       <UpdateBanner />

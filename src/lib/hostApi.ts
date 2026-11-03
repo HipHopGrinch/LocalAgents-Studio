@@ -221,19 +221,13 @@ export function createWebHostApi(token: string): Promise<ElectronAPI> {
       loadProjectChats: root => invoke('project:loadChats', [root]),
       saveProjectChats: (root, payload) => invoke('project:saveChats', [root, payload]),
       selectFolder: async () => {
-        const typed = window.prompt(
-          'Enter a folder path on the Studio host PC (e.g. C:\\\\Users\\\\you\\\\Projects\\\\MyApp):'
-        );
-        if (!typed) return null;
-        const res = await invoke<{ path?: string; error?: string }>('workspace:resolve-path', [
-          typed.trim()
-        ]);
-        if (res.error || !res.path) {
-          window.alert(res.error || 'Invalid folder');
-          return null;
-        }
-        return res.path;
+        // App opens ProjectPickerModal for web clients; keep resolve for completeness.
+        return null;
       },
+      resolveWorkspacePath: dirPath => invoke('workspace:resolve-path', [dirPath]),
+      projectsRoot: () => invoke('workspace:projectsRoot'),
+      listProjects: () => invoke('workspace:listProjects'),
+      createProject: name => invoke('workspace:createProject', [name]),
       readDir: dirPath => invoke('fs:read-dir', [dirPath]),
       readFile: filePath => invoke('fs:read-file', [filePath]),
       writeFile: (filePath, content) => invoke('fs:write-file', [filePath, content]),

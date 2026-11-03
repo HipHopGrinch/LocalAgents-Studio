@@ -231,6 +231,7 @@ let liveSession = {
   activeConversationId: null,
   selectedAgentId: 'coder',
   nodes: [],
+  chatsRevision: 0,
   source: 'none'
 };
 
@@ -239,6 +240,10 @@ ipcMain.handle('session:get', () => ({ ...liveSession }));
 ipcMain.handle('session:publish', (_e, snapshot = {}) => {
   try {
     const nodes = Array.isArray(snapshot.nodes) ? snapshot.nodes : liveSession.nodes;
+    const chatsRevision =
+      typeof snapshot.chatsRevision === 'number'
+        ? snapshot.chatsRevision
+        : liveSession.chatsRevision || 0;
     liveSession = {
       updatedAt: Date.now(),
       workspacePath:
@@ -249,6 +254,7 @@ ipcMain.handle('session:publish', (_e, snapshot = {}) => {
           : liveSession.activeConversationId,
       selectedAgentId: snapshot.selectedAgentId || liveSession.selectedAgentId || 'coder',
       nodes,
+      chatsRevision,
       source: snapshot.source || 'renderer'
     };
     send('session:changed', { ...liveSession });
@@ -752,6 +758,56 @@ ipcMain.handle('workspace:resolve-path', async (_e, dirPath) => {
     return { path: resolved };
   } catch {
     return { error: 'Path not found' };
+  }
+});
+
+function projectsRootPath() {
+  return path.join(os.homedir(), 'Projects');
+}
+
+function sanitizeProjectName(name) {
+  const cleaned = String(name || '')
+    .trim()
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
+    .replace(/\.+$/g, '')
+    .slice(0, 80);
+  return cleaned;
+}
+
+ipcMain.handle('workspace:projectsRoot', async () => {
+  const root = projectsRootPath();
+  await fsp.mkdir(root, { recursive: true });
+  return root;
+});
+
+ipcMain.handle('workspace:listProjects', async () => {
+  try {
+    const root = projectsRootPath();
+    await fsp.mkdir(root, { recursive: true });
+    const entries = await fsp.readdir(root, { withFileTypes: true });
+    return entries
+      .filter(e => e.isDirectory() && !e.name.startsWith('.'))
+      .map(e => ({ name: e.name, path: path.join(root, e.name) }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  } catch (err) {
+    return { error: err.message || 'Failed to list projects' };
+  }
+});
+
+ipcMain.handle('workspace:createProject', async (_e, name) => {
+  try {
+    const cleaned = sanitizeProjectName(name);
+    if (!cleaned) return { error: 'Enter a folder name' };
+    const root = projectsRootPath();
+    await fsp.mkdir(root, { recursive: true });
+    const dest = path.join(root, cleaned);
+    if (!dest.startsWith(root + path.sep) && dest !== root) {
+      return { error: 'Invalid project path' };
+    }
+    await fsp.mkdir(dest, { recursive: true });
+    return { path: dest, name: cleaned };
+  } catch (err) {
+    return { error: err.message || 'Failed to create project' };
   }
 });
 

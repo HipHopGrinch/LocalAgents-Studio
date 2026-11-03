@@ -1214,7 +1214,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                       </div>
 
                       {/* Detailed Hardware Inputs */}
-                      <div className="grid grid-cols-3 gap-3 text-xs">
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
                         <div>
                           <label className="text-[11px] text-zinc-400">GPU Model</label>
                           <input
@@ -1399,36 +1399,39 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                   onChange={(e) => onUpdateUiScale(parseFloat(e.target.value))}
                   className="w-full accent-indigo-500 cursor-pointer h-2 bg-[#25252e] rounded-lg"
                 />
-                <div className="flex justify-between text-[10px] text-zinc-500 font-mono">
-                  <span>75% (Compact)</span>
-                  <span>100% (Default)</span>
-                  <span>125% (1440p)</span>
-                  <span>150% (4K)</span>
-                  <span>175% (Large)</span>
+                <div className="flex justify-between text-[9px] sm:text-[10px] text-zinc-500 font-mono gap-1">
+                  <span>75%</span>
+                  <span className="hidden sm:inline">100%</span>
+                  <span className="sm:hidden">100%</span>
+                  <span className="hidden sm:inline">125%</span>
+                  <span>150%</span>
+                  <span>175%</span>
                 </div>
               </div>
 
               {/* Preset buttons */}
-              <div className="grid grid-cols-6 gap-2 pt-1 text-xs">
+              <div className="grid grid-cols-3 sm:grid-cols-6 gap-2 pt-1 text-xs">
                 {[
-                  { label: '80%', val: 0.8 },
-                  { label: '100% (Default)', val: 1.0 },
-                  { label: '115%', val: 1.15 },
-                  { label: '125% (HiDPI)', val: 1.25 },
-                  { label: '150% (4K)', val: 1.5 },
-                  { label: '175%', val: 1.75 }
+                  { label: '80%', short: '80%', val: 0.8 },
+                  { label: '100% (Default)', short: '100%', val: 1.0 },
+                  { label: '115%', short: '115%', val: 1.15 },
+                  { label: '125% (HiDPI)', short: '125%', val: 1.25 },
+                  { label: '150% (4K)', short: '150%', val: 1.5 },
+                  { label: '175%', short: '175%', val: 1.75 }
                 ].map(item => (
                   <button
                     key={item.val}
                     type="button"
                     onClick={() => onUpdateUiScale(item.val)}
-                    className={`py-1.5 px-2 rounded font-mono text-center transition border ${
+                    className={`py-2 sm:py-1.5 px-2 rounded font-mono text-center transition border truncate ${
                       Math.abs(uiScale - item.val) < 0.02
                         ? 'bg-indigo-600 text-white border-indigo-500 font-bold shadow'
                         : 'bg-[#18181d] text-zinc-400 hover:text-white border-[#272732] hover:bg-[#202026]'
                     }`}
+                    title={item.label}
                   >
-                    {item.label}
+                    <span className="sm:hidden">{item.short}</span>
+                    <span className="hidden sm:inline">{item.label}</span>
                   </button>
                 ))}
               </div>
@@ -1751,7 +1754,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
               </p>
             </div>
 
-            <div className="grid grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
               <div className="bg-[#121215] border border-[#272730] rounded-xl p-4 space-y-1">
                 <span className="text-[11px] text-zinc-400 font-medium">Free Local Tokens Generated</span>
                 <div className="text-2xl font-bold font-mono text-emerald-400">

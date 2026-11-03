@@ -6,6 +6,7 @@ import { TerminalPanel } from './components/TerminalPanel';
 import { AgentChat } from './components/AgentChat';
 import { HardwareSettingsModal } from './components/HardwareSettingsModal';
 import { UpdateBanner } from './components/UpdateBanner';
+import { ProjectPickerModal } from './components/ProjectPickerModal';
 import { MessageSquare, FolderTree, Code2, Terminal as TerminalIcon, MoreHorizontal } from 'lucide-react';
 
 import {
@@ -16,7 +17,8 @@ import {
   AppSettings,
   ChatConversation,
   ChatMessage,
-  LiveStudioSession
+  LiveStudioSession,
+  LiveSessionNode
 } from './types';
 import { DEFAULT_SETTINGS, mergeSettings } from './config/defaults';
 import { bumpFreeTierUsage } from './lib/freeTierAssist';
@@ -103,13 +105,32 @@ export const App: React.FC = () => {
   const [appVersion, setAppVersion] = useState<string>('');
   const isRemoteClient = isWebConsoleClient();
   const sessionAppliedAtRef = useRef(0);
+  const chatsRevisionRef = useRef(0);
+  const workspacePathRef = useRef(workspacePath);
+  workspacePathRef.current = workspacePath;
   const publishTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [projectPicker, setProjectPicker] = useState<{
+    open: boolean;
+    mode: 'open' | 'new';
+  }>({ open: false, mode: 'open' });
+  const [remoteLive, setRemoteLive] = useState(false);
+  const [chatsTick, setChatsTick] = useState(0);
 
-  const nodeConfigsFromLive = useCallback((list: EndpointNode[] | NodeConfig[]): NodeConfig[] => {
-    return list.map(n => {
-      const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, ...cfg } = n as EndpointNode;
-      return cfg;
-    });
+  const markChatsSaved = useCallback(() => {
+    if (isRemoteClient) return;
+    chatsRevisionRef.current += 1;
+    setChatsTick(t => t + 1);
+  }, [isRemoteClient]);
+
+  const toLiveSessionNodes = useCallback((list: EndpointNode[]): LiveSessionNode[] => {
+    return list.map(n => ({
+      ...(n as NodeConfig & EndpointNode),
+      online: !!n.online,
+      latency: n.latency ?? null,
+      models: n.models || [],
+      loaded: n.loaded || [],
+      error: n.error
+    }));
   }, []);
 
   // Forward renderer crashes into studio.log so "Submit logs to GitHub" includes them.
@@ -138,44 +159,64 @@ export const App: React.FC = () => {
     };
   }, []);
 
-  const applyLiveSession = useCallback(
-    (session: LiveStudioSession, opts?: { forceWorkspace?: boolean }) => {
-      if (!session || !session.updatedAt) return;
-      if (session.updatedAt <= sessionAppliedAtRef.current) return;
-      sessionAppliedAtRef.current = session.updatedAt;
+  const applyLiveSession = useCallback((session: LiveStudioSession) => {
+    if (!session || !session.updatedAt) return;
+    if (session.updatedAt < sessionAppliedAtRef.current) return;
+    sessionAppliedAtRef.current = session.updatedAt;
 
-      if (Array.isArray(session.nodes) && session.nodes.length > 0) {
-        setSettings(prev => ({ ...prev, nodes: session.nodes }));
-        setNodes(prev => {
-          const byId = new Map(prev.map(n => [n.id, n]));
-          return session.nodes.map(cfg => {
-            const existing = byId.get(cfg.id);
-            return {
-              ...cfg,
-              online: existing?.online ?? false,
-              latency: existing?.latency ?? null,
-              models: existing?.models ?? [],
-              loaded: existing?.loaded ?? [],
-              error: existing?.error
-            };
-          });
-        });
-      }
+    if (Array.isArray(session.nodes) && session.nodes.length > 0) {
+      const configs: NodeConfig[] = session.nodes.map(n => {
+        const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, ...cfg } = n as LiveSessionNode &
+          EndpointNode;
+        return cfg;
+      });
+      setSettings(prev => ({ ...prev, nodes: configs }));
+      setNodes(
+        session.nodes.map(n => {
+          const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, ...cfg } = n;
+          return {
+            ...cfg,
+            online: !!n.online,
+            latency: n.latency ?? null,
+            models: n.models || [],
+            loaded: n.loaded || [],
+            error: n.error
+          } as EndpointNode;
+        })
+      );
+    }
 
-      if (session.selectedAgentId) setSelectedAgentId(session.selectedAgentId);
-      if (session.activeConversationId) setActiveConversationId(session.activeConversationId || undefined);
+    if (session.selectedAgentId) setSelectedAgentId(session.selectedAgentId);
+    if (session.activeConversationId !== undefined) {
+      setActiveConversationId(session.activeConversationId || undefined);
+    }
 
-      const nextWs = session.workspacePath || '';
-      if (nextWs && (opts?.forceWorkspace || nextWs !== workspacePath)) {
-        forceNewChatRef.current = false;
-        loadedWorkspaceRef.current = '';
-        setWorkspaceEpoch(n => n + 1);
-        setWorkspacePath(nextWs);
-        void loadDirectory(nextWs);
-      }
-    },
-    [workspacePath]
-  );
+    const nextWs = session.workspacePath || '';
+    const wsChanged =
+      !!nextWs &&
+      normalizeWorkspacePath(nextWs) !== normalizeWorkspacePath(workspacePathRef.current || '');
+    const chatsBumped =
+      typeof session.chatsRevision === 'number' && session.chatsRevision > chatsRevisionRef.current;
+
+    if (typeof session.chatsRevision === 'number') {
+      chatsRevisionRef.current = session.chatsRevision;
+    }
+
+    if (wsChanged) {
+      forceNewChatRef.current = false;
+      loadedWorkspaceRef.current = '';
+      setWorkspaceEpoch(n => n + 1);
+      setWorkspacePath(nextWs);
+      void window.electronAPI?.readDir(nextWs).then(result => {
+        setFiles(Array.isArray(result) ? result : []);
+      });
+    } else if (chatsBumped && nextWs) {
+      // Same folder — reload chats from disk after desktop saved.
+      forceNewChatRef.current = false;
+      loadedWorkspaceRef.current = '';
+      setWorkspaceEpoch(n => n + 1);
+    }
+  }, []);
 
   // 1. Initial Load: Settings & Workspace (+ attach to live desktop session for web console)
   useEffect(() => {
@@ -233,35 +274,66 @@ export const App: React.FC = () => {
       }
       document.documentElement.style.setProperty('--app-scale', String(initialScale));
 
-      setNodes(
-        merged.nodes.map(n => ({
-          ...n,
-          online: false,
-          latency: null,
-          models: [],
-          loaded: []
-        }))
-      );
+      if (live && Array.isArray(live.nodes) && live.nodes.length > 0 && live.nodes.some(n => n.online != null)) {
+        setNodes(
+          live.nodes.map(n => {
+            const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, ...cfg } = n;
+            return {
+              ...cfg,
+              online: !!n.online,
+              latency: n.latency ?? null,
+              models: n.models || [],
+              loaded: n.loaded || [],
+              error: n.error
+            } as EndpointNode;
+          })
+        );
+      } else {
+        setNodes(
+          merged.nodes.map(n => ({
+            ...n,
+            online: false,
+            latency: null,
+            models: [],
+            loaded: []
+          }))
+        );
+      }
 
       const defaultPath =
         (live && live.workspacePath) ||
         merged.lastWorkspace ||
         (await window.electronAPI.getDefaultWorkspace());
       if (live?.updatedAt) sessionAppliedAtRef.current = live.updatedAt;
+      if (typeof live?.chatsRevision === 'number') chatsRevisionRef.current = live.chatsRevision;
       setWorkspacePath(defaultPath);
       loadDirectory(defaultPath);
     }
     init();
   }, [isRemoteClient]);
 
-  // Desktop publishes live session; web console follows it.
+  // Web console: stream live session (event + short poll backup). No manual resync.
   useEffect(() => {
-    if (!window.electronAPI?.onLiveSession || !isRemoteClient) return;
-    return window.electronAPI.onLiveSession(session => {
-      applyLiveSession(session, { forceWorkspace: true });
+    if (!isRemoteClient || !window.electronAPI?.onLiveSession) return;
+    const unsub = window.electronAPI.onLiveSession(session => {
+      setRemoteLive(true);
+      applyLiveSession(session);
     });
+    const poll = window.setInterval(() => {
+      void window.electronAPI.getLiveSession?.().then(s => {
+        if (s?.updatedAt) {
+          setRemoteLive(true);
+          applyLiveSession(s);
+        }
+      });
+    }, 1500);
+    return () => {
+      unsub();
+      window.clearInterval(poll);
+    };
   }, [isRemoteClient, applyLiveSession]);
 
+  // Desktop publishes full live cluster + workspace continuously.
   useEffect(() => {
     if (!window.electronAPI?.publishLiveSession || isRemoteClient) return;
     if (publishTimerRef.current) clearTimeout(publishTimerRef.current);
@@ -270,10 +342,11 @@ export const App: React.FC = () => {
         workspacePath,
         activeConversationId: activeConversationId || null,
         selectedAgentId,
-        nodes: nodeConfigsFromLive(nodes),
+        nodes: toLiveSessionNodes(nodes),
+        chatsRevision: chatsRevisionRef.current,
         source: 'desktop'
       });
-    }, 200);
+    }, 150);
     return () => {
       if (publishTimerRef.current) clearTimeout(publishTimerRef.current);
     };
@@ -283,7 +356,8 @@ export const App: React.FC = () => {
     activeConversationId,
     selectedAgentId,
     nodes,
-    nodeConfigsFromLive
+    toLiveSessionNodes,
+    chatsTick
   ]);
 
   // Persist Settings whenever modified
@@ -381,6 +455,7 @@ export const App: React.FC = () => {
           conversations: conversationsForWorkspace(conversations, workspacePath),
           activeConversationId: active
         });
+        markChatsSaved();
         return next;
       });
     })();
@@ -388,7 +463,7 @@ export const App: React.FC = () => {
       cancelled = true;
       if (loadedWorkspaceRef.current === key) loadedWorkspaceRef.current = '';
     };
-  }, [workspacePath, workspaceEpoch]);
+  }, [workspacePath, workspaceEpoch, markChatsSaved]);
 
   // Sidebar Drag-Resize Listeners
   useEffect(() => {
@@ -465,10 +540,12 @@ export const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    // Remote clients mirror online/models from the desktop live session stream.
+    if (isRemoteClient) return;
     refreshNodes();
     const interval = setInterval(refreshNodes, (settings.pollIntervalSec || 15) * 1000);
     return () => clearInterval(interval);
-  }, [settings.pollIntervalSec, refreshNodes]);
+  }, [settings.pollIntervalSec, refreshNodes, isRemoteClient]);
 
   // 4. File Tree
   const loadDirectory = async (dirPath: string) => {
@@ -477,42 +554,43 @@ export const App: React.FC = () => {
     setFiles(Array.isArray(result) ? result : []);
   };
 
-  const handleSelectFolder = async () => {
-    if (!window.electronAPI) return;
-    const chosen = await window.electronAPI.selectFolder();
+  const openWorkspace = (chosen: string, opts?: { newChat?: boolean }) => {
     if (!chosen) return;
-    forceNewChatRef.current = false;
+    forceNewChatRef.current = !!opts?.newChat;
     loadedWorkspaceRef.current = '';
     setWorkspaceEpoch(n => n + 1);
     setOpenTabs([]);
     setActiveTabPath(undefined);
     setWorkspacePath(chosen);
     loadDirectory(chosen);
+  };
+
+  const handleSelectFolder = async () => {
+    if (!window.electronAPI) return;
+    if (isRemoteClient) {
+      setProjectPicker({ open: true, mode: 'open' });
+      return;
+    }
+    const chosen = await window.electronAPI.selectFolder();
+    if (!chosen) return;
+    openWorkspace(chosen);
   };
 
   /** Open a folder and start a new chat, keeping older chats for that project. */
   const handleNewProject = async () => {
     if (!window.electronAPI) return;
+    if (isRemoteClient) {
+      setProjectPicker({ open: true, mode: 'new' });
+      return;
+    }
     const chosen = await window.electronAPI.selectFolder();
     if (!chosen) return;
-    forceNewChatRef.current = true;
-    loadedWorkspaceRef.current = '';
-    setWorkspaceEpoch(n => n + 1);
-    setOpenTabs([]);
-    setActiveTabPath(undefined);
-    setWorkspacePath(chosen);
-    loadDirectory(chosen);
+    openWorkspace(chosen, { newChat: true });
   };
 
   const handleOpenRecent = (chosen: string) => {
     if (!chosen) return;
-    forceNewChatRef.current = false;
-    loadedWorkspaceRef.current = '';
-    setWorkspaceEpoch(n => n + 1);
-    setOpenTabs([]);
-    setActiveTabPath(undefined);
-    setWorkspacePath(chosen);
-    loadDirectory(chosen);
+    openWorkspace(chosen);
   };
 
   const handleNewChat = () => {
@@ -531,6 +609,7 @@ export const App: React.FC = () => {
             conversations: conversationsForWorkspace(next.conversations, workspacePath),
             activeConversationId: fresh.id
           });
+          markChatsSaved();
         }
       }
       return next;
@@ -548,6 +627,7 @@ export const App: React.FC = () => {
             conversations: conversationsForWorkspace(next.conversations, workspacePath),
             activeConversationId: id
           });
+          markChatsSaved();
         }
       }
       return next;
@@ -583,6 +663,7 @@ export const App: React.FC = () => {
             conversations: conversationsForWorkspace(remaining, workspacePath),
             activeConversationId: nextActive
           });
+          markChatsSaved();
         }
       }
       return next;
@@ -628,6 +709,7 @@ export const App: React.FC = () => {
             conversations: conversationsForWorkspace(next.conversations, workspacePath),
             activeConversationId
           });
+          markChatsSaved();
         }
       }
       return next;
@@ -661,6 +743,7 @@ export const App: React.FC = () => {
             conversations: conversationsForWorkspace(next.conversations, workspacePath),
             activeConversationId
           });
+          markChatsSaved();
         }
       }
       return next;
@@ -977,24 +1060,24 @@ export const App: React.FC = () => {
       <UpdateBanner />
 
       {isRemoteClient && (
-        <div className="shrink-0 px-3 py-1.5 bg-indigo-950/80 border-b border-indigo-500/30 text-[11px] text-indigo-100 flex items-center justify-between gap-2">
+        <div className="shrink-0 px-3 py-1 bg-indigo-950/70 border-b border-indigo-500/25 text-[10px] text-indigo-100/90 flex items-center gap-2">
+          <span
+            className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+              remoteLive ? 'bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]' : 'bg-amber-400 animate-pulse'
+            }`}
+          />
           <span className="truncate">
-            Remote control — mirrored from the Studio window on this PC
+            {remoteLive ? 'Live — controlling Studio on this PC' : 'Connecting to Studio session…'}
           </span>
-          <button
-            type="button"
-            className="shrink-0 underline text-indigo-200"
-            onClick={() => {
-              void window.electronAPI?.getLiveSession?.().then(s => {
-                if (s) applyLiveSession(s, { forceWorkspace: true });
-              });
-              void refreshNodes();
-            }}
-          >
-            Sync now
-          </button>
         </div>
       )}
+
+      <ProjectPickerModal
+        open={projectPicker.open}
+        title={projectPicker.mode === 'new' ? 'New project' : 'Open project'}
+        onClose={() => setProjectPicker(p => ({ ...p, open: false }))}
+        onPick={path => openWorkspace(path, { newChat: projectPicker.mode === 'new' })}
+      />
 
       {isNarrow ? (
         <div className="flex-1 flex flex-col overflow-hidden min-h-0">

@@ -530,6 +530,10 @@ export interface ElectronAPI {
   selectFolder: () => Promise<string | null>;
   /** Resolve a typed folder path on the Studio host (web console). */
   resolveWorkspacePath?: (dirPath: string) => Promise<{ path?: string; error?: string }>;
+  /** `C:\\Users\\<user>\\Projects` on the Studio host (created if missing). */
+  projectsRoot?: () => Promise<string>;
+  listProjects?: () => Promise<{ name: string; path: string }[] | { error: string }>;
+  createProject?: (name: string) => Promise<{ path?: string; error?: string }>;
   readDir: (dirPath: string) => Promise<WorkspaceFile[] | { error: string }>;
   readFile: (filePath: string) => Promise<{ content?: string; error?: string }>;
   writeFile: (filePath: string, content: string) => Promise<{ success?: boolean; error?: string }>;
@@ -633,14 +637,25 @@ export interface ElectronAPI {
   onLiveSession?: (cb: (session: LiveStudioSession) => void) => () => void;
 }
 
+/** Live node row mirrored to web clients (includes online/models from desktop poll). */
+export type LiveSessionNode = NodeConfig & {
+  online?: boolean;
+  latency?: number | null;
+  models?: EndpointNode['models'];
+  loaded?: EndpointNode['loaded'];
+  error?: string;
+};
+
 /** Shared session published by the desktop window for web console clients. */
 export interface LiveStudioSession {
   updatedAt: number;
   workspacePath: string;
   activeConversationId?: string | null;
   selectedAgentId?: string;
-  /** Persisted node configs (online/models filled by each client's cluster poll). */
-  nodes: NodeConfig[];
+  /** Full cluster mirror from the desktop window (status + models). */
+  nodes: LiveSessionNode[];
+  /** Bumps when project chats are saved so remotes reload the thread. */
+  chatsRevision?: number;
   source?: string;
 }
 

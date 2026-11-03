@@ -622,6 +622,26 @@ export interface ElectronAPI {
   webConsoleSetPassword?: (
     password: string
   ) => Promise<{ success?: boolean; error?: string; status?: unknown }>;
+
+  /** Live Studio session snapshot for web remote-control clients. */
+  getLiveSession?: () => Promise<LiveStudioSession>;
+  publishLiveSession?: (snapshot: Partial<LiveStudioSession>) => Promise<{
+    success?: boolean;
+    updatedAt?: number;
+    error?: string;
+  }>;
+  onLiveSession?: (cb: (session: LiveStudioSession) => void) => () => void;
+}
+
+/** Shared session published by the desktop window for web console clients. */
+export interface LiveStudioSession {
+  updatedAt: number;
+  workspacePath: string;
+  activeConversationId?: string | null;
+  selectedAgentId?: string;
+  /** Persisted node configs (online/models filled by each client's cluster poll). */
+  nodes: NodeConfig[];
+  source?: string;
 }
 
 export type AppUpdateState =

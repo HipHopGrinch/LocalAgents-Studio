@@ -96,5 +96,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Embedded LAN web console
   webConsoleGetStatus: () => ipcRenderer.invoke('webConsole:getStatus'),
   webConsoleUpdate: patch => ipcRenderer.invoke('webConsole:update', patch || {}),
-  webConsoleSetPassword: password => ipcRenderer.invoke('webConsole:setPassword', password)
+  webConsoleSetPassword: password => ipcRenderer.invoke('webConsole:setPassword', password),
+
+  // Live session mirror (desktop publishes; web console follows)
+  getLiveSession: () => ipcRenderer.invoke('session:get'),
+  publishLiveSession: snapshot => ipcRenderer.invoke('session:publish', snapshot || {}),
+  onLiveSession: subscribe('session:changed')
 });

@@ -5,8 +5,18 @@ import type { ElectronAPI } from '../types';
 
 const TOKEN_KEY = 'la_web_console_token';
 
+declare global {
+  interface Window {
+    __LA_WEB_CONSOLE__?: boolean;
+  }
+}
+
+/** True when running in a browser attached to Studio (not the Electron window). */
 export function isWebConsoleClient(): boolean {
-  return typeof window !== 'undefined' && !(window as Window & { electronAPI?: ElectronAPI }).electronAPI;
+  if (typeof window === 'undefined') return false;
+  if (window.__LA_WEB_CONSOLE__) return true;
+  // Before the WS bridge assigns electronAPI
+  return !(window as Window & { electronAPI?: ElectronAPI }).electronAPI;
 }
 
 export function getStoredWebToken(): string | null {
@@ -275,7 +285,11 @@ export function createWebHostApi(token: string): Promise<ElectronAPI> {
 
       webConsoleGetStatus: () => invoke('webConsole:getStatus'),
       webConsoleUpdate: patch => invoke('webConsole:update', [patch]),
-      webConsoleSetPassword: password => invoke('webConsole:setPassword', [password])
+      webConsoleSetPassword: password => invoke('webConsole:setPassword', [password]),
+
+      getLiveSession: () => invoke('session:get'),
+      publishLiveSession: snapshot => invoke('session:publish', [snapshot || {}]),
+      onLiveSession: cb => subscribe('session:changed', p => cb(p as never))
     };
 
     const finish = () => {

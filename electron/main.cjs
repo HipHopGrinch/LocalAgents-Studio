@@ -187,6 +187,22 @@ ipcMain.handle('settings:save', async (_e, settings) => {
         passwordHash: next.passwordHash || prev.passwordHash,
         passwordSalt: next.passwordSalt || prev.passwordSalt
       };
+      // Guard against a second client racing with empty defaults and wiping the cluster.
+      if (
+        Array.isArray(existing?.nodes) &&
+        existing.nodes.length > 0 &&
+        (!Array.isArray(settings.nodes) || settings.nodes.length === 0)
+      ) {
+        settings.nodes = existing.nodes;
+        appendLog('warn', 'settings:save refused empty nodes overwrite — kept existing cluster');
+      }
+      if (
+        Array.isArray(existing?.agents) &&
+        existing.agents.length > 0 &&
+        (!Array.isArray(settings.agents) || settings.agents.length === 0)
+      ) {
+        settings.agents = existing.agents;
+      }
     }
     const tmp = settingsPath() + '.tmp';
     await fsp.writeFile(tmp, JSON.stringify(settings, null, 2), 'utf-8');
@@ -201,6 +217,44 @@ ipcMain.handle('settings:save', async (_e, settings) => {
     return { success: true };
   } catch (err) {
     return { error: err.message };
+  }
+});
+
+// ==========================================
+// LIVE SESSION (desktop ↔ web console remote control)
+// ==========================================
+
+/** In-memory mirror of the Studio window so web clients attach to the same session. */
+let liveSession = {
+  updatedAt: 0,
+  workspacePath: '',
+  activeConversationId: null,
+  selectedAgentId: 'coder',
+  nodes: [],
+  source: 'none'
+};
+
+ipcMain.handle('session:get', () => ({ ...liveSession }));
+
+ipcMain.handle('session:publish', (_e, snapshot = {}) => {
+  try {
+    const nodes = Array.isArray(snapshot.nodes) ? snapshot.nodes : liveSession.nodes;
+    liveSession = {
+      updatedAt: Date.now(),
+      workspacePath:
+        typeof snapshot.workspacePath === 'string' ? snapshot.workspacePath : liveSession.workspacePath,
+      activeConversationId:
+        snapshot.activeConversationId !== undefined
+          ? snapshot.activeConversationId
+          : liveSession.activeConversationId,
+      selectedAgentId: snapshot.selectedAgentId || liveSession.selectedAgentId || 'coder',
+      nodes,
+      source: snapshot.source || 'renderer'
+    };
+    send('session:changed', { ...liveSession });
+    return { success: true, updatedAt: liveSession.updatedAt };
+  } catch (err) {
+    return { error: err.message || 'publish failed' };
   }
 });
 

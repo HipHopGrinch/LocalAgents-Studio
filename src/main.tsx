@@ -29,6 +29,7 @@ function Root() {
     createWebHostApi(token)
       .then(api => {
         if (cancelled) return;
+        window.__LA_WEB_CONSOLE__ = true;
         (window as Window & { electronAPI: ElectronAPI }).electronAPI = api;
         setNeedsLogin(false);
         setReady(true);
@@ -50,6 +51,7 @@ function Root() {
     try {
       const api = await createWebHostApi(res.token);
       setStoredWebToken(res.token);
+      window.__LA_WEB_CONSOLE__ = true;
       (window as Window & { electronAPI: ElectronAPI }).electronAPI = api;
       setNeedsLogin(false);
       setReady(true);

@@ -15,7 +15,8 @@ import {
   OpenTab,
   AppSettings,
   ChatConversation,
-  ChatMessage
+  ChatMessage,
+  LiveStudioSession
 } from './types';
 import { DEFAULT_SETTINGS, mergeSettings } from './config/defaults';
 import { bumpFreeTierUsage } from './lib/freeTierAssist';
@@ -30,6 +31,7 @@ import {
   titleFromMessages,
   upsertConversation
 } from './lib/conversations';
+import { isWebConsoleClient } from './lib/hostApi';
 
 /** Keep agent writes inside the open folder, even when a model emits an absolute path. */
 function clampWritePath(root: string, filePath: string): string {
@@ -99,6 +101,16 @@ export const App: React.FC = () => {
   // UI & Text Scaling (Discord-style zoom factor: 0.75 to 2.0)
   const [uiScale, setUiScale] = useState<number>(DEFAULT_SETTINGS.uiScale || 1.0);
   const [appVersion, setAppVersion] = useState<string>('');
+  const isRemoteClient = isWebConsoleClient();
+  const sessionAppliedAtRef = useRef(0);
+  const publishTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const nodeConfigsFromLive = useCallback((list: EndpointNode[] | NodeConfig[]): NodeConfig[] => {
+    return list.map(n => {
+      const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, ...cfg } = n as EndpointNode;
+      return cfg;
+    });
+  }, []);
 
   // Forward renderer crashes into studio.log so "Submit logs to GitHub" includes them.
   useEffect(() => {
@@ -126,7 +138,46 @@ export const App: React.FC = () => {
     };
   }, []);
 
-  // 1. Initial Load: Settings & Workspace
+  const applyLiveSession = useCallback(
+    (session: LiveStudioSession, opts?: { forceWorkspace?: boolean }) => {
+      if (!session || !session.updatedAt) return;
+      if (session.updatedAt <= sessionAppliedAtRef.current) return;
+      sessionAppliedAtRef.current = session.updatedAt;
+
+      if (Array.isArray(session.nodes) && session.nodes.length > 0) {
+        setSettings(prev => ({ ...prev, nodes: session.nodes }));
+        setNodes(prev => {
+          const byId = new Map(prev.map(n => [n.id, n]));
+          return session.nodes.map(cfg => {
+            const existing = byId.get(cfg.id);
+            return {
+              ...cfg,
+              online: existing?.online ?? false,
+              latency: existing?.latency ?? null,
+              models: existing?.models ?? [],
+              loaded: existing?.loaded ?? [],
+              error: existing?.error
+            };
+          });
+        });
+      }
+
+      if (session.selectedAgentId) setSelectedAgentId(session.selectedAgentId);
+      if (session.activeConversationId) setActiveConversationId(session.activeConversationId || undefined);
+
+      const nextWs = session.workspacePath || '';
+      if (nextWs && (opts?.forceWorkspace || nextWs !== workspacePath)) {
+        forceNewChatRef.current = false;
+        loadedWorkspaceRef.current = '';
+        setWorkspaceEpoch(n => n + 1);
+        setWorkspacePath(nextWs);
+        void loadDirectory(nextWs);
+      }
+    },
+    [workspacePath]
+  );
+
+  // 1. Initial Load: Settings & Workspace (+ attach to live desktop session for web console)
   useEffect(() => {
     async function init() {
       if (!window.electronAPI) return;
@@ -135,7 +186,9 @@ export const App: React.FC = () => {
         const ver = await window.electronAPI.getAppVersion?.();
         if (ver) {
           setAppVersion(ver);
-          document.title = `LocalAgents Studio ${ver}`;
+          document.title = isRemoteClient
+            ? `LocalAgents Remote ${ver}`
+            : `LocalAgents Studio ${ver}`;
         }
       } catch {
         /* ignore */
@@ -143,6 +196,20 @@ export const App: React.FC = () => {
 
       const saved = await window.electronAPI.loadSettings();
       const merged = mergeSettings(saved);
+      let live: LiveStudioSession | null = null;
+      try {
+        live = (await window.electronAPI.getLiveSession?.()) || null;
+      } catch {
+        live = null;
+      }
+
+      // Prefer the live desktop session cluster when the disk snapshot is empty (remote attach).
+      if (live && Array.isArray(live.nodes) && live.nodes.length > 0) {
+        if (!merged.nodes.length || (live.updatedAt && live.nodes.length >= merged.nodes.length)) {
+          merged.nodes = live.nodes;
+        }
+      }
+
       const sortedChats = [...(merged.conversations || [])].sort((a, b) => a.updatedAt - b.updatedAt);
       let recent = merged.recentWorkspaces || [];
       for (const chat of sortedChats) {
@@ -153,8 +220,12 @@ export const App: React.FC = () => {
       if (merged.explorerWidth) setExplorerWidth(merged.explorerWidth);
       if (merged.chatWidth) setChatWidth(merged.chatWidth);
       if (merged.agentControlWidth) setAgentControlWidth(merged.agentControlWidth);
-      if (merged.activeConversationId) setActiveConversationId(merged.activeConversationId);
-      
+
+      const initialActive =
+        (live && live.activeConversationId) || merged.activeConversationId || undefined;
+      if (initialActive) setActiveConversationId(initialActive);
+      if (live?.selectedAgentId) setSelectedAgentId(live.selectedAgentId);
+
       const initialScale = merged.uiScale || 1.0;
       setUiScale(initialScale);
       if (window.electronAPI.setZoomFactor) {
@@ -162,7 +233,6 @@ export const App: React.FC = () => {
       }
       document.documentElement.style.setProperty('--app-scale', String(initialScale));
 
-      // Initialize live nodes
       setNodes(
         merged.nodes.map(n => ({
           ...n,
@@ -173,12 +243,48 @@ export const App: React.FC = () => {
         }))
       );
 
-      const defaultPath = merged.lastWorkspace || (await window.electronAPI.getDefaultWorkspace());
+      const defaultPath =
+        (live && live.workspacePath) ||
+        merged.lastWorkspace ||
+        (await window.electronAPI.getDefaultWorkspace());
+      if (live?.updatedAt) sessionAppliedAtRef.current = live.updatedAt;
       setWorkspacePath(defaultPath);
       loadDirectory(defaultPath);
     }
     init();
-  }, []);
+  }, [isRemoteClient]);
+
+  // Desktop publishes live session; web console follows it.
+  useEffect(() => {
+    if (!window.electronAPI?.onLiveSession || !isRemoteClient) return;
+    return window.electronAPI.onLiveSession(session => {
+      applyLiveSession(session, { forceWorkspace: true });
+    });
+  }, [isRemoteClient, applyLiveSession]);
+
+  useEffect(() => {
+    if (!window.electronAPI?.publishLiveSession || isRemoteClient) return;
+    if (publishTimerRef.current) clearTimeout(publishTimerRef.current);
+    publishTimerRef.current = setTimeout(() => {
+      void window.electronAPI.publishLiveSession?.({
+        workspacePath,
+        activeConversationId: activeConversationId || null,
+        selectedAgentId,
+        nodes: nodeConfigsFromLive(nodes),
+        source: 'desktop'
+      });
+    }, 200);
+    return () => {
+      if (publishTimerRef.current) clearTimeout(publishTimerRef.current);
+    };
+  }, [
+    isRemoteClient,
+    workspacePath,
+    activeConversationId,
+    selectedAgentId,
+    nodes,
+    nodeConfigsFromLive
+  ]);
 
   // Persist Settings whenever modified
   const updateSettings = useCallback((partial: Partial<AppSettings>) => {
@@ -869,6 +975,26 @@ export const App: React.FC = () => {
         />
       </div>
       <UpdateBanner />
+
+      {isRemoteClient && (
+        <div className="shrink-0 px-3 py-1.5 bg-indigo-950/80 border-b border-indigo-500/30 text-[11px] text-indigo-100 flex items-center justify-between gap-2">
+          <span className="truncate">
+            Remote control — mirrored from the Studio window on this PC
+          </span>
+          <button
+            type="button"
+            className="shrink-0 underline text-indigo-200"
+            onClick={() => {
+              void window.electronAPI?.getLiveSession?.().then(s => {
+                if (s) applyLiveSession(s, { forceWorkspace: true });
+              });
+              void refreshNodes();
+            }}
+          >
+            Sync now
+          </button>
+        </div>
+      )}
 
       {isNarrow ? (
         <div className="flex-1 flex flex-col overflow-hidden min-h-0">

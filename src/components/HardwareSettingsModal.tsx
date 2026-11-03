@@ -89,6 +89,19 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   } | null>(null);
   const [webBusy, setWebBusy] = useState(false);
   const [webNote, setWebNote] = useState('');
+  /** On phones: list of endpoints vs selected node detail (no side-by-side). */
+  const [mobileNodePane, setMobileNodePane] = useState<'list' | 'detail'>('list');
+  const [isNarrowHw, setIsNarrowHw] = useState(() =>
+    typeof window !== 'undefined' ? window.matchMedia('(max-width: 767px)').matches : false
+  );
+
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 767px)');
+    const apply = () => setIsNarrowHw(mq.matches);
+    apply();
+    mq.addEventListener('change', apply);
+    return () => mq.removeEventListener('change', apply);
+  }, []);
   
   // Benchmark state
   const [benchmarkingModel, setBenchmarkingModel] = useState<string | null>(null);
@@ -743,75 +756,60 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     }
   };
 
+  const hwTabs: { id: typeof activeTab; label: string; short: string }[] = [
+    { id: 'nodes', label: `Hardware Nodes (${nodes.length})`, short: `Nodes (${nodes.length})` },
+    { id: 'hub', label: 'Model Hub & Recommendations', short: 'Hub' },
+    { id: 'appearance', label: 'Appearance & Scaling', short: 'Display' },
+    { id: 'stats', label: 'Token Usage & Savings', short: 'Stats' },
+    { id: 'remote', label: 'Web Console', short: 'Remote' }
+  ];
+
   return (
-    <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4">
+    <div
+      className={`fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center ${
+        isNarrowHw ? 'p-0' : 'p-4'
+      }`}
+    >
       <div className="bg-[#161619] border border-[#2e2e38] w-full max-w-4xl sm:rounded-xl shadow-2xl overflow-hidden flex flex-col h-[100dvh] sm:h-[85vh] max-h-[100dvh] sm:max-h-[85vh] rounded-none">
         {/* Header */}
-        <div className="h-12 bg-[#121215] border-b border-[#27272a] px-4 flex items-center justify-between">
-          <div className="flex items-center space-x-3">
-            <div className="flex items-center space-x-2 text-indigo-400 font-bold text-sm">
-              <Cpu className="w-4 h-4" />
-              <span>Cluster & Hardware Conductor</span>
+        <div className="shrink-0 bg-[#121215] border-b border-[#27272a]">
+          <div className="h-11 px-3 sm:px-4 flex items-center justify-between gap-2">
+            <div className="flex items-center space-x-2 text-indigo-400 font-bold text-sm min-w-0">
+              <Cpu className="w-4 h-4 shrink-0" />
+              <span className="truncate">{isNarrowHw ? 'Hardware' : 'Cluster & Hardware Conductor'}</span>
             </div>
-            <div className="h-4 w-[1px] bg-[#27272a]" />
-            <div className="flex items-center space-x-1 text-xs">
+            <div className="flex items-center space-x-1.5 shrink-0">
               <button
-                onClick={() => setActiveTab('nodes')}
-                className={`px-3 py-1 rounded transition ${
-                  activeTab === 'nodes' ? 'bg-indigo-600 text-white font-medium' : 'text-zinc-400 hover:text-white'
-                }`}
+                onClick={onRefreshNodes}
+                className="flex items-center space-x-1 px-2 py-1 text-xs text-zinc-300 hover:text-white bg-[#1e1e24] hover:bg-[#282830] rounded border border-[#2c2c36] transition"
+                title="Ping all endpoints"
               >
-                Hardware Nodes ({nodes.length})
+                <RefreshCw className="w-3 h-3" />
+                {!isNarrowHw && <span>Ping All</span>}
               </button>
-              <button
-                onClick={() => setActiveTab('hub')}
-                className={`px-3 py-1 rounded transition ${
-                  activeTab === 'hub' ? 'bg-indigo-600 text-white font-medium' : 'text-zinc-400 hover:text-white'
-                }`}
-              >
-                Model Hub & Recommendations
-              </button>
-              <button
-                onClick={() => setActiveTab('appearance')}
-                className={`flex items-center space-x-1.5 px-3 py-1 rounded transition ${
-                  activeTab === 'appearance' ? 'bg-indigo-600 text-white font-medium' : 'text-zinc-400 hover:text-white'
-                }`}
-              >
-                <Sliders className="w-3.5 h-3.5" />
-                <span>Appearance & Scaling</span>
-              </button>
-              <button
-                onClick={() => setActiveTab('stats')}
-                className={`px-3 py-1 rounded transition ${
-                  activeTab === 'stats' ? 'bg-indigo-600 text-white font-medium' : 'text-zinc-400 hover:text-white'
-                }`}
-              >
-                Token Usage & Savings
-              </button>
-              <button
-                onClick={() => setActiveTab('remote')}
-                className={`flex items-center space-x-1.5 px-3 py-1 rounded transition ${
-                  activeTab === 'remote' ? 'bg-indigo-600 text-white font-medium' : 'text-zinc-400 hover:text-white'
-                }`}
-              >
-                <Globe className="w-3.5 h-3.5" />
-                <span>Web Console</span>
+              <button onClick={onClose} className="p-1.5 text-zinc-400 hover:text-white rounded">
+                <X className="w-4 h-4" />
               </button>
             </div>
           </div>
-
-          <div className="flex items-center space-x-2">
-            <button
-              onClick={onRefreshNodes}
-              className="flex items-center space-x-1 px-2.5 py-1 text-xs text-zinc-300 hover:text-white bg-[#1e1e24] hover:bg-[#282830] rounded border border-[#2c2c36] transition"
-              title="Ping all endpoints"
-            >
-              <RefreshCw className="w-3 h-3" />
-              <span>Ping All</span>
-            </button>
-            <button onClick={onClose} className="p-1 text-zinc-400 hover:text-white rounded">
-              <X className="w-4 h-4" />
-            </button>
+          <div className="px-2 pb-2 flex items-center gap-1 overflow-x-auto no-scrollbar">
+            {hwTabs.map(t => (
+              <button
+                key={t.id}
+                type="button"
+                onClick={() => {
+                  setActiveTab(t.id);
+                  if (t.id === 'nodes' && isNarrowHw) setMobileNodePane('list');
+                }}
+                className={`px-2.5 py-1 rounded text-[11px] whitespace-nowrap shrink-0 transition ${
+                  activeTab === t.id
+                    ? 'bg-indigo-600 text-white font-medium'
+                    : 'text-zinc-400 hover:text-white bg-[#18181d]'
+                }`}
+              >
+                {isNarrowHw ? t.short : t.label}
+              </button>
+            ))}
           </div>
         </div>
 
@@ -831,19 +829,39 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                 className="min-w-0 flex-1 select-text bg-[#18181d] border border-[#2c2c38] text-zinc-200 rounded px-2 py-1 text-[11px] font-mono"
               />
             </div>
-            <div className="flex-1 flex overflow-hidden">
-            {/* Left Node Sidebar */}
-            <div className="w-64 border-r border-[#27272a] bg-[#121215] flex flex-col justify-between p-2">
+            <div className="flex-1 flex overflow-hidden min-h-0">
+            {/* Left Node Sidebar — full width on phone until a node is opened */}
+            <div
+              className={`${
+                isNarrowHw
+                  ? mobileNodePane === 'list'
+                    ? 'w-full'
+                    : 'hidden'
+                  : 'w-64 border-r'
+              } border-[#27272a] bg-[#121215] flex flex-col justify-between p-2 shrink-0`}
+            >
               <div className="space-y-1 overflow-y-auto">
                 <div className="text-[10px] uppercase font-bold text-zinc-500 px-2 py-1 tracking-wider">
                   Configured Endpoints
                 </div>
+                {nodes.length === 0 && (
+                  <div className="px-2 py-6 text-center text-zinc-500 space-y-2">
+                    <Cpu className="w-8 h-8 text-indigo-400/50 mx-auto" />
+                    <p className="text-xs font-semibold text-zinc-300">No endpoints yet</p>
+                    <p className="text-[10px] leading-relaxed">
+                      Add a local Ollama node or Frontier API. On the web console, wait for the desktop session to sync if Studio already has nodes.
+                    </p>
+                  </div>
+                )}
                 {nodes.map(n => {
                   const isFrontier = n.type === 'openai' || !!n.apiKey;
                   return (
                     <div
                       key={n.id}
-                      onClick={() => setSelectedNodeId(n.id)}
+                      onClick={() => {
+                        setSelectedNodeId(n.id);
+                        if (isNarrowHw) setMobileNodePane('detail');
+                      }}
                       className={`p-2.5 rounded-lg cursor-pointer transition text-xs flex flex-col space-y-1 ${
                         selectedNodeId === n.id
                           ? 'bg-indigo-600/20 border border-indigo-500/40 text-white'
@@ -909,14 +927,27 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
             </div>
 
             {/* Right Node Configuration Panel */}
-            <div className="flex-1 p-5 overflow-y-auto space-y-5">
+            <div
+              className={`${
+                isNarrowHw ? (mobileNodePane === 'detail' ? 'w-full' : 'hidden') : 'flex-1'
+              } p-4 sm:p-5 overflow-y-auto space-y-5 min-w-0`}
+            >
+              {isNarrowHw && currentNode && mobileNodePane === 'detail' && (
+                <button
+                  type="button"
+                  onClick={() => setMobileNodePane('list')}
+                  className="text-[11px] text-indigo-300 hover:text-indigo-200"
+                >
+                  ← All endpoints
+                </button>
+              )}
               {currentNode && (
                 <>
                   {/* Node Identity & Connection */}
                   <div className="bg-[#121215] border border-[#272730] rounded-xl p-4 space-y-3">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center space-x-2">
-                        <span className="text-sm font-bold text-zinc-100">{currentNode.name}</span>
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <div className="flex items-center space-x-2 min-w-0 flex-wrap">
+                        <span className="text-sm font-bold text-zinc-100 truncate">{currentNode.name}</span>
                         {currentNode.type === 'openai' ? (
                           <span className="text-[10px] bg-sky-500/20 text-sky-300 border border-sky-500/30 px-2 py-0.5 rounded font-mono">
                             Frontier API (OpenAI Compatible)

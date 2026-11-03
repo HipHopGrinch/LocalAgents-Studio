@@ -11,7 +11,8 @@ import {
   ExecutionQueue,
   PlannerPlan,
   PlanOption,
-  WorkspaceFile
+  WorkspaceFile,
+  LiveConductorState
 } from '../types';
 import {
   Send,
@@ -240,6 +241,15 @@ interface AgentChatProps {
   maxAgentSteps?: number;
   /** True while a local/frontier agent turn (or stuck ladder) is in flight — blocks update restart. */
   onBusyChange?: (busy: boolean) => void;
+  /** Peer conductor snapshot (from live session) — toggles + Generating indicator. */
+  peerConductor?: LiveConductorState | null;
+  /** Live messages from the peer for the active conversation (streaming mirror). */
+  peerChatMirror?: { conversationId: string; messages: ChatMessage[] } | null;
+  /** Publish local conductor / chat mirror upward for live session. */
+  onLiveConductorPublish?: (payload: {
+    conductor: LiveConductorState;
+    chatMirror: { conversationId: string; messages: ChatMessage[] } | null;
+  }) => void;
 }
 
 export const AgentChat: React.FC<AgentChatProps> = ({
@@ -270,7 +280,10 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   onToggleModelThinking,
   searxngUrl = '',
   maxAgentSteps = 12,
-  onBusyChange
+  onBusyChange,
+  peerConductor = null,
+  peerChatMirror = null,
+  onLiveConductorPublish
 }) => {
   const toolStepLimit = toolContinuationLimit(maxAgentSteps);
   const currentAgent = agents.find(a => a.id === selectedAgentId) || agents[0];
@@ -304,6 +317,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     onBusyChange?.(isStreaming);
     return () => onBusyChange?.(false);
   }, [isStreaming, onBusyChange]);
+  const conductorRevisionRef = useRef(0);
+  const applyingPeerConductorRef = useRef(false);
+  const peerConductorRevAppliedRef = useRef(0);
   const [historyOpen, setHistoryOpen] = useState(false);
   /** Mobile fill mode: full-screen Conductor sheet */
   const [mobileControlsOpen, setMobileControlsOpen] = useState(false);
@@ -433,6 +449,117 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       }
     }
   }, [conversation?.id]);
+
+  // Adopt peer / parent conversation messages when we are not the one streaming.
+  useEffect(() => {
+    if (!conversation || conversation.id !== conversationIdRef.current) return;
+    if (isStreaming) return;
+    const next = conversation.messages || [];
+    const prev = messagesRef.current;
+    const lastPrev = prev[prev.length - 1];
+    const lastNext = next[next.length - 1];
+    if (
+      prev.length === next.length &&
+      lastPrev?.id === lastNext?.id &&
+      lastPrev?.raw === lastNext?.raw &&
+      lastPrev?.display === lastNext?.display
+    ) {
+      return;
+    }
+    skipPersistRef.current = true;
+    setMessages(next);
+    messagesRef.current = next;
+  }, [conversation?.messages, conversation?.id, isStreaming]);
+
+  // Live chat mirror from peer (faster than disk reload during Generating…).
+  useEffect(() => {
+    if (!peerChatMirror?.conversationId || !peerChatMirror.messages) return;
+    if (peerChatMirror.conversationId !== conversationIdRef.current) return;
+    if (isStreaming) return;
+    const next = peerChatMirror.messages;
+    const prev = messagesRef.current;
+    const lastPrev = prev[prev.length - 1];
+    const lastNext = next[next.length - 1];
+    if (
+      prev.length === next.length &&
+      lastPrev?.id === lastNext?.id &&
+      lastPrev?.raw === lastNext?.raw &&
+      lastPrev?.display === lastNext?.display
+    ) {
+      return;
+    }
+    skipPersistRef.current = true;
+    setMessages(next);
+    messagesRef.current = next;
+  }, [peerChatMirror, isStreaming]);
+
+  // Apply conductor toggles / busy UI from peer live session.
+  useEffect(() => {
+    if (!peerConductor) return;
+    if (typeof peerConductor.revision !== 'number') return;
+    if (peerConductor.revision <= peerConductorRevAppliedRef.current) return;
+    peerConductorRevAppliedRef.current = peerConductor.revision;
+    applyingPeerConductorRef.current = true;
+    setIsPipelineMode(!!peerConductor.isPipelineMode);
+    setAutoSelectEndpoint(!!peerConductor.autoSelectEndpoint);
+    autoApplyWritesRef.current = !!peerConductor.autoApplyWrites;
+    setAutoApplyWrites(!!peerConductor.autoApplyWrites);
+    autoReviewRef.current = !!peerConductor.autoReview;
+    setAutoReview(!!peerConductor.autoReview);
+    setIncludeActiveFile(!!peerConductor.includeActiveFile);
+    if (peerConductor.targetNodeId) setTargetNodeId(peerConductor.targetNodeId);
+    if (peerConductor.targetModel) setTargetModel(peerConductor.targetModel);
+    if (peerConductor.executingPlanNotice !== undefined) {
+      setExecutingPlanNotice(peerConductor.executingPlanNotice || null);
+    }
+    window.setTimeout(() => {
+      applyingPeerConductorRef.current = false;
+    }, 200);
+  }, [peerConductor]);
+
+  // Publish local conductor + chat buffer for peers.
+  useEffect(() => {
+    if (!onLiveConductorPublish) return;
+    if (applyingPeerConductorRef.current) return;
+    const timer = window.setTimeout(() => {
+      if (applyingPeerConductorRef.current) return;
+      conductorRevisionRef.current += 1;
+      const latestAssistant = [...messagesRef.current].reverse().find(m => m.role === 'assistant');
+      onLiveConductorPublish({
+        conductor: {
+          isPipelineMode,
+          autoSelectEndpoint,
+          autoApplyWrites,
+          autoReview,
+          includeActiveFile,
+          isStreaming,
+          activityLabel: isStreaming
+            ? streamingActivityLabel(latestAssistant)
+            : undefined,
+          targetNodeId,
+          targetModel,
+          executingPlanNotice,
+          revision: conductorRevisionRef.current
+        },
+        chatMirror: conversationIdRef.current
+          ? { conversationId: conversationIdRef.current, messages: messagesRef.current }
+          : null
+      });
+    }, 80);
+    return () => window.clearTimeout(timer);
+  }, [
+    onLiveConductorPublish,
+    isPipelineMode,
+    autoSelectEndpoint,
+    autoApplyWrites,
+    autoReview,
+    includeActiveFile,
+    isStreaming,
+    targetNodeId,
+    targetModel,
+    executingPlanNotice,
+    messages
+  ]);
 
   useEffect(() => {
     if (conversation?.id === conversationIdRef.current) {
@@ -3917,7 +4044,11 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
 
   const conductorInfo = findLeadArchitect(nodes) || findFastestConductor(nodes);
   const latestAssistant = [...messages].reverse().find(m => m.role === 'assistant');
-  const activityLabel = streamingActivityLabel(latestAssistant);
+  const peerStreaming = !!(peerConductor?.isStreaming && !isStreaming);
+  const showStreamingUi = isStreaming || peerStreaming;
+  const activityLabel = isStreaming
+    ? streamingActivityLabel(latestAssistant)
+    : peerConductor?.activityLabel || 'Generating';
 
   const handleNewChatClick = () => {
     if (isStreaming) {
@@ -4580,7 +4711,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
 
       {/* Input Composer */}
       <div className="p-3 border-t border-[#27272a] bg-[#121215]">
-        {isStreaming && <ActivityIndicator label={activityLabel} />}
+        {showStreamingUi && <ActivityIndicator label={activityLabel} />}
         {activeTab && (
           <div className="flex items-center justify-between mb-2 px-1 text-[11px] text-zinc-400">
             <label className="flex items-center space-x-1.5 cursor-pointer hover:text-zinc-200">

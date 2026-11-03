@@ -648,6 +648,23 @@ export type LiveSessionNode = NodeConfig & {
   error?: string;
 };
 
+/** Agent Conductor UI mirrored across desktop ↔ web console. */
+export interface LiveConductorState {
+  isPipelineMode: boolean;
+  autoSelectEndpoint: boolean;
+  autoApplyWrites: boolean;
+  autoReview: boolean;
+  includeActiveFile: boolean;
+  /** True while this surface is running an agent/swarm turn. */
+  isStreaming: boolean;
+  activityLabel?: string;
+  targetNodeId?: string;
+  targetModel?: string;
+  executingPlanNotice?: string | null;
+  /** Bumps whenever local conductor UI changes so peers re-apply. */
+  revision: number;
+}
+
 /** Shared session published by any Studio surface (desktop or web console). */
 export interface LiveStudioSession {
   updatedAt: number;
@@ -661,6 +678,16 @@ export interface LiveStudioSession {
   /** Open editor focus mirrored across clients. */
   activeTabPath?: string | null;
   openTabPaths?: string[];
+  /** Swarm / Auto-* toggles and Generating indicator. */
+  conductor?: LiveConductorState | null;
+  /**
+   * Live chat buffer for the active conversation (keeps peers current while streaming,
+   * before disk chatsRevision catches up).
+   */
+  chatMirror?: {
+    conversationId: string;
+    messages: ChatMessage[];
+  } | null;
   source?: string;
   /** Stable per-window id so a client ignores its own echo. */
   clientId?: string | null;

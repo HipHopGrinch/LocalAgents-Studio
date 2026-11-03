@@ -226,6 +226,8 @@ let liveSession = {
   chatsRevision: 0,
   activeTabPath: null,
   openTabPaths: [],
+  conductor: null,
+  chatMirror: null,
   source: 'none',
   clientId: null
 };
@@ -256,6 +258,9 @@ ipcMain.handle('session:publish', (_e, snapshot = {}) => {
       openTabPaths: Array.isArray(snapshot.openTabPaths)
         ? snapshot.openTabPaths
         : liveSession.openTabPaths || [],
+      // Last writer wins for conductor / chat mirror (each publish carries full snapshot).
+      conductor: snapshot.conductor !== undefined ? snapshot.conductor : liveSession.conductor,
+      chatMirror: snapshot.chatMirror !== undefined ? snapshot.chatMirror : liveSession.chatMirror,
       source: snapshot.source || 'renderer',
       clientId: snapshot.clientId || liveSession.clientId || null
     };
@@ -265,11 +270,12 @@ ipcMain.handle('session:publish', (_e, snapshot = {}) => {
       snapshot.chatsRevision !== undefined ||
       snapshot.workspacePath !== undefined ||
       snapshot.activeConversationId !== undefined ||
-      snapshot.activeTabPath !== undefined
+      snapshot.activeTabPath !== undefined ||
+      snapshot.conductor !== undefined
     ) {
       appendLog(
         'info',
-        `session:publish ${liveSession.source || '?'} client=${String(liveSession.clientId || '').slice(0, 12)} ws=${liveSession.workspacePath || '(none)'} chat=${liveSession.activeConversationId || '(none)'} rev=${liveSession.chatsRevision} tab=${liveSession.activeTabPath || '(none)'}`
+        `session:publish ${liveSession.source || '?'} client=${String(liveSession.clientId || '').slice(0, 12)} ws=${liveSession.workspacePath || '(none)'} chat=${liveSession.activeConversationId || '(none)'} rev=${liveSession.chatsRevision} swarm=${liveSession.conductor?.isPipelineMode ? 1 : 0} stream=${liveSession.conductor?.isStreaming ? 1 : 0}`
       );
     }
     return { success: true, updatedAt: liveSession.updatedAt };

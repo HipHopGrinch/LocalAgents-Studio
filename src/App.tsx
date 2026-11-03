@@ -18,7 +18,8 @@ import {
   ChatConversation,
   ChatMessage,
   LiveStudioSession,
-  LiveSessionNode
+  LiveSessionNode,
+  LiveConductorState
 } from './types';
 import { DEFAULT_SETTINGS, mergeSettings } from './config/defaults';
 import { bumpFreeTierUsage } from './lib/freeTierAssist';
@@ -159,6 +160,17 @@ export const App: React.FC = () => {
   }>({ open: false, mode: 'open' });
   const [remoteLive, setRemoteLive] = useState(false);
   const [chatsTick, setChatsTick] = useState(0);
+  const [peerConductor, setPeerConductor] = useState<LiveConductorState | null>(null);
+  const [peerChatMirror, setPeerChatMirror] = useState<{
+    conversationId: string;
+    messages: ChatMessage[];
+  } | null>(null);
+  const localConductorRef = useRef<LiveConductorState | null>(null);
+  const localChatMirrorRef = useRef<{
+    conversationId: string;
+    messages: ChatMessage[];
+  } | null>(null);
+  const [conductorTick, setConductorTick] = useState(0);
 
   /** Bump after local chat writes so every peer reloads from disk. */
   const markChatsSaved = useCallback(() => {
@@ -306,6 +318,13 @@ export const App: React.FC = () => {
         }
         setActiveTabPath(nextTab);
       })();
+    }
+
+    if (session.conductor) {
+      setPeerConductor(session.conductor);
+    }
+    if (session.chatMirror !== undefined) {
+      setPeerChatMirror(session.chatMirror || null);
     }
   }, [isRemoteClient]);
 
@@ -465,6 +484,8 @@ export const App: React.FC = () => {
         chatsRevision: chatsRevisionRef.current,
         activeTabPath: activeTabPath || null,
         openTabPaths: openTabs.map(t => t.path),
+        conductor: localConductorRef.current,
+        chatMirror: localChatMirrorRef.current,
         source: isRemoteClient ? 'web' : 'desktop',
         clientId: sessionClientIdRef.current
       } as Partial<LiveStudioSession>);
@@ -481,8 +502,21 @@ export const App: React.FC = () => {
     toLiveSessionNodes,
     chatsTick,
     activeTabPath,
-    openTabs
+    openTabs,
+    conductorTick
   ]);
+
+  const handleLiveConductorPublish = useCallback(
+    (payload: {
+      conductor: LiveConductorState;
+      chatMirror: { conversationId: string; messages: ChatMessage[] } | null;
+    }) => {
+      localConductorRef.current = payload.conductor;
+      localChatMirrorRef.current = payload.chatMirror;
+      setConductorTick(t => t + 1);
+    },
+    []
+  );
 
   // Persist Settings whenever modified
   const updateSettings = useCallback((partial: Partial<AppSettings>) => {
@@ -1127,7 +1161,10 @@ export const App: React.FC = () => {
     onDeleteConversation: handleDeleteConversation,
     onToggleModelThinking: handleToggleModelThinking,
     searxngUrl: settings.searxngUrl || '',
-    onBusyChange: handleAgentBusyChange
+    onBusyChange: handleAgentBusyChange,
+    peerConductor,
+    peerChatMirror,
+    onLiveConductorPublish: handleLiveConductorPublish
   };
 
   const mobileNavBtn = (id: MobilePane, label: string, Icon: typeof MessageSquare) => (

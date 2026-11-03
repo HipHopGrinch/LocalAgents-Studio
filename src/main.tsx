@@ -45,6 +45,19 @@ function Root() {
     };
   }, [hasElectron]);
 
+  // Session revoked on host (password change / console stopped) → back to login.
+  useEffect(() => {
+    if (hasElectron) return;
+    const onAuthLost = () => {
+      setStoredWebToken(null);
+      setReady(false);
+      setNeedsLogin(true);
+      setBootError('Studio web console session ended. Log in again.');
+    };
+    window.addEventListener('la-ws-auth-lost', onAuthLost);
+    return () => window.removeEventListener('la-ws-auth-lost', onAuthLost);
+  }, [hasElectron]);
+
   const handleLogin = async (password: string) => {
     const res = await loginWebConsole(password);
     if ('error' in res) return res;

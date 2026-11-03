@@ -177,16 +177,15 @@ ipcMain.handle('settings:save', async (_e, settings) => {
     } catch {
       existing = null;
     }
-    // Never let a renderer (especially the web client) wipe password hashes by omission.
     if (settings && typeof settings === 'object') {
-      const prev = existing?.webConsole || {};
-      const next = settings.webConsole || {};
-      settings.webConsole = {
-        enabled: typeof next.enabled === 'boolean' ? next.enabled : !!prev.enabled,
-        port: Number(next.port) > 0 ? Math.floor(Number(next.port)) : prev.port || webConsole.DEFAULT_PORT,
-        passwordHash: next.passwordHash || prev.passwordHash,
-        passwordSalt: next.passwordSalt || prev.passwordSalt
-      };
+      // Web console lifecycle is owned only by webConsole:update / setPassword / app startup.
+      // Never let a renderer settings save flip enabled off or restart the HTTP server
+      // (that was kicking LAN clients and clearing the Enable toggle).
+      if (existing?.webConsole) {
+        settings.webConsole = { ...existing.webConsole };
+      } else {
+        delete settings.webConsole;
+      }
       // Guard against a second client racing with empty defaults and wiping the cluster.
       if (
         Array.isArray(existing?.nodes) &&
@@ -207,13 +206,6 @@ ipcMain.handle('settings:save', async (_e, settings) => {
     const tmp = settingsPath() + '.tmp';
     await fsp.writeFile(tmp, JSON.stringify(settings, null, 2), 'utf-8');
     await fsp.rename(tmp, settingsPath()); // atomic replace
-    if (settings?.webConsole) {
-      try {
-        await webConsole.applyConfig(settings.webConsole);
-      } catch (err) {
-        appendLog('warn', `web console apply: ${err.message}`);
-      }
-    }
     return { success: true };
   } catch (err) {
     return { error: err.message };

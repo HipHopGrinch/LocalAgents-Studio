@@ -8,6 +8,7 @@ const TOKEN_KEY = 'la_web_console_token';
 declare global {
   interface Window {
     __LA_WEB_CONSOLE__?: boolean;
+    __LA_WS_STATE__?: 'connecting' | 'connected' | 'reconnecting' | 'disconnected';
   }
 }
 
@@ -70,6 +71,11 @@ function showPathNotice(title: string, pathValue?: string) {
   window.prompt(`${title}\n\nCopy path:`, text);
 }
 
+function setWsState(state: NonNullable<Window['__LA_WS_STATE__']>) {
+  window.__LA_WS_STATE__ = state;
+  window.dispatchEvent(new CustomEvent('la-ws-state', { detail: state }));
+}
+
 export async function loginWebConsole(password: string): Promise<{ token: string } | { error: string }> {
   try {
     const res = await fetch('/api/login', {
@@ -100,11 +106,13 @@ export async function logoutWebConsole(token?: string | null) {
   setStoredWebToken(null);
 }
 
-/** Build a full ElectronAPI that talks to the Studio host over WebSocket. */
+/** Build a full ElectronAPI that talks to the Studio host over WebSocket (auto-reconnects). */
 export function createWebHostApi(token: string): Promise<ElectronAPI> {
   return new Promise((resolve, reject) => {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${proto}//${location.host}/ws?token=${encodeURIComponent(token)}`);
+    const wsUrl = `${proto}//${location.host}/ws?token=${encodeURIComponent(token)}`;
+
+    let ws: WebSocket | null = null;
     let nextId = 1;
     const pending = new Map<
       number,
@@ -112,6 +120,9 @@ export function createWebHostApi(token: string): Promise<ElectronAPI> {
     >();
     const listeners = new Map<string, Set<(payload: unknown) => void>>();
     let opened = false;
+    let closedForGood = false;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let attempt = 0;
     let cssZoom = 1;
 
     const subscribe = (channel: string, cb: (payload: unknown) => void) => {
@@ -120,9 +131,14 @@ export function createWebHostApi(token: string): Promise<ElectronAPI> {
       return () => listeners.get(channel)?.delete(cb);
     };
 
+    const failPending = (message: string) => {
+      for (const [, p] of pending) p.reject(new Error(message));
+      pending.clear();
+    };
+
     const invoke = <T = unknown>(method: string, args: unknown[] = []): Promise<T> =>
       new Promise((res, rej) => {
-        if (ws.readyState !== WebSocket.OPEN) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
           rej(new Error('Web console disconnected'));
           return;
         }
@@ -134,38 +150,87 @@ export function createWebHostApi(token: string): Promise<ElectronAPI> {
         ws.send(JSON.stringify({ type: 'rpc', id, method, args }));
       });
 
-    ws.addEventListener('message', ev => {
-      let msg: RpcResult | EventMsg | { type: string };
+    const scheduleReconnect = () => {
+      if (closedForGood || reconnectTimer) return;
+      attempt += 1;
+      const delay = Math.min(8000, 400 * Math.pow(1.6, Math.min(attempt, 8)));
+      setWsState('reconnecting');
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, delay);
+    };
+
+    const attachSocket = (socket: WebSocket) => {
+      socket.addEventListener('message', ev => {
+        let msg: RpcResult | EventMsg | { type: string; status?: number; error?: string };
+        try {
+          msg = JSON.parse(String(ev.data));
+        } catch {
+          return;
+        }
+        if (msg.type === 'rpc-result') {
+          const m = msg as RpcResult;
+          const p = pending.get(m.id);
+          if (!p) return;
+          pending.delete(m.id);
+          if (m.error) p.reject(new Error(m.error));
+          else p.resolve(m.result);
+          return;
+        }
+        if (msg.type === 'event') {
+          const m = msg as EventMsg;
+          const set = listeners.get(m.channel);
+          if (set) for (const cb of set) cb(m.payload);
+        }
+      });
+
+      socket.addEventListener('close', ev => {
+        failPending('Web console disconnected');
+        ws = null;
+        // 4401 = unauthorized from host
+        if (ev.code === 4401) {
+          closedForGood = true;
+          setStoredWebToken(null);
+          setWsState('disconnected');
+          if (!opened) reject(new Error('Web console session expired — log in again'));
+          else window.dispatchEvent(new CustomEvent('la-ws-auth-lost'));
+          return;
+        }
+        if (closedForGood) {
+          setWsState('disconnected');
+          return;
+        }
+        scheduleReconnect();
+      });
+
+      socket.addEventListener('error', () => {
+        if (!opened) {
+          /* close handler will reject / reconnect */
+        }
+      });
+
+      socket.addEventListener('open', () => {
+        attempt = 0;
+        setWsState('connected');
+        if (!opened) {
+          opened = true;
+          resolve(api);
+        }
+      });
+    };
+
+    const connect = () => {
+      if (closedForGood) return;
+      setWsState(opened ? 'reconnecting' : 'connecting');
       try {
-        msg = JSON.parse(String(ev.data));
-      } catch {
-        return;
+        ws = new WebSocket(wsUrl);
+        attachSocket(ws);
+      } catch (err) {
+        if (!opened) reject(err instanceof Error ? err : new Error('WebSocket connect failed'));
+        else scheduleReconnect();
       }
-      if (msg.type === 'rpc-result') {
-        const m = msg as RpcResult;
-        const p = pending.get(m.id);
-        if (!p) return;
-        pending.delete(m.id);
-        if (m.error) p.reject(new Error(m.error));
-        else p.resolve(m.result);
-        return;
-      }
-      if (msg.type === 'event') {
-        const m = msg as EventMsg;
-        const set = listeners.get(m.channel);
-        if (set) for (const cb of set) cb(m.payload);
-      }
-    });
-
-    ws.addEventListener('close', () => {
-      for (const [, p] of pending) p.reject(new Error('Web console disconnected'));
-      pending.clear();
-      if (!opened) reject(new Error('Failed to connect web console'));
-    });
-
-    ws.addEventListener('error', () => {
-      if (!opened) reject(new Error('Web console WebSocket error'));
-    });
+    };
 
     const api: ElectronAPI = {
       setZoomFactor: factor => {
@@ -286,13 +351,21 @@ export function createWebHostApi(token: string): Promise<ElectronAPI> {
       onLiveSession: cb => subscribe('session:changed', p => cb(p as never))
     };
 
-    const finish = () => {
-      if (opened) return;
-      opened = true;
-      resolve(api);
-    };
-    if (ws.readyState === WebSocket.OPEN) finish();
-    else ws.addEventListener('open', finish, { once: true });
+    connect();
+
+    // First connect must succeed within a few seconds or fall through to login.
+    setTimeout(() => {
+      if (!opened && !closedForGood) {
+        closedForGood = true;
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        try {
+          ws?.close();
+        } catch {
+          /* ignore */
+        }
+        reject(new Error('Failed to connect web console'));
+      }
+    }, 12000);
   });
 }
 

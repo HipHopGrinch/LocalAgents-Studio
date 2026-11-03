@@ -49,6 +49,8 @@ interface HardwareSettingsModalProps {
   onUpdateUiScale: (scale: number) => void;
   searxngUrl: string;
   onUpdateSearxngUrl: (url: string) => void;
+  /** Keep App settings.webConsole in sync after enable/port/password changes (display only). */
+  onWebConsoleChange?: (webConsole: { enabled: boolean; port: number }) => void;
 }
 
 export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
@@ -64,7 +66,8 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   uiScale,
   onUpdateUiScale,
   searxngUrl,
-  onUpdateSearxngUrl
+  onUpdateSearxngUrl,
+  onWebConsoleChange
 }) => {
   const [activeTab, setActiveTab] = useState<'nodes' | 'hub' | 'appearance' | 'stats' | 'remote'>('nodes');
   const [selectedNodeId, setSelectedNodeId] = useState<string>(nodes[0]?.id || '');
@@ -85,6 +88,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     listening: boolean;
     hasPassword: boolean;
     urls: string[];
+    candidateUrls?: string[];
     clientCount: number;
   } | null>(null);
   const [webBusy, setWebBusy] = useState(false);
@@ -200,7 +204,15 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     if (!window.electronAPI?.webConsoleGetStatus) return;
     try {
       const st = await window.electronAPI.webConsoleGetStatus();
-      setWebStatus(st);
+      setWebStatus({
+        enabled: !!st.enabled,
+        port: st.port || 3847,
+        listening: !!st.listening,
+        hasPassword: !!st.hasPassword,
+        urls: st.urls || [],
+        candidateUrls: st.candidateUrls || st.urls || [],
+        clientCount: st.clientCount || 0
+      });
       setWebEnabled(!!st.enabled);
       setWebPort(st.port || 3847);
     } catch {
@@ -211,6 +223,15 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   useEffect(() => {
     if (!isOpen) return;
     void refreshWebConsoleStatus();
+  }, [isOpen, activeTab]);
+
+  // Keep Enable/listening truthful while the Web Console tab is open.
+  useEffect(() => {
+    if (!isOpen || activeTab !== 'remote') return;
+    const id = window.setInterval(() => {
+      void refreshWebConsoleStatus();
+    }, 2000);
+    return () => window.clearInterval(id);
   }, [isOpen, activeTab]);
 
   const applyWebConsole = async (patch: { enabled?: boolean; port?: number; password?: string }) => {
@@ -234,17 +255,30 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
           listening: !!res.status.listening,
           hasPassword: !!res.status.hasPassword,
           urls: res.status.urls || [],
+          candidateUrls:
+            (res.status as { candidateUrls?: string[] }).candidateUrls || res.status.urls || [],
           clientCount: (res.status as { clientCount?: number }).clientCount || 0
         });
       }
       setWebEnabled(!!res.status?.enabled);
       setWebPort(res.status?.port || patch.port || webPort);
       if (patch.password) setWebPassword('');
+      if (res.webConsole) {
+        onWebConsoleChange?.({
+          enabled: !!res.webConsole.enabled,
+          port: res.webConsole.port || res.status?.port || webPort
+        });
+      } else if (res.status) {
+        onWebConsoleChange?.({
+          enabled: !!res.status.enabled,
+          port: res.status.port || webPort
+        });
+      }
       setWebNote(
         res.status?.listening
-          ? 'Web console is listening on the LAN.'
+          ? 'Web console is listening. Leave Enable on while you use phone/PC browsers.'
           : res.status?.enabled
-            ? 'Enabled but not listening — set a password.'
+            ? 'Enabled but not listening — set a password, or the port may be in use.'
             : 'Web console stopped.'
       );
       await refreshWebConsoleStatus();
@@ -1581,8 +1615,10 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
             </div>
 
             <div className="bg-[#121215] border border-[#272730] rounded-xl p-4 space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-zinc-200">Reachable URLs</span>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-semibold text-zinc-200">
+                  {webStatus?.listening ? 'Listening on' : 'Addresses (after Enable)'}
+                </span>
                 <button
                   type="button"
                   onClick={() => void refreshWebConsoleStatus()}
@@ -1591,42 +1627,62 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                   <RefreshCw className="w-3 h-3" /> Refresh
                 </button>
               </div>
-              {(webStatus?.urls || []).length === 0 ? (
-                <p className="text-[11px] text-zinc-500">Enable the console to see addresses.</p>
-              ) : (
-                <ul className="space-y-1.5">
-                  {webStatus!.urls.map(url => (
-                    <li
-                      key={url}
-                      className="flex items-center justify-between gap-2 bg-[#0e0e11] border border-[#2a2a34] rounded px-2.5 py-1.5"
-                    >
-                      <code className="text-[11px] font-mono text-indigo-300 break-all">{url}</code>
-                      <div className="flex items-center gap-1 shrink-0">
-                        <button
-                          type="button"
-                          title="Copy"
-                          onClick={() => {
-                            void navigator.clipboard.writeText(url);
-                            setWebNote(`Copied ${url}`);
-                          }}
-                          className="p-1 text-zinc-400 hover:text-white"
-                        >
-                          <Copy className="w-3.5 h-3.5" />
-                        </button>
-                        <a
-                          href={url}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="p-1 text-zinc-400 hover:text-white"
-                          title="Open"
-                        >
-                          <ExternalLink className="w-3.5 h-3.5" />
-                        </a>
-                      </div>
-                    </li>
-                  ))}
-                </ul>
+              {!webStatus?.listening && (
+                <p className="text-[11px] text-amber-200/80">
+                  Turn <span className="font-semibold">Enable web console</span> on (and keep it on). Studio must stay
+                  running — the browser talks to this PC, not a separate server.
+                </p>
               )}
+              {(() => {
+                const list =
+                  (webStatus?.listening ? webStatus.urls : null) ||
+                  webStatus?.candidateUrls ||
+                  webStatus?.urls ||
+                  [];
+                if (list.length === 0) {
+                  return <p className="text-[11px] text-zinc-500">Set a port to preview addresses.</p>;
+                }
+                return (
+                  <ul className="space-y-1.5">
+                    {list.map(url => (
+                      <li
+                        key={url}
+                        className="flex items-center justify-between gap-2 bg-[#0e0e11] border border-[#2a2a34] rounded px-2.5 py-1.5"
+                      >
+                        <code
+                          className={`text-[11px] font-mono break-all ${
+                            webStatus?.listening ? 'text-indigo-300' : 'text-zinc-500'
+                          }`}
+                        >
+                          {url}
+                        </code>
+                        <div className="flex items-center gap-1 shrink-0">
+                          <button
+                            type="button"
+                            title="Copy"
+                            onClick={() => {
+                              void navigator.clipboard.writeText(url);
+                              setWebNote(`Copied ${url}`);
+                            }}
+                            className="p-1 text-zinc-400 hover:text-white"
+                          >
+                            <Copy className="w-3.5 h-3.5" />
+                          </button>
+                          <a
+                            href={url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="p-1 text-zinc-400 hover:text-white"
+                            title="Open"
+                          >
+                            <ExternalLink className="w-3.5 h-3.5" />
+                          </a>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                );
+              })()}
             </div>
           </div>
         )}

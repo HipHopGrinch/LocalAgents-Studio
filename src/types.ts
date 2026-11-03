@@ -604,6 +604,7 @@ export interface ElectronAPI {
     listening: boolean;
     hasPassword: boolean;
     urls: string[];
+    candidateUrls?: string[];
     lanAddresses: string[];
     clientCount: number;
   }>;
@@ -620,6 +621,7 @@ export interface ElectronAPI {
       listening: boolean;
       hasPassword: boolean;
       urls: string[];
+      candidateUrls?: string[];
     };
     webConsole?: AppSettings['webConsole'];
   }>;

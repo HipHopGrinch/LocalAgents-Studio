@@ -35,6 +35,44 @@ import {
 } from './lib/conversations';
 import { isWebConsoleClient } from './lib/hostApi';
 
+function RemoteHostBanner({ remoteLive }: { remoteLive: boolean }) {
+  const [wsState, setWsState] = useState(window.__LA_WS_STATE__ || 'connecting');
+  useEffect(() => {
+    const onState = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (typeof detail === 'string') setWsState(detail as typeof wsState);
+    };
+    window.addEventListener('la-ws-state', onState);
+    return () => window.removeEventListener('la-ws-state', onState);
+  }, []);
+  const reconnecting = wsState === 'reconnecting' || wsState === 'disconnected';
+  const label = reconnecting
+    ? 'Reconnecting to Studio host…'
+    : remoteLive
+      ? 'Connected to Studio host — cluster status is live'
+      : 'Connecting to Studio host…';
+  return (
+    <div
+      className={`shrink-0 px-3 py-1 border-b text-[10px] flex items-center gap-2 ${
+        reconnecting
+          ? 'bg-amber-950/80 border-amber-500/30 text-amber-100'
+          : 'bg-indigo-950/70 border-indigo-500/25 text-indigo-100/90'
+      }`}
+    >
+      <span
+        className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+          reconnecting
+            ? 'bg-amber-400 animate-pulse'
+            : remoteLive
+              ? 'bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]'
+              : 'bg-amber-400 animate-pulse'
+        }`}
+      />
+      <span className="truncate">{label}</span>
+    </div>
+  );
+}
+
 /** Keep agent writes inside the open folder, even when a model emits an absolute path. */
 function clampWritePath(root: string, filePath: string): string {
   let p = (filePath || '').trim().replace(/^["']|["']$/g, '');
@@ -1082,18 +1120,7 @@ export const App: React.FC = () => {
       <UpdateBanner />
 
       {isRemoteClient && (
-        <div className="shrink-0 px-3 py-1 bg-indigo-950/70 border-b border-indigo-500/25 text-[10px] text-indigo-100/90 flex items-center gap-2">
-          <span
-            className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-              remoteLive ? 'bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]' : 'bg-amber-400 animate-pulse'
-            }`}
-          />
-          <span className="truncate">
-            {remoteLive
-              ? 'Connected to Studio host — cluster status is live'
-              : 'Connecting to Studio host…'}
-          </span>
-        </div>
+        <RemoteHostBanner remoteLive={remoteLive} />
       )}
 
       <ProjectPickerModal
@@ -1221,6 +1248,16 @@ export const App: React.FC = () => {
         onUpdateUiScale={handleUpdateUiScale}
         searxngUrl={settings.searxngUrl || ''}
         onUpdateSearxngUrl={url => updateSettings({ searxngUrl: url })}
+        onWebConsoleChange={web =>
+          setSettings(prev => ({
+            ...prev,
+            webConsole: {
+              ...(prev.webConsole || { enabled: false, port: 3847 }),
+              enabled: web.enabled,
+              port: web.port
+            }
+          }))
+        }
       />
     </div>
   );

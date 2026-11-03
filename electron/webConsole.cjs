@@ -108,12 +108,17 @@ function listLanAddresses() {
   return out;
 }
 
-function listeningUrls() {
-  if (!server || !config.enabled) return [];
-  const port = config.port || DEFAULT_PORT;
-  const urls = [`http://127.0.0.1:${port}`];
-  for (const ip of listLanAddresses()) urls.push(`http://${ip}:${port}`);
+/** Candidate URLs for the configured port (shown even before listen succeeds). */
+function candidateUrls(port = config.port || DEFAULT_PORT) {
+  const p = Number(port) > 0 ? Math.floor(Number(port)) : DEFAULT_PORT;
+  const urls = [`http://127.0.0.1:${p}`];
+  for (const ip of listLanAddresses()) urls.push(`http://${ip}:${p}`);
   return urls;
+}
+
+function listeningUrls() {
+  if (!server || !config.enabled || !server.listening) return [];
+  return candidateUrls(config.port);
 }
 
 function getStatus() {
@@ -123,6 +128,8 @@ function getStatus() {
     listening: !!(server && server.listening),
     hasPassword: !!(config.passwordHash && config.passwordSalt),
     urls: listeningUrls(),
+    /** Always filled so the Hardware UI can show what to open after Enable. */
+    candidateUrls: candidateUrls(config.port),
     lanAddresses: listLanAddresses(),
     clientCount: clients.size
   };
@@ -382,7 +389,12 @@ function broadcast(channel, payload) {
   }
 }
 
-function stopServer() {
+/**
+ * @param {{ clearSessions?: boolean }} [opts]
+ * clearSessions=false keeps login tokens across a port-bind retry / same-password restart.
+ */
+function stopServer(opts = {}) {
+  const clearSessions = opts.clearSessions !== false;
   for (const socket of clients) {
     try {
       socket.close(1001, 'Console stopped');
@@ -391,7 +403,7 @@ function stopServer() {
     }
   }
   clients.clear();
-  sessions.clear();
+  if (clearSessions) sessions.clear();
   if (wss) {
     try {
       wss.close();
@@ -410,12 +422,12 @@ function stopServer() {
   }
 }
 
-function startServer() {
-  stopServer();
-  if (!config.enabled) return { success: true, listening: false };
+function startServer(opts = {}) {
+  stopServer({ clearSessions: opts.clearSessions !== false });
+  if (!config.enabled) return Promise.resolve({ success: true, listening: false });
   if (!config.passwordHash || !config.passwordSalt) {
     log('warn', 'Web console enabled but no password set — not listening');
-    return { success: false, error: 'Set a web console password before enabling' };
+    return Promise.resolve({ success: false, error: 'Set a web console password before enabling' });
   }
   const port = Number(config.port) > 0 ? Math.floor(Number(config.port)) : DEFAULT_PORT;
   config.port = port;
@@ -426,7 +438,7 @@ function startServer() {
   return new Promise(resolve => {
     server.once('error', err => {
       log('error', `listen failed: ${err.message}`);
-      stopServer();
+      stopServer({ clearSessions: false });
       resolve({ success: false, error: err.message });
     });
     server.listen(port, '0.0.0.0', () => {
@@ -437,33 +449,55 @@ function startServer() {
 }
 
 /**
- * Apply settings.webConsole and restart the server if needed.
+ * Apply settings.webConsole and restart the server only when enable/port/password actually change.
  * @param {object} next partial webConsole settings from AppSettings
  */
 async function applyConfig(next = {}) {
   const prevPort = config.port;
   const prevEnabled = config.enabled;
+  const prevHash = config.passwordHash || '';
+  const prevSalt = config.passwordSalt || '';
+
+  const nextEnabled = !!next.enabled;
+  const nextPort = Number(next.port) > 0 ? Math.floor(Number(next.port)) : DEFAULT_PORT;
+  const nextHash =
+    typeof next.passwordHash === 'string' && next.passwordHash
+      ? next.passwordHash
+      : config.passwordHash;
+  const nextSalt =
+    typeof next.passwordSalt === 'string' && next.passwordSalt
+      ? next.passwordSalt
+      : config.passwordSalt;
+
+  const passwordChanged = (nextHash || '') !== prevHash || (nextSalt || '') !== prevSalt;
+
   config = {
-    enabled: !!next.enabled,
-    port: Number(next.port) > 0 ? Math.floor(Number(next.port)) : DEFAULT_PORT,
-    passwordHash: next.passwordHash || config.passwordHash,
-    passwordSalt: next.passwordSalt || config.passwordSalt
+    enabled: nextEnabled,
+    port: nextPort,
+    passwordHash: nextHash,
+    passwordSalt: nextSalt
   };
-  if (next.passwordHash) config.passwordHash = next.passwordHash;
-  if (next.passwordSalt) config.passwordSalt = next.passwordSalt;
 
   if (!config.enabled) {
-    stopServer();
+    if (prevEnabled) log('info', 'disabled — stopping listener');
+    stopServer({ clearSessions: true });
     return getStatus();
   }
+
   const needRestart =
     !server ||
     !server.listening ||
     prevPort !== config.port ||
     !prevEnabled ||
-    next.passwordHash;
+    passwordChanged;
+
   if (needRestart) {
-    await startServer();
+    log(
+      'info',
+      `restart listener (port ${config.port}, wasEnabled=${prevEnabled}, passwordChanged=${passwordChanged})`
+    );
+    // Keep sessions when only the port changed or we are recovering listen; wipe on password change.
+    await startServer({ clearSessions: passwordChanged || !prevEnabled });
   }
   return getStatus();
 }

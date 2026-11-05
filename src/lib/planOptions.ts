@@ -234,12 +234,17 @@ export function parseStepVerdict(raw: string): {
   notes: string;
 } | null {
   const text = (raw || '').replace(/<think>[\s\S]*?<\/think>/gi, '');
-  const m = text.match(/<step_verdict\b([^>]*)>([\s\S]*?)<\/step_verdict>/i);
+  // Prefer closed blocks; fall back to unclosed trailing tag (local models often omit the close).
+  const m =
+    text.match(/<step_verdict\b([^>]*)>([\s\S]*?)<\/step_verdict\s*>/i) ||
+    text.match(/<step_verdict\b([^>]*)>([\s\S]*)$/i);
   if (!m) return null;
   const attrs = m[1] || '';
   const body = m[2] || '';
   const stepId =
     /(?:^|\s)step_id\s*=\s*"([^"]*)"/i.exec(attrs)?.[1]?.trim() ||
+    /(?:^|\s)step_id\s*=\s*'([^']*)'/i.exec(attrs)?.[1]?.trim() ||
+    /(?:^|\s)id\s*=\s*"([^"]*)"/i.exec(attrs)?.[1]?.trim() ||
     body.match(/<step_id>([\s\S]*?)<\/step_id>/i)?.[1]?.trim() ||
     '';
   const resultRaw = (
@@ -249,21 +254,30 @@ export function parseStepVerdict(raw: string): {
   )
     .toLowerCase()
     .trim();
-  const notes = (
-    body.match(/<notes>([\s\S]*?)<\/notes>/i)?.[1] || ''
-  )
+  const summary = (body.match(/<summary>([\s\S]*?)<\/summary>/i)?.[1] || '')
     .replace(/\s+/g, ' ')
     .trim();
+  const notesInner = (body.match(/<notes>([\s\S]*?)<\/notes>/i)?.[1] || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const notes = [summary, notesInner].filter(Boolean).join(' — ') || body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  const blob = `${resultRaw} ${notes}`.toLowerCase();
   const yay = /\b(yay|yes|pass|passed|go|approve|approved|ok|good|complete|completed)\b/.test(
-    resultRaw
+    resultRaw || blob
   );
-  const nay = /\b(nay|no|fail|failed|reject|rejected|no-?go|incomplete|wrong)\b/.test(resultRaw);
+  const nay = /\b(nay|no|fail|failed|reject|rejected|no-?go|incomplete|wrong|missing|broken|incorrect)\b/.test(
+    resultRaw || blob
+  );
   if (!yay && !nay) {
     if (DIRTY_REVIEW.test(notes) && !CLEAN_REVIEW.test(notes)) {
       return { stepId, result: 'nay', notes: notes || 'Needs refining.' };
     }
     if (CLEAN_REVIEW.test(notes) || /\bpass|ok|looks good\b/i.test(notes)) {
       return { stepId, result: 'yay', notes: notes || 'Looks good.' };
+    }
+    // Local models often omit <result> and only emit <summary>/<notes> — treat as nay if substantive.
+    if (notes.length > 20) {
+      return { stepId, result: 'nay', notes };
     }
     return null;
   }
@@ -274,9 +288,17 @@ export function parseStepVerdict(raw: string): {
   };
 }
 
+/** Remove step_verdict XML (closed, unclosed, and orphan inner tags local models leave behind). */
 export function stripStepVerdictMarkup(text: string): string {
   return (text || '')
-    .replace(/<step_verdict\b[^>]*>[\s\S]*?<\/step_verdict>/gi, '')
+    .replace(/<step_verdict\b[^>]*>[\s\S]*?<\/step_verdict\s*>/gi, '')
+    .replace(/<step_verdict\b[^>]*>[\s\S]*$/gi, '')
+    .replace(/<\/?step_verdict\b[^>]*>/gi, '')
+    .replace(/<\/?result\b[^>]*>/gi, '')
+    .replace(/<\/?verdict\b[^>]*>/gi, '')
+    .replace(/<\/?notes\b[^>]*>/gi, '')
+    .replace(/<\/?summary\b[^>]*>/gi, '')
+    .replace(/<\/?step_id\b[^>]*>/gi, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }

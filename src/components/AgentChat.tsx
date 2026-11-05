@@ -1299,13 +1299,17 @@ export const AgentChat: React.FC<AgentChatProps> = ({
               ? parsePlanOptions(content)
               : [];
           const liveReview = reviewModeContinue ? parseReviewPlan(content) : null;
+          const liveVerdict = stepVerdictContinue ? parseStepVerdict(content) : null;
           let displayLive = safeAssistantDisplay(parsed, {
-            structured: !!(liveReview || (liveOptions.length >= 2))
+            structured: !!(liveReview || liveVerdict || liveOptions.length >= 2)
           });
           displayLive = stripPlanOptionMarkup(displayLive);
-          if (reviewModeContinue) {
-            displayLive = stripReviewDeltaMarkup(stripReviewPlanMarkup(displayLive));
+          if (reviewModeContinue || stepVerdictContinue) {
+            displayLive = stripStepVerdictMarkup(
+              stripReviewDeltaMarkup(stripReviewPlanMarkup(displayLive))
+            );
           }
+          if (liveVerdict) displayLive = '';
           setMessages(prev => prev.map(m => {
             if (m.id === followUpId) {
               return {
@@ -1326,7 +1330,17 @@ export const AgentChat: React.FC<AgentChatProps> = ({
                       planSummary: buildPlanSummary(content, liveOptions)
                     }
                   : {}),
-                ...(liveReview ? { reviewPlan: liveReview } : {})
+                ...(liveReview ? { reviewPlan: liveReview } : {}),
+                ...(liveVerdict
+                  ? {
+                      stepVerdict: {
+                        stepId: liveVerdict.stepId || getActiveStep(plannerPlanRef.current)?.id || '',
+                        stepTitle: getActiveStep(plannerPlanRef.current)?.title || 'Step',
+                        result: liveVerdict.result,
+                        notes: liveVerdict.notes
+                      }
+                    }
+                  : {})
               };
             }
             return m;
@@ -1377,14 +1391,18 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           ? parsePlanOptions(finished)
           : [];
       const reviewPlan = reviewModeContinue ? parseReviewPlan(finished) : null;
+      const contVerdict = stepVerdictContinue ? parseStepVerdict(finished) : null;
       let displayBase = safeAssistantDisplay(
         { ...finalParsed, toolCalls: tools },
-        { structured: !!(reviewPlan || planOptions.length >= 2) }
+        { structured: !!(reviewPlan || contVerdict || planOptions.length >= 2) }
       );
       displayBase = stripPlanOptionMarkup(displayBase);
-      if (reviewModeContinue) {
-        displayBase = stripReviewDeltaMarkup(stripReviewPlanMarkup(displayBase));
+      if (reviewModeContinue || stepVerdictContinue) {
+        displayBase = stripStepVerdictMarkup(
+          stripReviewDeltaMarkup(stripReviewPlanMarkup(displayBase))
+        );
       }
+      if (contVerdict) displayBase = '';
       const writeAnnot = annotateAppliedWrites(tools);
       if (writeAnnot && !displayBase.includes('Wrote') && !displayBase.includes('Edited')) {
         displayBase = displayBase ? `${displayBase}\n${writeAnnot}` : writeAnnot;
@@ -1403,7 +1421,17 @@ export const AgentChat: React.FC<AgentChatProps> = ({
               planSummary: buildPlanSummary(finished, planOptions)
             }
           : {}),
-        ...(reviewPlan ? { reviewPlan } : {})
+        ...(reviewPlan ? { reviewPlan } : {}),
+        ...(contVerdict
+          ? {
+              stepVerdict: {
+                stepId: contVerdict.stepId || getActiveStep(plannerPlanRef.current)?.id || '',
+                stepTitle: getActiveStep(plannerPlanRef.current)?.title || 'Step',
+                result: contVerdict.result,
+                notes: contVerdict.notes
+              }
+            }
+          : {})
       };
 
       setMessages(prev => prev.map(m => (m.id === followUpId ? followUpMsgFinal : m)));
@@ -2568,6 +2596,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           }
           if (lockPlanMode) displayBase = stripExecutionPlanMarkup(displayBase);
           if (contractMode) displayBase = stripFixContractMarkup(displayBase);
+          if (liveVerdict || liveReview) displayBase = '';
           setMessages(prev =>
             prev.map(m => {
               if (m.id !== agentMsgId) return m;
@@ -2671,6 +2700,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       }
       if (lockPlanMode) displayText = stripExecutionPlanMarkup(displayText);
       if (contractMode) displayText = stripFixContractMarkup(displayText);
+      // Verdict / review cards own the UI — never leave raw XML in the bubble.
+      if (parsedVerdict || reviewPlan) displayText = '';
       const writeAnnot = annotateAppliedWrites(tools);
       if (
         writeAnnot &&
@@ -2750,6 +2781,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           stats
         });
       } else if (reviewMode || stepVerdictMode) {
+        const reviewSummary = parsedVerdict
+          ? `${parsedVerdict.result === 'yay' ? 'Yay' : 'Nay'}: ${(parsedVerdict.notes || '').slice(0, 160)}`
+          : reviewPlan?.summary || 'Review complete';
         upsertNodeWorkStep({
           nodeId: routedNode.id,
           nodeName: routedNode.name,
@@ -2758,9 +2792,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           agentHandle: 'reviewer',
           role: `Reviewer · ${routedModel}`,
           status: 'completed',
-          content: parsedVerdict
-            ? `${parsedVerdict.result}: ${(parsedVerdict.notes || '').slice(0, 160)}`
-            : reviewPlan?.summary || 'Review complete',
+          content: stripStepVerdictMarkup(reviewSummary),
           toolCalls: tools,
           stats
         });
@@ -4974,10 +5006,19 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                   </div>
                 )}
 
-                {/* Display standard text (swarm cards live in Node Work column) */}
-                {msg.display && (
-                  <div className="whitespace-pre-wrap">{msg.display}</div>
-                )}
+                {/* Swarm cards live in Node Work. Strip leftover verdict/review XML at
+                    render time — local models often emit <summary>/<notes> variants. */}
+                {(() => {
+                  if (!msg.display) return null;
+                  const cleaned = stripStepVerdictMarkup(
+                    stripReviewDeltaMarkup(stripReviewPlanMarkup(msg.display))
+                  );
+                  if (!cleaned) return null;
+                  // Structured cards already show notes — hide duplicate bubble text.
+                  if ((msg.stepVerdict || msg.reviewPlan) && cleaned.length < 8) return null;
+                  if (msg.stepVerdict) return null;
+                  return <div className="whitespace-pre-wrap">{cleaned}</div>;
+                })()}
 
                 {msg.notice && msg.role === 'assistant' && !msg.display?.includes(msg.notice) && (
                   <div className="mb-2 text-[10px] text-emerald-300/90 font-medium">{msg.notice}</div>

@@ -63,9 +63,12 @@ export const ToolActionCard: React.FC<ToolActionCardProps> = ({
           </span>
         </div>
 
-        <div className="bg-[#0e0e11] p-2 rounded max-h-32 overflow-y-auto text-[10px] text-zinc-400 whitespace-pre">
-          {content.slice(0, 300)}...
-        </div>
+        {!applied && content ? (
+          <div className="bg-[#0e0e11] p-2 rounded max-h-24 overflow-y-auto text-[10px] text-zinc-400 whitespace-pre">
+            {content.slice(0, 200)}
+            {content.length > 200 ? '…' : ''}
+          </div>
+        ) : null}
 
         <div className="flex items-center space-x-2 pt-1">
           {!hideApply && (
@@ -149,9 +152,12 @@ export const ToolActionCard: React.FC<ToolActionCardProps> = ({
           </span>
         </div>
 
-        <div className="bg-[#0e0e11] p-2 rounded max-h-36 overflow-y-auto text-[10px] text-zinc-300 whitespace-pre">
-          {body}
-        </div>
+        {!applied && body ? (
+          <div className="bg-[#0e0e11] p-2 rounded max-h-24 overflow-y-auto text-[10px] text-zinc-300 whitespace-pre">
+            {body.slice(0, 200)}
+            {body.length > 200 ? '…' : ''}
+          </div>
+        ) : null}
 
         <div className="flex items-center space-x-2 pt-1">
           {!hideApply && (

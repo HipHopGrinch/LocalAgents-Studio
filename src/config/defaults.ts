@@ -135,6 +135,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   explorerWidth: 240,
   chatWidth: 640,
   agentControlWidth: 270,
+  agentNodeWorkWidth: 280,
   uiScale: 1.0,
   recentWorkspaces: [],
   conversations: [],

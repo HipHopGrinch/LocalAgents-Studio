@@ -140,6 +140,9 @@ export const App: React.FC = () => {
   const [agentControlWidth, setAgentControlWidth] = useState<number>(
     DEFAULT_SETTINGS.agentControlWidth || 270
   );
+  const [agentNodeWorkWidth, setAgentNodeWorkWidth] = useState<number>(
+    DEFAULT_SETTINGS.agentNodeWorkWidth || 280
+  );
   const [resizingSide, setResizingSide] = useState<'explorer' | 'chat' | null>(null);
 
   // UI & Text Scaling (Discord-style zoom factor: 0.75 to 2.0)
@@ -378,6 +381,7 @@ export const App: React.FC = () => {
       if (merged.explorerWidth) setExplorerWidth(merged.explorerWidth);
       if (merged.chatWidth) setChatWidth(merged.chatWidth);
       if (merged.agentControlWidth) setAgentControlWidth(merged.agentControlWidth);
+      if (merged.agentNodeWorkWidth) setAgentNodeWorkWidth(merged.agentNodeWorkWidth);
 
       const initialActive =
         (live && live.activeConversationId) || merged.activeConversationId || undefined;
@@ -635,14 +639,15 @@ export const App: React.FC = () => {
         const nextWidth = Math.max(160, Math.min(540, e.clientX));
         setExplorerWidth(nextWidth);
       } else if (resizingSide === 'chat') {
-        const nextWidth = Math.max(480, Math.min(1100, window.innerWidth - e.clientX));
+        // Whole Agent Conductor (chat + Conductor + Node Work) — allow pulling further left.
+        const nextWidth = Math.max(560, Math.min(1600, window.innerWidth - e.clientX));
         setChatWidth(nextWidth);
       }
     };
 
     const handleMouseUp = () => {
       setResizingSide(null);
-      updateSettings({ explorerWidth, chatWidth, agentControlWidth });
+      updateSettings({ explorerWidth, chatWidth, agentControlWidth, agentNodeWorkWidth });
     };
 
     window.addEventListener('mousemove', handleMouseMove);
@@ -651,7 +656,7 @@ export const App: React.FC = () => {
       window.removeEventListener('mousemove', handleMouseMove);
       window.removeEventListener('mouseup', handleMouseUp);
     };
-  }, [resizingSide, explorerWidth, chatWidth, agentControlWidth, updateSettings]);
+  }, [resizingSide, explorerWidth, chatWidth, agentControlWidth, agentNodeWorkWidth, updateSettings]);
 
   // 3. Cluster Polling — preserve user toggles/benchmarks; only merge live status fields
   const nodesRef = React.useRef(nodes);
@@ -1144,6 +1149,11 @@ export const App: React.FC = () => {
     onControlWidthChange: (w: number) => {
       setAgentControlWidth(w);
       updateSettings({ agentControlWidth: w });
+    },
+    nodeWorkWidth: agentNodeWorkWidth,
+    onNodeWorkWidthChange: (w: number) => {
+      setAgentNodeWorkWidth(w);
+      updateSettings({ agentNodeWorkWidth: w });
     },
     onSelectNodeModel: handleSelectNodeModel,
     onApplyFileWrite: handleApplyFileWrite,

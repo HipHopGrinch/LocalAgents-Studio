@@ -4,7 +4,8 @@ import {
   PlannerStep,
   PlannerStepStatus,
   PlannerTask,
-  ExecutionTaskStatus
+  ExecutionTaskStatus,
+  ExecutionQueue
 } from '../types';
 
 export function plannerPlanPath(root: string, conversationId: string): string {
@@ -326,6 +327,142 @@ export function createPlanFromParsed(
     ...(opts?.conversationId ? { conversationId: opts.conversationId } : {}),
     ...(opts?.chosenOptionId ? { chosenOptionId: opts.chosenOptionId } : {}),
     ...(opts?.chosenOptionTitle ? { chosenOptionTitle: opts.chosenOptionTitle } : {})
+  };
+}
+
+/**
+ * Append a newly locked plan onto an existing conversation plan.
+ * Prior steps stay (as completed/failed); new steps get remapped ids and become active.
+ */
+export function appendPlannerPlan(
+  existing: PlannerPlan | null | undefined,
+  incoming: PlannerPlan
+): PlannerPlan {
+  if (!existing?.steps?.length) return incoming;
+
+  const usedStepIds = new Set(existing.steps.map(s => String(s.id)));
+  const usedTaskIds = new Set(
+    existing.steps.flatMap(s => s.tasks.map(t => String(t.id)))
+  );
+
+  const remapStepId = (raw: string, index: number): string => {
+    let id = String(raw || index + 1);
+    if (!usedStepIds.has(id)) {
+      usedStepIds.add(id);
+      return id;
+    }
+    let n = existing.steps.length + index + 1;
+    while (usedStepIds.has(String(n))) n += 1;
+    id = String(n);
+    usedStepIds.add(id);
+    return id;
+  };
+
+  const remapTaskId = (raw: string, stepId: string, tIndex: number): string => {
+    let id = String(raw || `${stepId}${String.fromCharCode(97 + tIndex)}`);
+    if (!usedTaskIds.has(id)) {
+      usedTaskIds.add(id);
+      return id;
+    }
+    let n = 1;
+    while (usedTaskIds.has(`${stepId}-${n}`)) n += 1;
+    id = `${stepId}-${n}`;
+    usedTaskIds.add(id);
+    return id;
+  };
+
+  const priorSteps: PlannerStep[] = existing.steps.map(s =>
+    s.status === 'in_progress' || s.status === 'pending'
+      ? { ...s, status: 'completed' as PlannerStepStatus }
+      : s
+  );
+
+  const newSteps: PlannerStep[] = incoming.steps.map((s, i) => {
+    const stepId = remapStepId(s.id, i);
+    return {
+      ...s,
+      id: stepId,
+      status: (i === 0 ? 'in_progress' : 'pending') as PlannerStepStatus,
+      tasks: s.tasks.map((t, ti) => ({
+        ...t,
+        id: remapTaskId(t.id, stepId, ti),
+        status: (i === 0 ? 'pending' : t.status) as ExecutionTaskStatus
+      }))
+    };
+  });
+
+  const firstNew = newSteps[0];
+  const summary =
+    incoming.summary && incoming.summary !== existing.summary
+      ? `${existing.summary} · ${incoming.summary}`
+      : existing.summary || incoming.summary;
+
+  return {
+    ...existing,
+    id: incoming.id || existing.id,
+    summary,
+    status: 'active' as PlannerPlanStatus,
+    steps: [...priorSteps, ...newSteps],
+    activeStepId: firstNew?.id ?? null,
+    updatedAt: Date.now(),
+    ...(incoming.chosenOptionId ? { chosenOptionId: incoming.chosenOptionId } : {}),
+    ...(incoming.chosenOptionTitle ? { chosenOptionTitle: incoming.chosenOptionTitle } : {})
+  };
+}
+
+/** Materialize Review fix queue into a PlannerPlan for the Conductor panel. */
+export function plannerPlanFromReviewQueue(
+  queue: ExecutionQueue,
+  opts?: { conversationId?: string; existing?: PlannerPlan | null }
+): PlannerPlan {
+  const stepId = 'review-fixes';
+  const tasks: PlannerTask[] = queue.tasks.map(t => ({
+    id: t.id,
+    title: t.title,
+    description: t.description,
+    ...(t.file ? { file: t.file } : {}),
+    status: t.status,
+    ...(t.failureNote ? { failureNote: t.failureNote } : {})
+  }));
+  const anyOpen = tasks.some(
+    t => t.status === 'pending' || t.status === 'failed' || t.status === 'in_progress'
+  );
+  const allDone = tasks.length > 0 && tasks.every(t => t.status === 'completed');
+  const stepStatus: PlannerStepStatus = allDone
+    ? 'completed'
+    : anyOpen
+      ? 'in_progress'
+      : 'pending';
+  const step: PlannerStep = {
+    id: stepId,
+    title: queue.summary || 'Review fix tasks',
+    description: 'Tasks from Reviewer for Planner → Coder',
+    status: stepStatus,
+    tasks
+  };
+
+  const existing = opts?.existing;
+  if (existing?.steps?.length) {
+    const withoutReview = existing.steps.filter(s => s.id !== stepId);
+    const steps = [...withoutReview, step];
+    return {
+      ...existing,
+      summary: queue.summary || existing.summary,
+      status: allDone ? 'completed' : 'active',
+      steps,
+      activeStepId: allDone ? null : stepId,
+      updatedAt: Date.now()
+    };
+  }
+
+  return {
+    id: `plan-review-${queue.id}`,
+    summary: queue.summary || 'Review fix tasks',
+    status: allDone ? 'completed' : 'active',
+    steps: [step],
+    activeStepId: allDone ? null : stepId,
+    updatedAt: Date.now(),
+    ...(opts?.conversationId ? { conversationId: opts.conversationId } : {})
   };
 }
 

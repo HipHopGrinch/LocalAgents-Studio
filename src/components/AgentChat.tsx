@@ -46,7 +46,9 @@ import {
   stripThinking,
   looksLikeCreateIntent,
   hasUnclosedWrite,
-  anchorWritePath
+  anchorWritePath,
+  safeAssistantDisplay,
+  annotateAppliedWrites
 } from '../lib/tools';
 import {
   assignSwarmTasksToCluster,
@@ -90,6 +92,7 @@ import { ToolActionCard } from './agent/ToolActionCard';
 import { PlanOptionsCard } from './agent/PlanOptionsCard';
 import { ReviewPlanCard } from './agent/ReviewPlanCard';
 import { PlannerPlanPanel } from './agent/PlannerPlanPanel';
+import { NodeWorkPanel } from './agent/NodeWorkPanel';
 import { StepVerdictCard } from './agent/StepVerdictCard';
 import { HelpTip } from './agent/HelpTip';
 import { ActivityIndicator, streamingActivityLabel } from './agent/ActivityIndicator';
@@ -174,6 +177,7 @@ import {
 } from '../lib/executionQueue';
 import {
   activateNextStep,
+  appendPlannerPlan,
   applyStepVerdict,
   collectStepFilePaths,
   createPlanFromParsed,
@@ -184,6 +188,7 @@ import {
   markAllStepTasks,
   markStepInProgress,
   parsePlannerPlanJson,
+  plannerPlanFromReviewQueue,
   plannerPlanPath,
   serializePlannerPlan
 } from '../lib/plannerPlan';
@@ -216,6 +221,9 @@ interface AgentChatProps {
   /** Right orchestration column width inside the conductor */
   controlWidth?: number;
   onControlWidthChange?: (width: number) => void;
+  /** Far-right Node Work column width */
+  nodeWorkWidth?: number;
+  onNodeWorkWidthChange?: (width: number) => void;
   onSelectNodeModel?: (nodeId: string, model: string) => void;
   onApplyFileWrite: (filePath: string, content: string) => Promise<boolean>;
   onExecuteToolCommand: (command: string) => Promise<string>;
@@ -265,6 +273,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   fill = false,
   controlWidth = 270,
   onControlWidthChange,
+  nodeWorkWidth = 280,
+  onNodeWorkWidthChange,
   onSelectNodeModel,
   onApplyFileWrite,
   onExecuteToolCommand,
@@ -349,10 +359,30 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   /** Auto-review Nay reworks per step id — caps infinite Coder↔Reviewer loops. */
   const stepReworkCountRef = useRef<Record<string, number>>({});
   const stopRequestedRef = useRef(false);
-
-  const commitExecutionQueue = (next: ExecutionQueue | null) => {
-    executionQueueRef.current = next;
-    onConversationPatch?.({ executionQueue: next });
+  /** Live Node Work column (Swarm + single-node workers). */
+  const [nodeWorkSteps, setNodeWorkSteps] = useState<PipelineStep[]>([]);
+  const nodeWorkStepsRef = useRef<PipelineStep[]>([]);
+  const syncNodeWork = (next: PipelineStep[]) => {
+    nodeWorkStepsRef.current = next;
+    setNodeWorkSteps(next);
+  };
+  const upsertNodeWorkStep = (step: PipelineStep, indexHint?: number) => {
+    const prev = nodeWorkStepsRef.current;
+    const key = `${step.nodeId}::${step.targetFile || step.role || ''}`;
+    const idx =
+      typeof indexHint === 'number' && indexHint >= 0
+        ? indexHint
+        : prev.findIndex(
+            s => `${s.nodeId}::${s.targetFile || s.role || ''}` === key
+          );
+    let next: PipelineStep[];
+    if (idx >= 0) {
+      next = [...prev];
+      next[idx] = { ...next[idx], ...step };
+    } else {
+      next = [...prev, step];
+    }
+    syncNodeWork(next);
   };
 
   const commitPlannerPlan = (next: PlannerPlan | null) => {
@@ -366,6 +396,29 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         plannerPlanPath(workspacePath, id),
         serializePlannerPlan(next)
       );
+    }
+  };
+
+  const commitExecutionQueue = (next: ExecutionQueue | null) => {
+    executionQueueRef.current = next;
+    onConversationPatch?.({ executionQueue: next });
+    // Keep Conductor plan panel in sync — Review queues never showed before.
+    if (next?.tasks?.length) {
+      const existing = plannerPlanRef.current;
+      const alreadyReview = existing?.steps?.some(s => s.id === 'review-fixes');
+      const canMirror =
+        !existing?.steps?.length ||
+        !!alreadyReview ||
+        existing?.status === 'completed' ||
+        existing?.status === 'abandoned';
+      if (canMirror) {
+        commitPlannerPlan(
+          plannerPlanFromReviewQueue(next, {
+            conversationId: conversationIdRef.current || undefined,
+            existing
+          })
+        );
+      }
     }
   };
   const freeTierUsageRef = useRef<Record<string, FreeTierUsage>>({});
@@ -437,6 +490,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       plannerPlanRef.current = conversation?.plannerPlan ?? null;
       setPlannerPlanView(conversation?.plannerPlan ?? null);
       stepReworkCountRef.current = {};
+      syncNodeWork([]);
       setExecutingPlanNotice(null);
       setInput('');
       setPendingImages([]);
@@ -789,8 +843,10 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   };
 
   /**
-   * Live Ollama num_ctx for this request: smallest window that fits the payload,
-   * capped by the user's max. Pass the exact messages array about to be sent.
+   * Live Ollama num_ctx for this request.
+   * Planner / Reviewer always use the Hardware Settings ceiling so long history
+   * after tight worker packets does not under-size the window.
+   * Coder and other roles keep dynamic sizing from the payload.
    */
   const chatNumCtx = (
     node: EndpointNode | undefined,
@@ -799,6 +855,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     opts?: { role?: DynamicCtxRole; createIntent?: boolean }
   ) => {
     const maxCtx = modelMaxCtx(node, model);
+    if (opts?.role === 'planner' || opts?.role === 'reviewer') return maxCtx;
     if (!messages?.length) return maxCtx;
     return pickDynamicNumCtx({
       messages,
@@ -944,13 +1001,17 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     node: EndpointNode,
     model: string,
     content: string,
-    doneReason?: string
+    doneReason?: string,
+    expectedFilePath?: string
   ): Promise<string> => {
     const open = hasUnclosedWrite(content);
     if (!open || stopRequestedRef.current) return content;
-    // A clean stop just forgot the closing tag — save the body as-is.
-    // Keep going only when the API cut the reply off.
-    if (/^(stop|end_turn|end)$/i.test(doneReason || '')) return content;
+    // Local models often report "stop" while forgetting </write_file>. Still continue once
+    // when we know the path (assigned swarm file or tagged path).
+    const pathKnown = !!(open.path && open.path !== 'file') || !!expectedFilePath;
+    const cleanStop = /^(stop|end_turn|end)$/i.test(doneReason || '');
+    if (cleanStop && !pathKnown) return content;
+    const writePath = (open.path && open.path !== 'file' ? open.path : expectedFilePath) || open.path;
     const continueMsgs = [
       {
         role: 'system',
@@ -966,7 +1027,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           'Continue the unfinished <' +
           open.name +
           ' path="' +
-          open.path +
+          writePath +
           '"> from the last characters above. End with </' +
           open.name +
           '>.'
@@ -1238,11 +1299,13 @@ export const AgentChat: React.FC<AgentChatProps> = ({
               ? parsePlanOptions(content)
               : [];
           const liveReview = reviewModeContinue ? parseReviewPlan(content) : null;
-          const displayLive = reviewModeContinue
-            ? stripReviewDeltaMarkup(
-                stripReviewPlanMarkup(stripPlanOptionMarkup(parsed.display || content))
-              )
-            : stripPlanOptionMarkup(parsed.display || content);
+          let displayLive = safeAssistantDisplay(parsed, {
+            structured: !!(liveReview || (liveOptions.length >= 2))
+          });
+          displayLive = stripPlanOptionMarkup(displayLive);
+          if (reviewModeContinue) {
+            displayLive = stripReviewDeltaMarkup(stripReviewPlanMarkup(displayLive));
+          }
           setMessages(prev => prev.map(m => {
             if (m.id === followUpId) {
               return {
@@ -1277,7 +1340,13 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       const result = await handle.done;
       const finished = readOnlyContinue
         ? result.content
-        : await finishTruncatedWrites(routeNode, routeModel, result.content, result.stats?.doneReason);
+        : await finishTruncatedWrites(
+            routeNode,
+            routeModel,
+            result.content,
+            result.stats?.doneReason,
+            opts?.expectedFilePath
+          );
       let finalParsed = parseResponse(finished, followUpId, false, {
         expectedFilePath: opts?.expectedFilePath,
         createIntent: readOnlyContinue ? false : (opts?.createIntent ?? true)
@@ -1308,11 +1377,18 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           ? parsePlanOptions(finished)
           : [];
       const reviewPlan = reviewModeContinue ? parseReviewPlan(finished) : null;
-      const displayBase = reviewModeContinue
-        ? stripReviewDeltaMarkup(
-            stripReviewPlanMarkup(stripPlanOptionMarkup(finalParsed.display || finished))
-          )
-        : stripPlanOptionMarkup(finalParsed.display || finished);
+      let displayBase = safeAssistantDisplay(
+        { ...finalParsed, toolCalls: tools },
+        { structured: !!(reviewPlan || planOptions.length >= 2) }
+      );
+      displayBase = stripPlanOptionMarkup(displayBase);
+      if (reviewModeContinue) {
+        displayBase = stripReviewDeltaMarkup(stripReviewPlanMarkup(displayBase));
+      }
+      const writeAnnot = annotateAppliedWrites(tools);
+      if (writeAnnot && !displayBase.includes('Wrote') && !displayBase.includes('Edited')) {
+        displayBase = displayBase ? `${displayBase}\n${writeAnnot}` : writeAnnot;
+      }
       const followUpMsgFinal: ChatMessage = {
         ...followUpMsg,
         raw: finished,
@@ -1472,18 +1548,51 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       );
 
       try {
+        upsertNodeWorkStep(
+          {
+            nodeId: node.id,
+            nodeName: node.name,
+            modelName: model,
+            targetFile: expectedFilePath,
+            agentHandle: 'coder',
+            role: `${model} (local)`,
+            status: 'running',
+            content: `Writing \`${expectedFilePath}\`…`,
+            toolCalls: []
+          },
+          idx
+        );
         const handle = streamChat(
           node.url,
           body,
-          content => {
+          () => {
+            const statusLine = `Writing \`${expectedFilePath}\`…`;
             patchPipelineMsg(m => {
               if (!m.pipelineSteps) return m;
               const updatedSteps = [...m.pipelineSteps];
               if (updatedSteps[idx]) {
-                updatedSteps[idx] = { ...updatedSteps[idx], content };
+                updatedSteps[idx] = {
+                  ...updatedSteps[idx],
+                  status: 'running',
+                  content: statusLine
+                };
               }
               return { ...m, pipelineSteps: updatedSteps };
             });
+            upsertNodeWorkStep(
+              {
+                nodeId: node.id,
+                nodeName: node.name,
+                modelName: model,
+                targetFile: expectedFilePath,
+                agentHandle: 'coder',
+                role: `${model} (local)`,
+                status: 'running',
+                content: statusLine,
+                toolCalls: []
+              },
+              idx
+            );
           },
           node.type,
           node.apiKey
@@ -1491,7 +1600,13 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         activeAbortsRef.current.push(handle.abort);
         const res = await handle.done;
         recordTok(node, res.stats);
-        const finished = await finishTruncatedWrites(node, model, res.content, res.stats?.doneReason);
+        const finished = await finishTruncatedWrites(
+          node,
+          model,
+          res.content,
+          res.stats?.doneReason,
+          expectedFilePath
+        );
 
         let tools = parseResponse(finished, `${agentMsgId}-${idx}`, false, {
           expectedFilePath,
@@ -1554,14 +1669,22 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           });
         }
 
-        const parsedDisplay = parseResponse(finished, `${agentMsgId}-${idx}`, false, {
-          expectedFilePath,
-          createIntent: true
-        }).display;
         const writeErrors = tools.filter(
           t => (t.name === 'write_file' || t.name === 'edit_file') && t.status === 'error'
         );
 
+        const doneStats =
+          res.stats?.evalCount && res.stats?.evalDuration
+            ? {
+                evalCount: res.stats.evalCount,
+                tokensPerSec: Math.round(res.stats.evalCount / (res.stats.evalDuration / 1e9))
+              }
+            : undefined;
+        const doneContent = writeErrors.length
+          ? writeErrors
+              .map(t => t.result || `Failed to write ${t.args?.path || expectedFilePath}`)
+              .join('\n')
+          : `Completed ${expectedFilePath}`;
         patchPipelineMsg(m => {
           if (!m.pipelineSteps) return m;
           const updatedSteps = [...m.pipelineSteps];
@@ -1569,26 +1692,37 @@ export const AgentChat: React.FC<AgentChatProps> = ({
             updatedSteps[idx] = {
               ...updatedSteps[idx],
               status: writeErrors.length ? 'failed' : 'completed',
-              content: writeErrors.length
-                ? writeErrors.map(t => t.result || `Failed to write ${t.args?.path || expectedFilePath}`).join('\n')
-                : opts.stepLabel ||
-                  parsedDisplay ||
-                  `Completed ${expectedFilePath}`,
+              content: doneContent,
               toolCalls: tools,
-              stats:
-                res.stats?.evalCount && res.stats?.evalDuration
-                  ? {
-                      evalCount: res.stats.evalCount,
-                      tokensPerSec: Math.round(
-                        res.stats.evalCount / (res.stats.evalDuration / 1e9)
-                      )
-                    }
-                  : undefined
+              stats: doneStats
             };
           }
           const allTools = updatedSteps.flatMap(s => s.toolCalls || []);
-          return { ...m, pipelineSteps: updatedSteps, toolCalls: allTools };
+          const annot = annotateAppliedWrites(tools);
+          return {
+            ...m,
+            pipelineSteps: updatedSteps,
+            toolCalls: allTools,
+            display: annot
+              ? `Swarm: ${annot}`
+              : m.display || `Swarm worker finished \`${expectedFilePath}\``
+          };
         });
+        upsertNodeWorkStep(
+          {
+            nodeId: node.id,
+            nodeName: node.name,
+            modelName: model,
+            targetFile: expectedFilePath,
+            agentHandle: 'coder',
+            role: `${model} (local)`,
+            status: writeErrors.length ? 'failed' : 'completed',
+            content: doneContent,
+            toolCalls: tools,
+            stats: doneStats
+          },
+          idx
+        );
       } catch (workerErr: any) {
         const errText = String(workerErr?.message || workerErr || '');
         const networkish =
@@ -1901,15 +2035,16 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         })
       ];
 
+      const swarmNotice = `Swarm: ${assignments.length} file${
+        assignments.length === 1 ? '' : 's'
+      } on ${[
+        ...new Set(assignments.map(a => a.node.name).filter(Boolean))
+      ].join(' / ') || 'cluster'}${waveLabel}`;
       patchPipelineMsg({
-        display:
-          frontierCount > 0 && localCount === 0
-            ? `⚡ Pass 2 — ${assignments.length} files via frontier (contract locked)${waveLabel}:`
-            : `⚡ Pass 2 — ${assignments.length} files in ${taskWaves.length} wave${
-                taskWaves.length === 1 ? '' : 's'
-              } (${localCount} local${frontierCount ? ` + ${frontierCount} frontier` : ''}). Same-wave files may run in parallel; later waves wait for dependencies:`,
+        display: swarmNotice,
         pipelineSteps: initialSteps
       });
+      syncNodeWork(initialSteps);
 
       const completedPaths: string[] = [];
       let flatOffset = 0;
@@ -2297,6 +2432,24 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     setMessages(prev => (skipUserAppend ? [...prev, initialAgentMsg] : [...prev, userMsg, initialAgentMsg]));
     setIsStreaming(true);
 
+    if (useFreshContext || agent.handle === 'coder' || agent.handle === 'reviewer') {
+      upsertNodeWorkStep({
+        nodeId: routedNode.id,
+        nodeName: routedNode.name,
+        modelName: routedModel,
+        targetFile: stepVerdictMode
+          ? 'step verdict'
+          : reviewMode
+            ? 'review'
+            : 'workspace',
+        agentHandle: agent.handle || 'coder',
+        role: `${agent.name || agent.handle} · ${routedModel}`,
+        status: 'running',
+        content: notice || 'Working…',
+        toolCalls: []
+      });
+    }
+
     let originOut: ChatMessage | undefined;
     try {
       const routedMaxCtx = modelMaxCtx(routedNode, routedModel);
@@ -2389,14 +2542,6 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         body,
         (content, thinking) => {
           const parsed = parseResponse(content, agentMsgId, true, { createIntent });
-          let displayBase = stripPlanOptionMarkup(parsed.display || content);
-          if (reviewMode || stepVerdictMode) {
-            displayBase = stripStepVerdictMarkup(
-              stripReviewDeltaMarkup(stripReviewPlanMarkup(displayBase))
-            );
-          }
-          if (lockPlanMode) displayBase = stripExecutionPlanMarkup(displayBase);
-          if (contractMode) displayBase = stripFixContractMarkup(displayBase);
           // Never surface architecture options once an execution plan is locked/running.
           const liveOptions =
             planMode && !lockPlanMode && !isPlanActive(plannerPlanRef.current)
@@ -2411,6 +2556,18 @@ export const AgentChat: React.FC<AgentChatProps> = ({
                 )
               : parsed.toolCalls
           );
+          let displayBase = safeAssistantDisplay(
+            { ...parsed, toolCalls: liveTools },
+            { structured: !!(liveReview || liveVerdict || liveOptions.length >= 2) }
+          );
+          displayBase = stripPlanOptionMarkup(displayBase);
+          if (reviewMode || stepVerdictMode) {
+            displayBase = stripStepVerdictMarkup(
+              stripReviewDeltaMarkup(stripReviewPlanMarkup(displayBase))
+            );
+          }
+          if (lockPlanMode) displayBase = stripExecutionPlanMarkup(displayBase);
+          if (contractMode) displayBase = stripFixContractMarkup(displayBase);
           setMessages(prev =>
             prev.map(m => {
               if (m.id !== agentMsgId) return m;
@@ -2446,7 +2603,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       const result = await handle.done;
       const finished = readOnlyMode
         ? result.content
-        : await finishTruncatedWrites(routedNode, routedModel, result.content, result.stats?.doneReason);
+        : await finishTruncatedWrites(
+            routedNode,
+            routedModel,
+            result.content,
+            result.stats?.doneReason
+          );
       const finalParsed = parseResponse(finished, agentMsgId, false, { createIntent });
 
       let tools = collapseDuplicateReadTools(finalParsed.toolCalls);
@@ -2497,7 +2659,11 @@ export const AgentChat: React.FC<AgentChatProps> = ({
             } as const)
           : null;
       const parsedVerdict = stepVerdictMode ? parseStepVerdict(finished) : null;
-      let displayText = stripPlanOptionMarkup(finalParsed.display || finished);
+      let displayText = safeAssistantDisplay(
+        { ...finalParsed, toolCalls: tools },
+        { structured: !!(reviewPlan || parsedVerdict || options.length >= 2) }
+      );
+      displayText = stripPlanOptionMarkup(displayText);
       if (reviewMode || stepVerdictMode) {
         displayText = stripStepVerdictMarkup(
           stripReviewDeltaMarkup(stripReviewPlanMarkup(displayText))
@@ -2505,6 +2671,14 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       }
       if (lockPlanMode) displayText = stripExecutionPlanMarkup(displayText);
       if (contractMode) displayText = stripFixContractMarkup(displayText);
+      const writeAnnot = annotateAppliedWrites(tools);
+      if (
+        writeAnnot &&
+        !displayText.includes('Wrote') &&
+        !displayText.includes('Edited')
+      ) {
+        displayText = displayText ? `${displayText}\n${writeAnnot}` : writeAnnot;
+      }
 
       const origin: ChatMessage = {
         id: agentMsgId,
@@ -2542,6 +2716,55 @@ export const AgentChat: React.FC<AgentChatProps> = ({
 
       setMessages(prev => prev.map(m => (m.id === agentMsgId ? origin : m)));
       originOut = origin;
+
+      // Surface Reviewer fix tasks under Conductor immediately (not only after Send).
+      if (
+        reviewMode &&
+        !stepVerdictMode &&
+        reviewPlan &&
+        reviewPlan.tasks.length > 0 &&
+        !hasOpenTasks(executionQueueRef.current)
+      ) {
+        commitExecutionQueue(createQueueFromReviewPlan(reviewPlan, agentMsgId));
+      }
+
+      // Track ephemeral Coder/Reviewer on the Node Work column.
+      if (!readOnlyMode && (useFreshContext || agent.handle === 'coder')) {
+        const writePaths = tools
+          .filter(t => t.name === 'write_file' || t.name === 'edit_file')
+          .map(t => t.args?.path)
+          .filter(Boolean) as string[];
+        const labelPath = writePaths[0] || 'workspace';
+        upsertNodeWorkStep({
+          nodeId: routedNode.id,
+          nodeName: routedNode.name,
+          modelName: routedModel,
+          targetFile: labelPath,
+          agentHandle: agent.handle || 'coder',
+          role: `${agent.name || agent.handle} · ${routedModel}`,
+          status: 'completed',
+          content:
+            annotateAppliedWrites(tools) ||
+            (writePaths.length ? `Completed ${writePaths.join(', ')}` : displayText.slice(0, 120) || 'Done'),
+          toolCalls: tools,
+          stats
+        });
+      } else if (reviewMode || stepVerdictMode) {
+        upsertNodeWorkStep({
+          nodeId: routedNode.id,
+          nodeName: routedNode.name,
+          modelName: routedModel,
+          targetFile: stepVerdictMode ? 'step verdict' : 'review',
+          agentHandle: 'reviewer',
+          role: `Reviewer · ${routedModel}`,
+          status: 'completed',
+          content: parsedVerdict
+            ? `${parsedVerdict.result}: ${(parsedVerdict.notes || '').slice(0, 160)}`
+            : reviewPlan?.summary || 'Review complete',
+          toolCalls: tools,
+          stats
+        });
+      }
 
       const turnContinueOpts = continueDecisionOpts(undefined, {
         maxReadOnlyContinues:
@@ -2591,6 +2814,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
             setMessages(prev =>
               prev.map(m => (m.id === latest.id ? { ...m, reviewPlan: rp } : m))
             );
+            if (rp?.tasks?.length && !hasOpenTasks(executionQueueRef.current)) {
+              commitExecutionQueue(createQueueFromReviewPlan(rp, latest.id));
+            }
           }
         }
       }
@@ -3899,9 +4125,13 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       chosenOptionId: option.id,
       chosenOptionTitle: option.title
     });
+    // Same conversation: keep finished steps and append the new lock.
+    plan = appendPlannerPlan(plannerPlanRef.current, plan);
     plan = activateNextStep(plan);
     commitPlannerPlan(plan);
-    setExecutingPlanNotice(`Plan locked (${plan.steps.length} steps) — dispatching step 1…`);
+    setExecutingPlanNotice(
+      `Plan locked (${plan.steps.length} steps) — dispatching next step…`
+    );
 
     await dispatchActiveStep();
   };
@@ -4109,15 +4339,17 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       });
     }
 
-    // Explicit Reviewer (power-user) → findings + review_plan only
+    // Explicit Reviewer (power-user) → findings + review_plan only (cleared context)
     if (isReviewerSelected) {
       setExecutingPlanNotice(null);
+      ephemeralWorkerRef.current = true;
       return runSingleNodeTurn({
         userText,
         fullPrompt,
         attachedImages,
         agent: currentAgent,
-        reviewMode: true
+        reviewMode: true,
+        freshContext: true
       });
     }
 
@@ -4221,18 +4453,27 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
 
   const [controlColWidth, setControlColWidth] = useState(controlWidth);
   const controlColWidthRef = useRef(controlWidth);
+  const [nodeWorkColWidth, setNodeWorkColWidth] = useState(nodeWorkWidth);
+  const nodeWorkColWidthRef = useRef(nodeWorkWidth);
   const [resizingControl, setResizingControl] = useState(false);
+  const [resizingNodeWork, setResizingNodeWork] = useState(false);
   useEffect(() => {
     setControlColWidth(controlWidth);
     controlColWidthRef.current = controlWidth;
   }, [controlWidth]);
+  useEffect(() => {
+    setNodeWorkColWidth(nodeWorkWidth);
+    nodeWorkColWidthRef.current = nodeWorkWidth;
+  }, [nodeWorkWidth]);
   useEffect(() => {
     if (!resizingControl) return;
     const onMove = (e: MouseEvent) => {
       const el = document.getElementById('agent-conductor-root');
       if (!el) return;
       const rect = el.getBoundingClientRect();
-      const next = Math.max(220, Math.min(420, rect.right - e.clientX));
+      // Leave room for Node Work + min chat; allow Conductor up to ~560px.
+      const nodeW = nodeWorkColWidthRef.current;
+      const next = Math.max(200, Math.min(560, rect.right - e.clientX - nodeW - 4));
       controlColWidthRef.current = next;
       setControlColWidth(next);
     };
@@ -4247,6 +4488,38 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       window.removeEventListener('mouseup', onUp);
     };
   }, [resizingControl, onControlWidthChange]);
+  useEffect(() => {
+    if (!resizingNodeWork) return;
+    const onMove = (e: MouseEvent) => {
+      const el = document.getElementById('agent-conductor-root');
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const next = Math.max(200, Math.min(480, rect.right - e.clientX));
+      nodeWorkColWidthRef.current = next;
+      setNodeWorkColWidth(next);
+    };
+    const onUp = () => {
+      setResizingNodeWork(false);
+      onNodeWorkWidthChange?.(nodeWorkColWidthRef.current);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [resizingNodeWork, onNodeWorkWidthChange]);
+
+  const nodeWorkColumn = (
+    <div
+      style={fill ? undefined : { width: nodeWorkColWidth }}
+      className={`flex flex-col min-h-0 ${
+        fill ? 'w-full min-h-[40%] border-t border-[#27272a]' : 'shrink-0 min-w-[200px]'
+      }`}
+    >
+      <NodeWorkPanel steps={nodeWorkSteps} />
+    </div>
+  );
 
   const conductorColumn = (
       <div
@@ -4687,44 +4960,6 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                     : 'bg-[#1e1e24] text-zinc-200 border border-[#2b2b36] rounded-bl-none'
                 }`}
               >
-                {/* Parallel Pipeline Grid if present */}
-                {msg.pipelineSteps && msg.pipelineSteps.length > 0 && (
-                  <div className="space-y-2.5 mb-3">
-                    <div className="text-[11px] font-bold text-amber-300 flex items-center space-x-1.5">
-                      <Share2 className="w-3.5 h-3.5" />
-                      <span>Distributed Multi-Node File Generation:</span>
-                    </div>
-
-                    <div className="space-y-2">
-                      {msg.pipelineSteps.map((step, sIdx) => (
-                        <div
-                          key={`${step.nodeId}-${step.targetFile || sIdx}`}
-                          className="bg-[#121215] border border-[#282834] rounded-lg p-2.5 text-[11px]"
-                        >
-                          <div className="flex items-center justify-between font-mono text-[10px] mb-1">
-                            <span className="text-indigo-300 font-bold truncate">{step.nodeName}</span>
-                            <span className={`shrink-0 ml-2 ${
-                              step.status === 'completed'
-                                ? 'text-emerald-400'
-                                : step.status === 'failed'
-                                  ? 'text-red-400'
-                                  : step.status === 'pending'
-                                    ? 'text-zinc-500'
-                                    : 'text-amber-400 animate-pulse'
-                            }`}>
-                              {step.status} {step.stats ? `(${step.stats.tokensPerSec} t/s)` : ''}
-                            </span>
-                          </div>
-                          <div className="text-[9px] text-zinc-500 font-mono mb-1">{step.role}</div>
-                          <div className="text-zinc-300 whitespace-pre-wrap max-h-36 overflow-y-auto font-mono text-[10px]">
-                            {step.content || 'Awaiting computation...'}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
                 {/* Attached screenshots */}
                 {msg.images && msg.images.length > 0 && (
                   <div className={`flex flex-wrap gap-1.5 ${msg.display ? 'mb-2' : ''}`}>
@@ -4739,8 +4974,8 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                   </div>
                 )}
 
-                {/* Display standard text */}
-                {!msg.pipelineSteps && msg.display && (
+                {/* Display standard text (swarm cards live in Node Work column) */}
+                {msg.display && (
                   <div className="whitespace-pre-wrap">{msg.display}</div>
                 )}
 
@@ -4986,12 +5221,21 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
             }`}
           />
           {conductorColumn}
+          <div
+            onMouseDown={() => setResizingNodeWork(true)}
+            title="Drag to resize Node Work column"
+            className={`w-1 cursor-col-resize transition-colors shrink-0 ${
+              resizingNodeWork ? 'bg-amber-500' : 'bg-[#22222a] hover:bg-amber-500/60'
+            }`}
+          />
+          {nodeWorkColumn}
         </>
       )}
 
       {fill && mobileControlsOpen && (
-        <div className="absolute inset-0 z-50 flex flex-col bg-[#121215]">
-          {conductorColumn}
+        <div className="absolute inset-0 z-50 flex flex-col bg-[#121215] min-h-0">
+          <div className="flex-1 min-h-0 overflow-hidden flex flex-col">{conductorColumn}</div>
+          <div className="flex-1 min-h-0 overflow-hidden flex flex-col">{nodeWorkColumn}</div>
         </div>
       )}
     </div>

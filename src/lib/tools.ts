@@ -127,7 +127,7 @@ export function parseResponse(
     return `\u0000${found.length - 1}\u0000`;
   });
 
-  // A frontier reply often stops inside the last file, with no closing tag.
+  // A frontier/local reply often stops inside the last file, with no closing tag.
   // Closed tags are already placeholders, so the last remaining tag is the cutoff.
   if (!streaming) {
     const openRe = /<(write_file|edit_file)\b([^>]*)>/gi;
@@ -142,8 +142,13 @@ export function parseResponse(
         if (fallbackPath) args.path = fallbackPath;
       }
       const rawBody = work.slice(lastOpen.index + lastOpen[0].length);
-      if (args.path && rawBody.trim().length > 0) {
-        found.push({ name, attrs: lastOpen[2] || '', body: rawBody });
+      const pathForSalvage = args.path || expectedFilePath;
+      if (pathForSalvage && rawBody.trim().length > 0) {
+        const attrs =
+          lastOpen[2] && /path\s*=/i.test(lastOpen[2])
+            ? lastOpen[2]
+            : ` path="${pathForSalvage}"`;
+        found.push({ name, attrs, body: rawBody });
         const idx = found.length - 1;
         work = `${work.slice(0, lastOpen.index)}\u0000${idx}\u0000`;
       }
@@ -727,9 +732,9 @@ export function describeTool(call: ToolCall): string {
     case 'search':
       return `Search "${call.args.query}"${call.args.path ? ` in ${call.args.path}` : ''}`;
     case 'write_file':
-      return `Write ${call.args.path}`;
+      return `Wrote \`${call.args.path || 'file'}\``;
     case 'edit_file':
-      return `Edit ${call.args.path}`;
+      return `Edited \`${call.args.path || 'file'}\``;
     case 'run_command':
       return `Run: ${call.body}`;
     case 'read_terminal':
@@ -739,6 +744,43 @@ export function describeTool(call: ToolCall): string {
     case 'generate_image':
       return `Image ${call.args.path || 'asset'}: ${call.args.prompt || call.body || ''}`;
   }
+}
+
+/** Chat bubble text — never fall back to raw tool XML / file bodies. */
+export function safeAssistantDisplay(
+  parsed: Pick<ParsedResponse, 'display' | 'toolCalls' | 'pendingTool'>,
+  opts?: { structured?: boolean }
+): string {
+  const prose = (parsed.display || '').trim();
+  if (opts?.structured) return prose;
+  const writes = (parsed.toolCalls || []).filter(
+    t => t.name === 'write_file' || t.name === 'edit_file'
+  );
+  if (writes.length) {
+    const lines = writes.map(describeTool);
+    return prose ? `${prose}\n${lines.join('\n')}` : lines.join('\n');
+  }
+  if (parsed.pendingTool) {
+    const path = parsed.pendingTool.path || 'file';
+    const writing = `Writing \`${path}\`…`;
+    return prose ? `${prose}\n${writing}` : writing;
+  }
+  if ((parsed.toolCalls || []).length && !prose) {
+    return (parsed.toolCalls || []).map(describeTool).join('\n');
+  }
+  return prose;
+}
+
+/** One-line annotations after tools apply (path only). */
+export function annotateAppliedWrites(tools: ToolCall[]): string {
+  return tools
+    .filter(
+      t =>
+        (t.name === 'write_file' || t.name === 'edit_file') &&
+        (t.status === 'done' || t.status === 'pending')
+    )
+    .map(describeTool)
+    .join('\n');
 }
 
 // ==========================================

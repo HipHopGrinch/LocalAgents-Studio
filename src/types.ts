@@ -249,6 +249,8 @@ export interface AppSettings {
   chatWidth?: number;
   /** Right orchestration column inside Agent Conductor */
   agentControlWidth?: number;
+  /** Far-right Node Work column inside Agent Conductor */
+  agentNodeWorkWidth?: number;
   /** UI & Text scaling factor (0.75 to 2.0, default 1.0) */
   uiScale?: number;
   /** SearXNG base URL for the web_search tool. Empty = search unavailable. */

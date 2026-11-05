@@ -10,6 +10,7 @@ import {
   ChatConversation,
   ExecutionQueue,
   PlannerPlan,
+  PlannerResumePhase,
   PlanOption,
   WorkspaceFile,
   LiveConductorState
@@ -164,6 +165,15 @@ import {
   stripReviewPlanMarkup,
   stripStepVerdictMarkup
 } from '../lib/planOptions';
+
+/** Scrub planner/reviewer structured XML that local models leave in the bubble. */
+function scrubStructuredMarkup(text: string): string {
+  return stripExecutionPlanMarkup(
+    stripStepVerdictMarkup(
+      stripReviewDeltaMarkup(stripReviewPlanMarkup(stripPlanOptionMarkup(text || '')))
+    )
+  );
+}
 import {
   applyReviewDelta,
   createQueueFromReviewPlan,
@@ -359,6 +369,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   /** Auto-review Nay reworks per step id — caps infinite Coder↔Reviewer loops. */
   const stepReworkCountRef = useRef<Record<string, number>>({});
   const stopRequestedRef = useRef(false);
+  /** True after Stop (or idle) while a durable plan is still active — show Continue. */
+  const [planPaused, setPlanPaused] = useState(false);
   /** Live Node Work column (Swarm + single-node workers). */
   const [nodeWorkSteps, setNodeWorkSteps] = useState<PipelineStep[]>([]);
   const nodeWorkStepsRef = useRef<PipelineStep[]>([]);
@@ -397,6 +409,13 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         serializePlannerPlan(next)
       );
     }
+  };
+
+  const setPlanResumePhase = (phase: PlannerResumePhase | undefined) => {
+    const plan = plannerPlanRef.current;
+    if (!plan) return;
+    if (plan.resumePhase === phase) return;
+    commitPlannerPlan({ ...plan, resumePhase: phase, updatedAt: Date.now() });
   };
 
   const commitExecutionQueue = (next: ExecutionQueue | null) => {
@@ -491,6 +510,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       setPlannerPlanView(conversation?.plannerPlan ?? null);
       stepReworkCountRef.current = {};
       syncNodeWork([]);
+      setPlanPaused(isPlanActive(conversation?.plannerPlan));
       setExecutingPlanNotice(null);
       setInput('');
       setPendingImages([]);
@@ -1303,13 +1323,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           let displayLive = safeAssistantDisplay(parsed, {
             structured: !!(liveReview || liveVerdict || liveOptions.length >= 2)
           });
-          displayLive = stripPlanOptionMarkup(displayLive);
-          if (reviewModeContinue || stepVerdictContinue) {
-            displayLive = stripStepVerdictMarkup(
-              stripReviewDeltaMarkup(stripReviewPlanMarkup(displayLive))
-            );
-          }
-          if (liveVerdict) displayLive = '';
+          displayLive = scrubStructuredMarkup(displayLive);
+          if (liveVerdict || liveReview || parseExecutionPlan(content)) displayLive = '';
           setMessages(prev => prev.map(m => {
             if (m.id === followUpId) {
               return {
@@ -1396,13 +1411,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         { ...finalParsed, toolCalls: tools },
         { structured: !!(reviewPlan || contVerdict || planOptions.length >= 2) }
       );
-      displayBase = stripPlanOptionMarkup(displayBase);
-      if (reviewModeContinue || stepVerdictContinue) {
-        displayBase = stripStepVerdictMarkup(
-          stripReviewDeltaMarkup(stripReviewPlanMarkup(displayBase))
-        );
-      }
-      if (contVerdict) displayBase = '';
+      displayBase = scrubStructuredMarkup(displayBase);
+      if (contVerdict || reviewPlan || parseExecutionPlan(finished)) displayBase = '';
       const writeAnnot = annotateAppliedWrites(tools);
       if (writeAnnot && !displayBase.includes('Wrote') && !displayBase.includes('Edited')) {
         displayBase = displayBase ? `${displayBase}\n${writeAnnot}` : writeAnnot;
@@ -2594,9 +2604,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
               stripReviewDeltaMarkup(stripReviewPlanMarkup(displayBase))
             );
           }
-          if (lockPlanMode) displayBase = stripExecutionPlanMarkup(displayBase);
+          displayBase = scrubStructuredMarkup(displayBase);
           if (contractMode) displayBase = stripFixContractMarkup(displayBase);
-          if (liveVerdict || liveReview) displayBase = '';
+          // Structured cards / Conductor own these — never leave raw XML in the bubble.
+          if (liveVerdict || liveReview || lockPlanMode || parseExecutionPlan(content)) {
+            displayBase = '';
+          }
           setMessages(prev =>
             prev.map(m => {
               if (m.id !== agentMsgId) return m;
@@ -2692,16 +2705,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         { ...finalParsed, toolCalls: tools },
         { structured: !!(reviewPlan || parsedVerdict || options.length >= 2) }
       );
-      displayText = stripPlanOptionMarkup(displayText);
-      if (reviewMode || stepVerdictMode) {
-        displayText = stripStepVerdictMarkup(
-          stripReviewDeltaMarkup(stripReviewPlanMarkup(displayText))
-        );
-      }
-      if (lockPlanMode) displayText = stripExecutionPlanMarkup(displayText);
+      displayText = scrubStructuredMarkup(displayText);
       if (contractMode) displayText = stripFixContractMarkup(displayText);
-      // Verdict / review cards own the UI — never leave raw XML in the bubble.
-      if (parsedVerdict || reviewPlan) displayText = '';
+      // Structured cards / Conductor own these — never leave raw XML in the bubble.
+      if (parsedVerdict || reviewPlan || lockPlanMode || parseExecutionPlan(finished)) {
+        displayText = '';
+      }
       const writeAnnot = annotateAppliedWrites(tools);
       if (
         writeAnnot &&
@@ -3773,8 +3782,8 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
     if (!step) return;
 
     plan = markStepInProgress(plan, step.id);
-    commitPlannerPlan(plan);
-    step = getActiveStep(plan)!;
+    commitPlannerPlan({ ...plan, resumePhase: 'coder', updatedAt: Date.now() });
+    step = getActiveStep(plannerPlanRef.current)!;
 
     ephemeralWorkerRef.current = true;
     onSelectAgent(coderAgent.id);
@@ -3843,7 +3852,11 @@ ${progressForPrompt() || '(empty)'}`;
       }
 
       if (stopRequestedRef.current) {
-        restorePlannerControl('Stopped — talk to Planner about what to do next.');
+        setPlanPaused(true);
+        setPlanResumePhase('coder');
+        restorePlannerControl(
+          `Paused during Coder on step #${step.id} — press Play to resume.`
+        );
         return;
       }
 
@@ -3851,10 +3864,14 @@ ${progressForPrompt() || '(empty)'}`;
       plan = plannerPlanRef.current;
       if (plan && step) {
         plan = markAllStepTasks(plan, step.id, 'completed');
-        commitPlannerPlan(plan);
+        commitPlannerPlan({ ...plan, resumePhase: 'review', updatedAt: Date.now() });
+      } else {
+        setPlanResumePhase('review');
       }
       await reviewActiveStep();
     } catch (err: any) {
+      setPlanPaused(true);
+      setPlanResumePhase('coder');
       restorePlannerControl(`Coder step failed: ${err?.message || err}`);
       throw err;
     }
@@ -3871,6 +3888,7 @@ ${progressForPrompt() || '(empty)'}`;
       }
       return;
     }
+    setPlanResumePhase('review');
 
     const target = pickCapableReviewTarget(nodes);
     if (!target) {
@@ -3923,7 +3941,11 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     });
 
     if (stopRequestedRef.current) {
-      restorePlannerControl('Stopped — talk to Planner about what to do next.');
+      setPlanPaused(true);
+      setPlanResumePhase('review');
+      restorePlannerControl(
+        `Paused during Review on step #${step.id} — press Play to resume.`
+      );
       return;
     }
 
@@ -3979,10 +4001,12 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     }
 
     if (!autoReviewRef.current) {
+      setPlanResumePhase('verdict');
+      setPlanPaused(true);
       restorePlannerControl(
         packed.result === 'yay'
-          ? `Step #${step.id} Yay — click Accept to continue (Planner owns next)`
-          : `Step #${step.id} Nay — click Accept to send fixes to Coder`
+          ? `Step #${step.id} Yay — Accept on the card or press Play to continue`
+          : `Step #${step.id} Nay — Accept on the card or press Play to send fixes to Coder`
       );
       return;
     }
@@ -4027,6 +4051,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
 
     if (plan.status === 'completed') {
       stepReworkCountRef.current = {};
+      setPlanPaused(false);
       restorePlannerControl('All plan steps complete — ask Planner what to build next.');
       return;
     }
@@ -4411,10 +4436,201 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
     activeAbortsRef.current = [];
     setIsStreaming(false);
     if (isPlanActive(plannerPlanRef.current)) {
-      restorePlannerControl('Stopped — talk to Planner about what to do next.');
+      setPlanPaused(true);
+      // Keep existing checkpoint; only stamp coder if nothing was saved yet.
+      const plan = plannerPlanRef.current;
+      if (plan && !plan.resumePhase) setPlanResumePhase('coder');
+      const step = getActiveStep(plan);
+      const phase = plan?.resumePhase || 'coder';
+      const phaseLabel =
+        phase === 'review' ? 'Review' : phase === 'verdict' ? 'verdict' : 'Coder';
+      restorePlannerControl(
+        step
+          ? `Paused during ${phaseLabel} on step #${step.id}: ${step.title} — press Play to resume.`
+          : 'Paused — press Play on the active step to resume.'
+      );
     } else {
+      setPlanPaused(false);
       setExecutingPlanNotice(null);
     }
+  };
+
+  /** Resume from the saved checkpoint (coder / review / verdict) — not a blind step restart. */
+  const resumeActivePlan = async () => {
+    if (isStreaming) return;
+    const activePlan = plannerPlanRef.current;
+    if (!isPlanActive(activePlan) || !activePlan) {
+      setPlanPaused(false);
+      setExecutingPlanNotice('No active plan to continue.');
+      return;
+    }
+    const plan = activePlan;
+    stopRequestedRef.current = false;
+    setPlanPaused(false);
+    resetAgentLoopBudget();
+
+    const step = getActiveStep(plan);
+    const stepId = step?.id;
+
+    const pendingVerdict = [...messagesRef.current].reverse().find(
+      m =>
+        m.stepVerdict &&
+        !m.stepVerdictApplied &&
+        (m.stepVerdictNeedsConfirm || plan.resumePhase === 'verdict') &&
+        (!stepId || !m.stepVerdict.stepId || m.stepVerdict.stepId === stepId)
+    );
+
+    // Infer phase: explicit checkpoint, else chat evidence, else coder.
+    let phase: PlannerResumePhase = plan.resumePhase || 'coder';
+    if (pendingVerdict?.stepVerdict) phase = 'verdict';
+    else if (!plan.resumePhase) {
+      const lastReview = [...messagesRef.current].reverse().find(
+        m =>
+          m.role === 'assistant' &&
+          (m.personaHandle === 'reviewer' || m.stepVerdict) &&
+          (!stepId || !m.stepVerdict?.stepId || m.stepVerdict.stepId === stepId)
+      );
+      const lastCoder = [...messagesRef.current].reverse().find(
+        m =>
+          m.role === 'assistant' &&
+          (m.personaHandle === 'coder' || m.personaHandle === 'planner') &&
+          (m.toolCalls || []).some(t => t.name === 'write_file' || t.name === 'edit_file')
+      );
+      const tasksDone =
+        !!step &&
+        step.tasks.length > 0 &&
+        step.tasks.every(t => t.status === 'completed');
+      if (lastReview?.stepVerdict && !lastReview.stepVerdictApplied) phase = 'verdict';
+      else if (tasksDone || (lastCoder && (!lastReview || messagesRef.current.indexOf(lastCoder) > messagesRef.current.indexOf(lastReview)))) {
+        phase = 'review';
+      } else if (step?.status === 'failed') {
+        phase = 'coder';
+      }
+    }
+
+    if (phase === 'verdict') {
+      const verdictMsg =
+        pendingVerdict ||
+        [...messagesRef.current].reverse().find(
+          m => m.stepVerdict && !m.stepVerdictApplied
+        );
+      if (verdictMsg?.stepVerdict) {
+        setExecutingPlanNotice(
+          `Resuming — applying ${verdictMsg.stepVerdict.result === 'yay' ? 'Yay' : 'Nay'} then continuing…`
+        );
+        await applyStepVerdictAndContinue(verdictMsg);
+        return;
+      }
+      phase = 'review';
+    }
+
+    if (phase === 'review') {
+      setExecutingPlanNotice(
+        step
+          ? `Resuming Review on step #${step.id}: ${step.title}…`
+          : 'Resuming Review…'
+      );
+      setPlanResumePhase('review');
+      await reviewActiveStep();
+      return;
+    }
+
+    // phase === 'coder' — finish pending tool applies if any, else only re-dispatch when needed.
+    const lastCoderMsg = [...messagesRef.current].reverse().find(
+      m =>
+        m.role === 'assistant' &&
+        (m.toolCalls || []).some(
+          t => t.name === 'write_file' || t.name === 'edit_file' || t.name === 'run_command'
+        )
+    );
+    const pendingTools = (lastCoderMsg?.toolCalls || []).filter(
+      t => t.status !== 'done' && t.status !== 'error'
+    );
+    if (lastCoderMsg && pendingTools.length > 0) {
+      setExecutingPlanNotice('Resuming — finishing pending workspace actions…');
+      setIsStreaming(true);
+      let tools = lastCoderMsg.toolCalls || [];
+      if (autoApplyWritesRef.current) {
+        tools = await autoApplyWritableTools(tools, toolDeps);
+        tools = await runAuxTools(tools, toolDeps);
+        const cmdPass = await runCommandTools(tools, toolDeps);
+        tools = cmdPass.tools;
+        updateProgress(log => noteSavedFiles(log, tools));
+      }
+      const updatedMsg = { ...lastCoderMsg, toolCalls: tools };
+      setMessages(prev => {
+        const next = prev.map(m => (m.id === lastCoderMsg.id ? updatedMsg : m));
+        messagesRef.current = next;
+        return next;
+      });
+      setIsStreaming(false);
+      if (stopRequestedRef.current) {
+        setPlanPaused(true);
+        return;
+      }
+      if (shouldContinueFromTools(tools, continueDecisionOpts())) {
+        await continueWithToolResults(updatedMsg, {
+          createIntent: true,
+          freshContext: true,
+          role: 'coder'
+        });
+      }
+      if (stopRequestedRef.current) {
+        setPlanPaused(true);
+        setPlanResumePhase('coder');
+        return;
+      }
+      // Coder progress exists — advance to Review rather than re-implementing.
+      if (step) {
+        let p = plannerPlanRef.current;
+        if (p) {
+          p = markAllStepTasks(p, step.id, 'completed');
+          commitPlannerPlan({ ...p, resumePhase: 'review', updatedAt: Date.now() });
+        }
+      }
+      setExecutingPlanNotice(
+        step ? `Resuming Review on step #${step.id}…` : 'Resuming Review…'
+      );
+      await reviewActiveStep();
+      return;
+    }
+
+    const wroteSomething = (lastCoderMsg?.toolCalls || []).some(
+      t =>
+        (t.name === 'write_file' || t.name === 'edit_file') &&
+        (t.status === 'done' || autoApplyWritesRef.current)
+    );
+    const tasksAlreadyDone =
+      !!step &&
+      step.tasks.length > 0 &&
+      step.tasks.every(t => t.status === 'completed');
+
+    if (wroteSomething || tasksAlreadyDone) {
+      // Seamless: skip re-coding; pick up at Review.
+      if (step && !tasksAlreadyDone) {
+        let p = plannerPlanRef.current;
+        if (p) {
+          p = markAllStepTasks(p, step.id, 'completed');
+          commitPlannerPlan({ ...p, resumePhase: 'review', updatedAt: Date.now() });
+        }
+      } else {
+        setPlanResumePhase('review');
+      }
+      setExecutingPlanNotice(
+        step
+          ? `Resuming Review on step #${step.id}: ${step.title}…`
+          : 'Resuming Review…'
+      );
+      await reviewActiveStep();
+      return;
+    }
+
+    setExecutingPlanNotice(
+      step
+        ? `Resuming Coder on step #${step.id}: ${step.title}…`
+        : 'Resuming Coder…'
+    );
+    await dispatchActiveStep();
   };
 
   const handleApplyAllTools = async (msg: ChatMessage) => {
@@ -4629,7 +4845,13 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
 
         <div className="flex-1 min-h-0 flex flex-col px-2.5 py-2 overflow-y-auto">
           {plannerPlanView && plannerPlanView.steps.length > 0 ? (
-            <PlannerPlanPanel plan={plannerPlanView} />
+            <PlannerPlanPanel
+              plan={plannerPlanView}
+              isBusy={showStreamingUi}
+              isPaused={planPaused || (!showStreamingUi && isPlanActive(plannerPlanView))}
+              onPause={handleStop}
+              onResume={() => void resumeActivePlan()}
+            />
           ) : (
             <div className="rounded-md border border-dashed border-[#2a2a36] bg-[#0e0e12] px-2.5 py-3 text-[10px] text-zinc-500 leading-relaxed">
               No active plan — pick a Planner option to lock steps and tasks here.
@@ -5006,17 +5228,12 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                   </div>
                 )}
 
-                {/* Swarm cards live in Node Work. Strip leftover verdict/review XML at
-                    render time — local models often emit <summary>/<notes> variants. */}
+                {/* Strip leftover planner/reviewer XML at render time (local models). */}
                 {(() => {
                   if (!msg.display) return null;
-                  const cleaned = stripStepVerdictMarkup(
-                    stripReviewDeltaMarkup(stripReviewPlanMarkup(msg.display))
-                  );
+                  if (msg.stepVerdict || msg.reviewPlan) return null;
+                  const cleaned = scrubStructuredMarkup(msg.display);
                   if (!cleaned) return null;
-                  // Structured cards already show notes — hide duplicate bubble text.
-                  if ((msg.stepVerdict || msg.reviewPlan) && cleaned.length < 8) return null;
-                  if (msg.stepVerdict) return null;
                   return <div className="whitespace-pre-wrap">{cleaned}</div>;
                 })()}
 
@@ -5125,8 +5342,10 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         {showStreamingUi && <ActivityIndicator label={activityLabel} />}
         {isPlanActive(plannerPlanView) && (
           <div className="mb-2 px-2 py-1.5 rounded-md bg-indigo-600/15 border border-indigo-500/30 text-[10px] text-indigo-100/90 leading-snug">
-            Talk to <span className="font-semibold">Planner</span> — Coder and Reviewer run as short-lived
-            workers with a cleared context for each step.
+            Talk to <span className="font-semibold">Planner</span> — use{' '}
+            <span className="font-semibold">Pause / Play</span> on the active step under Conductor
+            (or the red Stop next to Send). Closing the app also pauses; Play resumes with Auto-* as
+            checked.
           </div>
         )}
         {activeTab && (

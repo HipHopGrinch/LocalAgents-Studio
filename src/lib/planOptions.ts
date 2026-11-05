@@ -220,11 +220,22 @@ export function parseExecutionPlan(raw: string): ParsedExecutionPlan | null {
   return { summary, steps: steps.slice(0, 8) };
 }
 
+/** Remove execution_plan XML (closed, unclosed, and orphan step/task tags). */
 export function stripExecutionPlanMarkup(text: string): string {
   return (text || '')
-    .replace(/<execution_plan>[\s\S]*?<\/execution_plan>/gi, '')
+    .replace(/<execution_plan\b[^>]*>[\s\S]*?<\/execution_plan\s*>/gi, '')
+    .replace(/<execution_plan\b[^>]*>[\s\S]*$/gi, '')
+    .replace(/<\/?execution_plan\b[^>]*>/gi, '')
+    .replace(/<step\b[^>]*>[\s\S]*?<\/step\s*>/gi, '')
+    .replace(/<task\b[^>]*>[\s\S]*?<\/task\s*>/gi, '')
+    .replace(/<\/?(?:step|task|description|summary)\b[^>]*>/gi, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+/** True when the reply still has planner execution-plan XML leaking into the bubble. */
+export function hasExecutionPlanMarkup(text: string): boolean {
+  return /<\/?execution_plan\b/i.test(text || '') || /<\/?step\b[^>]*\bid\s*=/i.test(text || '');
 }
 
 /** Parse \`<step_verdict>\` Yay/Nay for a Planner step. */

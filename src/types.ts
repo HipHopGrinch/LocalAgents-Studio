@@ -198,6 +198,9 @@ export interface PlannerStep {
   reviewNote?: string;
 }
 
+/** Where Play should pick up after Pause / app close. */
+export type PlannerResumePhase = 'coder' | 'review' | 'verdict';
+
 export interface PlannerPlan {
   id: string;
   summary: string;
@@ -209,6 +212,11 @@ export interface PlannerPlan {
   /** Architecture option that produced this plan */
   chosenOptionId?: string;
   chosenOptionTitle?: string;
+  /**
+   * Checkpoint for seamless Play after Pause / app reopen.
+   * coder = implement (or finish tools); review = Reviewer Yay/Nay; verdict = apply pending Yay/Nay.
+   */
+  resumePhase?: PlannerResumePhase;
 }
 
 /** One agent chat thread (Cursor/VS Code-style conversation). */

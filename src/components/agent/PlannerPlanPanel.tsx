@@ -1,13 +1,25 @@
 import React from 'react';
-import { ListChecks } from 'lucide-react';
+import { ListChecks, Pause, Play } from 'lucide-react';
 import { PlannerPlan } from '../../types';
 
 export interface PlannerPlanPanelProps {
   plan: PlannerPlan;
+  /** True while a worker turn is streaming. */
+  isBusy?: boolean;
+  /** True after Stop / app reopen while the plan is still active. */
+  isPaused?: boolean;
+  onPause?: () => void;
+  onResume?: () => void;
 }
 
 /** Durable plan panel — steps + task status (fills tall orchestration column). */
-export const PlannerPlanPanel: React.FC<PlannerPlanPanelProps> = ({ plan }) => {
+export const PlannerPlanPanel: React.FC<PlannerPlanPanelProps> = ({
+  plan,
+  isBusy = false,
+  isPaused = false,
+  onPause,
+  onResume
+}) => {
   if (!plan.steps.length) return null;
   return (
     <div className="flex flex-col min-h-0 flex-1 rounded-md border border-[#2a2a36] bg-[#121215] px-2.5 py-2">
@@ -29,6 +41,7 @@ export const PlannerPlanPanel: React.FC<PlannerPlanPanelProps> = ({ plan }) => {
                   : 'text-zinc-500';
           const reviewClass =
             step.status === 'failed' ? 'text-rose-300/90' : 'text-sky-300/90';
+          const showControls = active && plan.status === 'active' && (onPause || onResume);
           return (
             <li
               key={step.id}
@@ -38,18 +51,58 @@ export const PlannerPlanPanel: React.FC<PlannerPlanPanelProps> = ({ plan }) => {
                   : 'border-[#2a2a36] bg-[#0e0e12]'
               }`}
             >
-              <div className="flex items-center gap-1.5 flex-wrap text-[11px]">
-                <span className={`font-mono text-[9px] uppercase ${statusClass}`}>
-                  {step.status.replace('_', ' ')}
-                </span>
-                <span className="font-semibold text-zinc-100">
-                  Step {step.id}: {step.title}
-                </span>
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5 flex-wrap text-[11px]">
+                    <span className={`font-mono text-[9px] uppercase ${statusClass}`}>
+                      {isPaused && active ? 'paused' : step.status.replace('_', ' ')}
+                    </span>
+                    <span className="font-semibold text-zinc-100">
+                      Step {step.id}: {step.title}
+                    </span>
+                  </div>
+                </div>
+                {showControls && (
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      type="button"
+                      onClick={onPause}
+                      disabled={!isBusy}
+                      title="Pause this step (same as the red Stop by Send)"
+                      className={`p-1 rounded border transition ${
+                        isBusy
+                          ? 'border-rose-500/50 bg-rose-600/25 text-rose-200 hover:bg-rose-600/40'
+                          : 'border-[#2a2a36] text-zinc-600 cursor-default opacity-50'
+                      }`}
+                    >
+                      <Pause className="w-3 h-3" fill="currentColor" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={onResume}
+                      disabled={isBusy}
+                      title="Resume this step — Auto-apply / Auto-review / Swarm stay as checked"
+                      className={`p-1 rounded border transition ${
+                        isBusy
+                          ? 'border-[#2a2a36] text-zinc-600 cursor-default opacity-50'
+                          : 'border-emerald-500/50 bg-emerald-600/25 text-emerald-200 hover:bg-emerald-600/40'
+                      }`}
+                    >
+                      <Play className="w-3 h-3" fill="currentColor" />
+                    </button>
+                  </div>
+                )}
               </div>
               <ul className="mt-1 space-y-0.5">
                 {step.tasks.map(t => {
                   const mark =
-                    t.status === 'completed' ? '✓' : t.status === 'failed' ? '!' : t.status === 'in_progress' ? '›' : '·';
+                    t.status === 'completed'
+                      ? '✓'
+                      : t.status === 'failed'
+                        ? '!'
+                        : t.status === 'in_progress'
+                          ? '›'
+                          : '·';
                   return (
                     <li key={t.id} className="text-[10px] text-zinc-400 font-mono truncate">
                       {mark} #{t.id} {t.title}

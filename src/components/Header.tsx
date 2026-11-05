@@ -29,6 +29,10 @@ interface HeaderProps {
   onOpenHardwareModal: () => void;
   localTokens: number;
   frontierTokens: number;
+  tokenStatsScope?: 'global' | 'project';
+  onTokenStatsScopeChange?: (scope: 'global' | 'project') => void;
+  /** False when no workspace is open — Project scope still toggleable but shows zeros. */
+  hasProject?: boolean;
   uiScale: number;
   onUpdateUiScale: (scale: number) => void;
   appVersion?: string;
@@ -49,6 +53,9 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenHardwareModal,
   localTokens,
   frontierTokens,
+  tokenStatsScope = 'global',
+  onTokenStatsScopeChange,
+  hasProject = false,
   uiScale,
   onUpdateUiScale,
   appVersion,
@@ -217,6 +224,49 @@ export const Header: React.FC<HeaderProps> = ({
               className="flex flex-wrap items-center gap-x-2 gap-y-0.5 bg-[#18181d] border border-[#272732] px-2.5 py-1 rounded-xl text-[11px] cursor-pointer hover:border-zinc-600 transition min-w-0 max-w-max"
               title="Click to view token statistics & savings"
             >
+              {onTokenStatsScopeChange && (
+                <div
+                  role="group"
+                  aria-label="Token stats scope"
+                  className="flex items-center rounded-md border border-[#30303a] bg-[#121215] p-0.5 shrink-0"
+                  onClick={e => e.stopPropagation()}
+                >
+                  <button
+                    type="button"
+                    onClick={e => {
+                      e.stopPropagation();
+                      onTokenStatsScopeChange('global');
+                    }}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition ${
+                      tokenStatsScope === 'global'
+                        ? 'bg-zinc-700 text-zinc-100'
+                        : 'text-zinc-500 hover:text-zinc-300'
+                    }`}
+                    title="Lifetime totals"
+                  >
+                    Global
+                  </button>
+                  <button
+                    type="button"
+                    onClick={e => {
+                      e.stopPropagation();
+                      onTokenStatsScopeChange('project');
+                    }}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition ${
+                      tokenStatsScope === 'project'
+                        ? 'bg-zinc-700 text-zinc-100'
+                        : 'text-zinc-500 hover:text-zinc-300'
+                    }`}
+                    title={
+                      hasProject
+                        ? 'Current project totals'
+                        : 'Open a project to track per-project tokens'
+                    }
+                  >
+                    Project
+                  </button>
+                </div>
+              )}
               <div className="flex items-center space-x-1 text-emerald-400 font-mono shrink-0">
                 <Zap className="w-3 h-3" />
                 <span>Local: {localTokens.toLocaleString()} tok</span>

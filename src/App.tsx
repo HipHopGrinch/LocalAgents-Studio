@@ -1127,10 +1127,57 @@ export const App: React.FC = () => {
   };
 
   const handleRecordTokens = (localCount: number, frontierCount: number) => {
-    updateSettings({
-      localTokensGenerated: (settings.localTokensGenerated || 0) + localCount,
-      frontierTokensUsed: (settings.frontierTokensUsed || 0) + frontierCount
+    setSettings(prev => {
+      const usage = { ...(prev.workspaceTokenUsage || {}) };
+      const key = normalizeWorkspacePath(workspacePath);
+      if (key) {
+        const cur = usage[key] || { localTokensGenerated: 0, frontierTokensUsed: 0 };
+        usage[key] = {
+          localTokensGenerated: (cur.localTokensGenerated || 0) + localCount,
+          frontierTokensUsed: (cur.frontierTokensUsed || 0) + frontierCount
+        };
+      }
+      const next: AppSettings = {
+        ...prev,
+        localTokensGenerated: (prev.localTokensGenerated || 0) + localCount,
+        frontierTokensUsed: (prev.frontierTokensUsed || 0) + frontierCount,
+        workspaceTokenUsage: usage
+      };
+      window.electronAPI?.saveSettings(next);
+      return next;
     });
+  };
+
+  const tokenStatsScope = settings.tokenStatsScope === 'project' ? 'project' : 'global';
+  const projectTokenKey = normalizeWorkspacePath(workspacePath);
+  const projectTokens = projectTokenKey
+    ? settings.workspaceTokenUsage?.[projectTokenKey]
+    : undefined;
+  const displayLocalTokens =
+    tokenStatsScope === 'project'
+      ? projectTokens?.localTokensGenerated || 0
+      : settings.localTokensGenerated || 0;
+  const displayFrontierTokens =
+    tokenStatsScope === 'project'
+      ? projectTokens?.frontierTokensUsed || 0
+      : settings.frontierTokensUsed || 0;
+
+  const handleTokenStatsScopeChange = (scope: 'global' | 'project') => {
+    updateSettings({ tokenStatsScope: scope });
+  };
+
+  const handleResetTokenStats = () => {
+    if (tokenStatsScope === 'project') {
+      if (!projectTokenKey) return;
+      const label = workspacePath.split(/[\\/]/).filter(Boolean).pop() || 'this project';
+      if (!window.confirm(`Reset token stats for ${label}?`)) return;
+      const usage = { ...(settings.workspaceTokenUsage || {}) };
+      delete usage[projectTokenKey];
+      updateSettings({ workspaceTokenUsage: usage });
+      return;
+    }
+    if (!window.confirm('Reset global token stats?')) return;
+    updateSettings({ localTokensGenerated: 0, frontierTokensUsed: 0 });
   };
 
   const handleAgentBusyChange = useCallback((busy: boolean) => {
@@ -1222,8 +1269,11 @@ export const App: React.FC = () => {
             if (isNarrow) setMobilePane('term');
           }}
           onOpenHardwareModal={() => setIsHardwareModalOpen(true)}
-          localTokens={settings.localTokensGenerated || 0}
-          frontierTokens={settings.frontierTokensUsed || 0}
+          localTokens={displayLocalTokens}
+          frontierTokens={displayFrontierTokens}
+          tokenStatsScope={tokenStatsScope}
+          onTokenStatsScopeChange={handleTokenStatsScopeChange}
+          hasProject={!!projectTokenKey}
           uiScale={uiScale}
           onUpdateUiScale={handleUpdateUiScale}
           appVersion={appVersion}
@@ -1355,8 +1405,15 @@ export const App: React.FC = () => {
         onRefreshNodes={refreshNodes}
         estimateContext={settings.estimateContext || 16384}
         onUpdateEstimateContext={ctx => updateSettings({ estimateContext: ctx })}
-        localTokens={settings.localTokensGenerated || 0}
-        frontierTokens={settings.frontierTokensUsed || 0}
+        localTokens={displayLocalTokens}
+        frontierTokens={displayFrontierTokens}
+        tokenStatsScope={tokenStatsScope}
+        onTokenStatsScopeChange={handleTokenStatsScopeChange}
+        onResetTokenStats={handleResetTokenStats}
+        hasProject={!!projectTokenKey}
+        projectLabel={
+          workspacePath.split(/[\\/]/).filter(Boolean).pop() || undefined
+        }
         uiScale={uiScale}
         onUpdateUiScale={handleUpdateUiScale}
         searxngUrl={settings.searxngUrl || ''}

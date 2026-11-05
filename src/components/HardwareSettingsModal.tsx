@@ -45,6 +45,11 @@ interface HardwareSettingsModalProps {
   onUpdateEstimateContext: (ctx: number) => void;
   localTokens: number;
   frontierTokens: number;
+  tokenStatsScope?: 'global' | 'project';
+  onTokenStatsScopeChange?: (scope: 'global' | 'project') => void;
+  onResetTokenStats?: () => void;
+  hasProject?: boolean;
+  projectLabel?: string;
   uiScale: number;
   onUpdateUiScale: (scale: number) => void;
   searxngUrl: string;
@@ -63,6 +68,11 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   onUpdateEstimateContext,
   localTokens,
   frontierTokens,
+  tokenStatsScope = 'global',
+  onTokenStatsScopeChange,
+  onResetTokenStats,
+  hasProject = false,
+  projectLabel,
   uiScale,
   onUpdateUiScale,
   searxngUrl,
@@ -1803,11 +1813,70 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
               </div>
             </div>
 
-            <div>
-              <h3 className="text-sm font-bold text-zinc-100">Local Agent Token Economy</h3>
-              <p className="text-xs text-zinc-400 mt-1">
-                LocalAgents runs heavy agent loops on your local Ollama GPUs without API charges.
-              </p>
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0">
+                <h3 className="text-sm font-bold text-zinc-100">Local Agent Token Economy</h3>
+                <p className="text-xs text-zinc-400 mt-1">
+                  LocalAgents runs heavy agent loops on your local Ollama GPUs without API charges.
+                  {tokenStatsScope === 'project' && projectLabel
+                    ? ` Showing project “${projectLabel}”.`
+                    : tokenStatsScope === 'project'
+                      ? ' Open a project to track per-project tokens.'
+                      : ' Showing lifetime (global) totals.'}
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                {onTokenStatsScopeChange && (
+                  <div
+                    role="group"
+                    aria-label="Token stats scope"
+                    className="flex items-center rounded-lg border border-[#30303a] bg-[#121215] p-0.5"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => onTokenStatsScopeChange('global')}
+                      className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition ${
+                        tokenStatsScope === 'global'
+                          ? 'bg-zinc-700 text-zinc-100'
+                          : 'text-zinc-500 hover:text-zinc-300'
+                      }`}
+                    >
+                      Global
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onTokenStatsScopeChange('project')}
+                      className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition ${
+                        tokenStatsScope === 'project'
+                          ? 'bg-zinc-700 text-zinc-100'
+                          : 'text-zinc-500 hover:text-zinc-300'
+                      }`}
+                      title={
+                        hasProject
+                          ? 'Current project totals'
+                          : 'Open a project to track per-project tokens'
+                      }
+                    >
+                      Project
+                    </button>
+                  </div>
+                )}
+                {onResetTokenStats && (
+                  <button
+                    type="button"
+                    onClick={onResetTokenStats}
+                    disabled={tokenStatsScope === 'project' && !hasProject}
+                    className="inline-flex items-center px-2.5 py-1 text-[11px] font-medium text-zinc-300 bg-[#1c1c22] hover:bg-[#272730] disabled:opacity-40 disabled:cursor-not-allowed border border-[#30303a] rounded-md transition"
+                    title={
+                      tokenStatsScope === 'project'
+                        ? 'Reset token stats for this project'
+                        : 'Reset lifetime global token stats'
+                    }
+                  >
+                    Reset
+                  </button>
+                )}
+              </div>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">

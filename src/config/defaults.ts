@@ -132,6 +132,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   estimateContext: 16384,
   localTokensGenerated: 0,
   frontierTokensUsed: 0,
+  tokenStatsScope: 'global',
+  workspaceTokenUsage: {},
   explorerWidth: 240,
   chatWidth: 640,
   agentControlWidth: 270,

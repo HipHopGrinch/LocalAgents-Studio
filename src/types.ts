@@ -254,6 +254,13 @@ export interface AppSettings {
   estimateContext: number; // context length used for VRAM estimates in Model Hub
   localTokensGenerated: number;
   frontierTokensUsed: number;
+  /** Header/settings token chip: lifetime totals vs current project. */
+  tokenStatsScope?: 'global' | 'project';
+  /** Per-workspace token counters (key = normalizeWorkspacePath). */
+  workspaceTokenUsage?: Record<
+    string,
+    { localTokensGenerated: number; frontierTokensUsed: number }
+  >;
   explorerWidth?: number;
   /** Outer Agent Conductor pane (conversation + orchestration columns) */
   chatWidth?: number;

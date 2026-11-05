@@ -597,12 +597,17 @@ export const App: React.FC = () => {
         const fromSettings = conversationsForWorkspace(prev.conversations, workspacePath);
         let forWs = fromDisk.length ? fromDisk : fromSettings;
         let active = loaded.activeConversationId || undefined;
-        if (wantNewChat || !forWs.some(c => c.id === active)) {
-          if (wantNewChat || !forWs.length) {
+        if (wantNewChat) {
+          // Same as New Chat: discard every prior thread for this project.
+          const fresh = createConversation(workspacePath, selectedAgentId);
+          forWs = [fresh];
+          active = fresh.id;
+        } else if (!forWs.some(c => c.id === active)) {
+          if (!forWs.length) {
             const fresh = createConversation(workspacePath, selectedAgentId);
-            forWs = [fresh, ...forWs.filter(c => c.id !== fresh.id)];
+            forWs = [fresh];
             active = fresh.id;
-          } else if (!forWs.some(c => c.id === active)) {
+          } else {
             active = forWs[0].id;
           }
         }
@@ -758,20 +763,24 @@ export const App: React.FC = () => {
     openWorkspace(chosen);
   };
 
+  /** New Chat wipes all prior threads for this project — one blank conversation only. */
   const handleNewChat = () => {
     const fresh = createConversation(workspacePath, selectedAgentId);
     setActiveConversationId(fresh.id);
     setSettings(prev => {
+      const conversations = replaceWorkspaceConversations(prev.conversations, workspacePath, [
+        fresh
+      ]);
       const next = {
         ...prev,
-        conversations: upsertConversation(prev.conversations, fresh),
+        conversations,
         activeConversationId: fresh.id
       };
       if (window.electronAPI) {
         window.electronAPI.saveSettings(next);
         if (workspacePath) {
           window.electronAPI.saveProjectChats(workspacePath, {
-            conversations: conversationsForWorkspace(next.conversations, workspacePath),
+            conversations: [fresh],
             activeConversationId: fresh.id
           });
           markChatsSaved();

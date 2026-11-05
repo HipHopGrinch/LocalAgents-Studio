@@ -196,6 +196,8 @@ export interface PlannerStep {
   tasks: PlannerTask[];
   /** Last Nay notes from Reviewer for this step */
   reviewNote?: string;
+  /** Durable Auto-review Nay rework count for this step (survives app reopen). */
+  reworkCount?: number;
 }
 
 /** Where Play should pick up after Pause / app close. */

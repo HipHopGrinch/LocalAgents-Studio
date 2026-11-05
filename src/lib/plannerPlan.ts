@@ -137,6 +137,9 @@ export interface StepVerdict {
   notes: string;
 }
 
+/** Auto Coder↔Reviewer reworks per step before Planner escalation. */
+export const MAX_STEP_REWORKS = 2;
+
 /** Apply Reviewer Yay/Nay to the active (or named) step. */
 export function applyStepVerdict(plan: PlannerPlan, verdict: StepVerdict): PlannerPlan {
   const stepId = verdict.stepId || plan.activeStepId || '';
@@ -151,6 +154,7 @@ export function applyStepVerdict(plan: PlannerPlan, verdict: StepVerdict): Plann
               ...s,
               status: 'completed' as PlannerStepStatus,
               reviewNote: verdict.notes || undefined,
+              reworkCount: 0,
               tasks: s.tasks.map(t => ({
                 ...t,
                 status: 'completed' as ExecutionTaskStatus,
@@ -165,6 +169,7 @@ export function applyStepVerdict(plan: PlannerPlan, verdict: StepVerdict): Plann
   }
 
   // Nay — reopen step with notes; tasks go back to pending/failed for rework
+  const nextRework = (step.reworkCount || 0) + 1;
   return touch(plan, {
     status: 'active',
     activeStepId: step.id,
@@ -174,6 +179,7 @@ export function applyStepVerdict(plan: PlannerPlan, verdict: StepVerdict): Plann
             ...s,
             status: 'failed' as PlannerStepStatus,
             reviewNote: verdict.notes || 'Reviewer requested fixes.',
+            reworkCount: nextRework,
             tasks: s.tasks.map(t => ({
               ...t,
               status: 'failed' as ExecutionTaskStatus,
@@ -284,7 +290,7 @@ Verify ONLY this step against the files just written. End with:
 <result>yay</result>
 <notes>why it passes (or what fails)</notes>
 </step_verdict>
-Use result nay if the step is incomplete or wrong. Do NOT emit a new <execution_plan> or <review_plan>.`;
+Use result nay only for a concrete missing/broken behavior (name the file and issue). Do NOT nay for "needs verification", vague fragility, or empty notes. Do NOT emit a new <execution_plan> or <review_plan>.`;
 }
 
 export function createPlanFromParsed(
@@ -328,6 +334,120 @@ export function createPlanFromParsed(
     ...(opts?.chosenOptionId ? { chosenOptionId: opts.chosenOptionId } : {}),
     ...(opts?.chosenOptionTitle ? { chosenOptionTitle: opts.chosenOptionTitle } : {})
   };
+}
+
+export type IncomingFixSteps = {
+  summary?: string;
+  steps: Array<{
+    id: string;
+    title: string;
+    description?: string;
+    tasks: Array<{ id: string; title: string; description: string; file?: string }>;
+  }>;
+};
+
+/**
+ * After Nay rework cap: mark the stuck step completed (superseded), insert Planner
+ * fix steps immediately after it, and leave later pending steps untouched.
+ */
+export function insertFixStepsAfter(
+  plan: PlannerPlan,
+  afterStepId: string,
+  incoming: IncomingFixSteps,
+  opts?: { reworkNays?: number }
+): PlannerPlan {
+  const afterIdx = plan.steps.findIndex(s => String(s.id) === String(afterStepId));
+  if (afterIdx < 0 || !incoming.steps.length) return plan;
+
+  const usedStepIds = new Set(plan.steps.map(s => String(s.id)));
+  const usedTaskIds = new Set(plan.steps.flatMap(s => s.tasks.map(t => String(t.id))));
+
+  const remapStepId = (raw: string, index: number): string => {
+    let id = String(raw || `fix-${index + 1}`);
+    if (!usedStepIds.has(id)) {
+      usedStepIds.add(id);
+      return id;
+    }
+    let n = plan.steps.length + index + 1;
+    while (usedStepIds.has(String(n))) n += 1;
+    id = String(n);
+    usedStepIds.add(id);
+    return id;
+  };
+
+  const remapTaskId = (raw: string, stepId: string, tIndex: number): string => {
+    let id = String(raw || `${stepId}${String.fromCharCode(97 + tIndex)}`);
+    if (!usedTaskIds.has(id)) {
+      usedTaskIds.add(id);
+      return id;
+    }
+    let n = 1;
+    while (usedTaskIds.has(`${stepId}-${n}`)) n += 1;
+    id = `${stepId}-${n}`;
+    usedTaskIds.add(id);
+    return id;
+  };
+
+  const nays = opts?.reworkNays ?? plan.steps[afterIdx]?.reworkCount ?? 0;
+  const priorNote = plan.steps[afterIdx]?.reviewNote;
+  const escalateNote = [
+    `Escalated to Planner fix steps after ${nays} Nays.`,
+    priorNote ? `Last Nay: ${priorNote.slice(0, 400)}` : ''
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  const newSteps: PlannerStep[] = incoming.steps.map((s, i) => {
+    const stepId = remapStepId(s.id, i);
+    return {
+      id: stepId,
+      title: s.title,
+      ...(s.description ? { description: s.description } : {}),
+      status: (i === 0 ? 'in_progress' : 'pending') as PlannerStepStatus,
+      reworkCount: 0,
+      tasks: s.tasks.map((t, ti) => ({
+        id: remapTaskId(t.id, stepId, ti),
+        title: t.title,
+        description: t.description,
+        ...(t.file ? { file: t.file } : {}),
+        status: 'pending' as ExecutionTaskStatus
+      }))
+    };
+  });
+
+  const steps: PlannerStep[] = [];
+  for (let i = 0; i < plan.steps.length; i++) {
+    const s = plan.steps[i];
+    if (i === afterIdx) {
+      steps.push({
+        ...s,
+        status: 'completed' as PlannerStepStatus,
+        reviewNote: escalateNote,
+        tasks: s.tasks.map(t => ({
+          ...t,
+          status: 'completed' as ExecutionTaskStatus,
+          failureNote: undefined
+        }))
+      });
+      steps.push(...newSteps);
+    } else {
+      steps.push(s);
+    }
+  }
+
+  const firstNew = newSteps[0];
+  const summary =
+    incoming.summary && incoming.summary !== plan.summary
+      ? `${plan.summary} · ${incoming.summary}`
+      : plan.summary;
+
+  return touch(plan, {
+    summary,
+    status: 'active' as PlannerPlanStatus,
+    steps,
+    activeStepId: firstNew?.id ?? null,
+    resumePhase: 'coder'
+  });
 }
 
 /**

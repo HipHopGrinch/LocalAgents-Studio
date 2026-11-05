@@ -152,6 +152,7 @@ import {
   extractFixContractBrief,
   formatReviewPlanForCoder,
   formatReviewPlanForPlanner,
+  formatReworkEscalationForPlanner,
   matchPlanOption,
   parseExecutionPlan,
   parsePlanOptions,
@@ -191,12 +192,15 @@ import {
   applyStepVerdict,
   collectStepFilePaths,
   createPlanFromParsed,
+  formatPlanForPanel,
   formatStepForCoders,
   formatStepForReviewer,
   getActiveStep,
+  insertFixStepsAfter,
   isPlanActive,
   markAllStepTasks,
   markStepInProgress,
+  MAX_STEP_REWORKS,
   parsePlannerPlanJson,
   plannerPlanFromReviewQueue,
   plannerPlanPath,
@@ -397,9 +401,18 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     syncNodeWork(next);
   };
 
+  const syncReworkCountsFromPlan = (plan: PlannerPlan | null | undefined) => {
+    const seeded: Record<string, number> = {};
+    for (const s of plan?.steps || []) {
+      if (s.reworkCount) seeded[String(s.id)] = s.reworkCount;
+    }
+    stepReworkCountRef.current = seeded;
+  };
+
   const commitPlannerPlan = (next: PlannerPlan | null) => {
     plannerPlanRef.current = next;
     setPlannerPlanView(next);
+    syncReworkCountsFromPlan(next);
     onConversationPatch?.({ plannerPlan: next });
     const id = conversationIdRef.current;
     if (!workspacePath || !id || !window.electronAPI?.writeFile) return;
@@ -508,7 +521,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       executionQueueRef.current = conversation?.executionQueue ?? null;
       plannerPlanRef.current = conversation?.plannerPlan ?? null;
       setPlannerPlanView(conversation?.plannerPlan ?? null);
-      stepReworkCountRef.current = {};
+      // Durable rework counts live on each step — seed the in-memory cache.
+      const seeded: Record<string, number> = {};
+      for (const s of conversation?.plannerPlan?.steps || []) {
+        if (s.reworkCount) seeded[String(s.id)] = s.reworkCount;
+      }
+      stepReworkCountRef.current = seeded;
       syncNodeWork([]);
       setPlanPaused(isPlanActive(conversation?.plannerPlan));
       setExecutingPlanNotice(null);
@@ -526,6 +544,11 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           if (fromDisk && (!conversation?.plannerPlan || fromDisk.updatedAt >= (conversation.plannerPlan.updatedAt || 0))) {
             plannerPlanRef.current = fromDisk;
             setPlannerPlanView(fromDisk);
+            const seeded: Record<string, number> = {};
+            for (const s of fromDisk.steps || []) {
+              if (s.reworkCount) seeded[String(s.id)] = s.reworkCount;
+            }
+            stepReworkCountRef.current = seeded;
             onConversationPatch?.({ plannerPlan: fromDisk });
           }
         });
@@ -4018,7 +4041,148 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     restorePlannerControl();
   };
 
-  /** Apply Yay/Nay to durable plan, then next step or rework. */
+  /** Collect distinct Reviewer Nay notes for a step from chat history. */
+  const collectStepNayNotes = (stepId: string): string[] => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const m of messagesRef.current) {
+      const v = m.stepVerdict;
+      if (!v || v.result !== 'nay') continue;
+      if (v.stepId && String(v.stepId) !== String(stepId)) continue;
+      const note = (v.notes || '').replace(/\s+/g, ' ').trim();
+      if (!note || note.toLowerCase() === 'nay') continue;
+      const key = note.slice(0, 160).toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(note.slice(0, 600));
+    }
+    return out;
+  };
+
+  /** Durable step.reworkCount, plus chat history for plans saved before reworkCount existed. */
+  const effectiveStepReworkCount = (
+    stepId: string,
+    stepRework?: number
+  ): number => {
+    const fromChat = messagesRef.current.filter(
+      m =>
+        m.stepVerdict?.result === 'nay' &&
+        (!m.stepVerdict.stepId || String(m.stepVerdict.stepId) === String(stepId))
+    ).length;
+    return Math.max(
+      stepRework || 0,
+      stepReworkCountRef.current[String(stepId)] || 0,
+      fromChat
+    );
+  };
+
+  /**
+   * After Nay rework cap: Planner appends focused fix steps, then Coder continues.
+   * Preserves later pending steps (does not use appendPlannerPlan).
+   */
+  const escalateStepToPlannerFixes = async (stepId: string): Promise<void> => {
+    if (stopRequestedRef.current) return;
+    let plan = plannerPlanRef.current;
+    if (!plan) return;
+    const stuck =
+      plan.steps.find(s => String(s.id) === String(stepId)) || getActiveStep(plan);
+    if (!stuck) {
+      restorePlannerControl(`No step #${stepId} to escalate.`);
+      return;
+    }
+
+    const nayNotes = collectStepNayNotes(String(stuck.id));
+    if (stuck.reviewNote) {
+      const last = stuck.reviewNote.replace(/\s+/g, ' ').trim();
+      if (last && !nayNotes.some(n => n.slice(0, 80) === last.slice(0, 80))) {
+        nayNotes.unshift(last.slice(0, 600));
+      }
+    }
+    const reworkCount = effectiveStepReworkCount(String(stuck.id), stuck.reworkCount);
+
+    setPlanPaused(false);
+    setExecutingPlanNotice(
+      `Step #${stuck.id} hit ${reworkCount} Nays — Planner appending fix steps…`
+    );
+
+    const prompt = formatReworkEscalationForPlanner({
+      planPanel: formatPlanForPanel(plan),
+      stepId: String(stuck.id),
+      stepTitle: stuck.title,
+      stepDescription: stuck.description,
+      reworkCount,
+      nayNotes
+    });
+
+    ephemeralWorkerRef.current = true;
+    onSelectAgent(plannerAgent.id);
+    onConversationPatch?.({ agentId: plannerAgent.id });
+
+    const lockMsg = await runSingleNodeTurn({
+      userText: `Escalate step #${stuck.id} — append fix steps`,
+      fullPrompt: prompt,
+      agent: plannerAgent,
+      lockPlanMode: true,
+      skipUserAppend: true,
+      notice: `Planner escalating step #${stuck.id} after ${reworkCount} Nays`,
+      freshContext: true
+    });
+
+    if (stopRequestedRef.current) {
+      setPlanPaused(true);
+      setPlanResumePhase('coder');
+      restorePlannerControl(
+        `Paused during Planner escalation on step #${stuck.id} — press Play to resume.`
+      );
+      return;
+    }
+
+    const raw = lockMsg?.raw || '';
+    let parsed = parseExecutionPlan(raw);
+    if (!parsed?.steps.length) {
+      const focus =
+        nayNotes[0]?.slice(0, 200) ||
+        stuck.reviewNote?.slice(0, 200) ||
+        stuck.title;
+      parsed = {
+        summary: `Fixes for step #${stuck.id}`,
+        steps: [
+          {
+            id: `fix-${stuck.id}`,
+            title: `Fix: ${stuck.title}`,
+            description: focus,
+            tasks: [
+              {
+                id: `fix-${stuck.id}a`,
+                title: `Address Reviewer Nays on step #${stuck.id}`,
+                description: nayNotes.join('\n\n').slice(0, 1500) || focus
+              }
+            ]
+          }
+        ]
+      };
+    }
+
+    plan = plannerPlanRef.current;
+    if (!plan) return;
+    plan = insertFixStepsAfter(
+      plan,
+      String(stuck.id),
+      { summary: parsed.summary, steps: parsed.steps },
+      { reworkNays: reworkCount }
+    );
+    commitPlannerPlan(plan);
+
+    const next = getActiveStep(plan);
+    setExecutingPlanNotice(
+      next
+        ? `Planner appended fix steps — starting #${next.id}: ${next.title}…`
+        : 'Planner appended fix steps — continuing…'
+    );
+    await dispatchActiveStep();
+  };
+
+  /** Apply Yay/Nay to durable plan, then next step or rework / escalate. */
   const applyStepVerdictAndContinue = async (
     verdictMsg: ChatMessage | null,
     packed?: { stepId: string; stepTitle: string; result: 'yay' | 'nay'; notes: string }
@@ -4058,14 +4222,10 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
 
     if (v.result === 'nay') {
       const sid = String(v.stepId || '');
-      const prior = stepReworkCountRef.current[sid] || 0;
-      const nextCount = prior + 1;
-      stepReworkCountRef.current[sid] = nextCount;
-      const MAX_STEP_REWORKS = 2;
+      const stuck = plan.steps.find(s => String(s.id) === sid);
+      const nextCount = effectiveStepReworkCount(sid, stuck?.reworkCount);
       if (nextCount > MAX_STEP_REWORKS) {
-        restorePlannerControl(
-          `Step #${sid} failed review ${nextCount} times — talk to Planner (or fix Auto-review) before another Coder pass.`
-        );
+        await escalateStepToPlannerFixes(sid);
         return;
       }
       setExecutingPlanNotice(
@@ -4075,8 +4235,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       return;
     }
 
-    // Yay — clear rework counter for this step, then next
-    if (v.stepId) delete stepReworkCountRef.current[String(v.stepId)];
+    // Yay — reworkCount cleared on the plan via applyStepVerdict
     const next = getActiveStep(plan);
     if (next) {
       setExecutingPlanNotice(`Step Yay — starting step #${next.id}: ${next.title}`);
@@ -4522,6 +4681,16 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         return;
       }
       phase = 'review';
+    }
+
+    // Already past the Nay rework cap — Play escalates to Planner instead of another Review.
+    if (
+      step &&
+      step.status === 'failed' &&
+      effectiveStepReworkCount(String(step.id), step.reworkCount) > MAX_STEP_REWORKS
+    ) {
+      await escalateStepToPlannerFixes(String(step.id));
+      return;
     }
 
     if (phase === 'review') {

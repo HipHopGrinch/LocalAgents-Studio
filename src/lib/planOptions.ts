@@ -139,10 +139,11 @@ OR
 
 <step_verdict step_id="1">
 <result>nay</result>
-<notes>What is wrong and how Coders should fix THIS step.</notes>
+<notes>Concrete failure: file path + what is missing or broken + how to fix THIS step.</notes>
 </step_verdict>
 
-yay = step tasks are done correctly. nay = send fix notes to Planner/Coders for the same step.`;
+yay = step tasks are done correctly in the files shown.
+nay = only when you can name a concrete missing/broken behavior (file + issue). Do NOT nay for "needs verification", "looks fragile", "assumed complete", or empty notes. If unsure after the allowed reads, yay with caveats in notes — do not invent failures.`;
 
 export interface ParsedExecutionPlan {
   summary: string;
@@ -425,6 +426,42 @@ export function stripReviewPlanMarkup(text: string): string {
     .replace(/<review_plan>[\s\S]*?<\/review_plan>/gi, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+/** Prompt for Planner when a step hits the Nay rework cap — append focused fix steps. */
+export function formatReworkEscalationForPlanner(opts: {
+  planPanel: string;
+  stepId: string;
+  stepTitle: string;
+  stepDescription?: string;
+  reworkCount: number;
+  nayNotes: string[];
+}): string {
+  const history = opts.nayNotes
+    .map((n, i) => `${i + 1}. ${n.replace(/\s+/g, ' ').trim().slice(0, 500)}`)
+    .filter(n => n.length > 3)
+    .join('\n');
+  return `## REWORK ESCALATION (append fix steps — do not restart the whole plan)
+
+A durable plan is already locked. Step #${opts.stepId} ("${opts.stepTitle}") failed Reviewer Yay/Nay ${opts.reworkCount} times with **different** issues. Blind Coder reworks of the same step are capped.
+
+### Current Conductor plan
+${opts.planPanel}
+
+### Stuck step
+#${opts.stepId}: ${opts.stepTitle}
+${opts.stepDescription ? `${opts.stepDescription}\n` : ''}
+### Distinct Nay notes (address these)
+${history || '(no detailed notes — inspect the stuck step tasks and files)'}
+
+### Your job
+Emit a small <execution_plan> with **1–3 new fix steps** that knock out those Nays.
+- Each step needs concrete coder <task> items with file= when known.
+- Do NOT restate completed steps. Do NOT emit <plan_options>. Do NOT implement code yourself.
+- Later pending product steps stay in the Conductor list; you only add the fix packet.
+- Prefer surgical edits (e.g. finish movePiece validation, wire input → state → redraw) over rewriting the app.
+
+End with <execution_plan> only.`;
 }
 
 /** Prompt for Planner after Send to Planner / Auto-review. */

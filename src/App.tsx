@@ -115,6 +115,8 @@ export const App: React.FC = () => {
   const loadedWorkspaceRef = useRef('');
   const forceNewChatRef = useRef(false);
   const [workspaceEpoch, setWorkspaceEpoch] = useState(0);
+  const [canInstallDeps, setCanInstallDeps] = useState(false);
+  const [installingDeps, setInstallingDeps] = useState(false);
 
   // Modals & Drawers
   const [isTerminalOpen, setIsTerminalOpen] = useState(false);
@@ -1016,10 +1018,17 @@ export const App: React.FC = () => {
   const handleApplyFileWrite = async (filePath: string, content: string): Promise<boolean> => {
     if (!window.electronAPI || !workspacePath) return false;
 
+    const rel = clampWritePath(workspacePath, filePath);
+    let writeContent = content;
+    if (/(^|[/\\])package\.json$/i.test(rel.replace(/\\/g, '/'))) {
+      const { sanitizePackageJsonContent } = await import('./lib/npmDeps');
+      writeContent = sanitizePackageJsonContent(content).content;
+    }
+
     // Prefer scoped agent write so paths cannot escape the open workspace
     const scoped = await window.electronAPI.execTool(workspacePath, 'write_file', {
-      path: clampWritePath(workspacePath, filePath),
-      content
+      path: rel,
+      content: writeContent
     });
     if (scoped.error) {
       console.error('Scoped write failed:', scoped.error);
@@ -1028,19 +1037,27 @@ export const App: React.FC = () => {
 
     const absolutePath = scoped.path || (filePath.includes(':') ? filePath : `${workspacePath}\\${filePath.replace(/^[\\/]+/, '')}`);
     await loadDirectory(workspacePath);
+    if (/(^|[/\\])package\.json$/i.test(rel.replace(/\\/g, '/'))) {
+      setCanInstallDeps(true);
+    }
     setOpenTabs(prev => {
       const idx = prev.findIndex(t => t.path === absolutePath);
       if (idx >= 0) {
         const updated = [...prev];
-        updated[idx] = { ...updated[idx], content, originalContent: content, isDirty: false };
+        updated[idx] = {
+          ...updated[idx],
+          content: writeContent,
+          originalContent: writeContent,
+          isDirty: false
+        };
         return updated;
       }
       const fileName = absolutePath.split(/[\\/]/).pop() || 'file';
       const newTab: OpenTab = {
         path: absolutePath,
         name: fileName,
-        content,
-        originalContent: content,
+        content: writeContent,
+        originalContent: writeContent,
         isDirty: false,
         language: getLanguageFromPath(absolutePath)
       };
@@ -1055,6 +1072,40 @@ export const App: React.FC = () => {
     if (!window.electronAPI || !workspacePath) return '';
     const res = await window.electronAPI.execTool(workspacePath, 'run_command', { command });
     return res.content || res.error || '';
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!workspacePath || !window.electronAPI?.hasPackageJson) {
+        setCanInstallDeps(false);
+        return;
+      }
+      const res = await window.electronAPI.hasPackageJson(workspacePath);
+      if (!cancelled) setCanInstallDeps(!!res.exists);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [workspacePath, workspaceEpoch, files]);
+
+  const handleInstallDeps = async () => {
+    if (!workspacePath || !window.electronAPI?.installWorkspaceDeps || installingDeps) return;
+    setIsTerminalOpen(true);
+    setInstallingDeps(true);
+    try {
+      const res = await window.electronAPI.installWorkspaceDeps(workspacePath, {
+        timeoutMs: 300000
+      });
+      if (!res.ok) {
+        console.warn('npm install failed:', res.error || res.output);
+      }
+      await loadDirectory(workspacePath);
+      const again = await window.electronAPI.hasPackageJson(workspacePath);
+      setCanInstallDeps(!!again.exists);
+    } finally {
+      setInstallingDeps(false);
+    }
   };
 
   const handleOpenFileInEditor = (filePath: string) => {
@@ -1283,6 +1334,9 @@ export const App: React.FC = () => {
           tokenStatsScope={tokenStatsScope}
           onTokenStatsScopeChange={handleTokenStatsScopeChange}
           hasProject={!!projectTokenKey}
+          canInstallDeps={canInstallDeps}
+          installingDeps={installingDeps}
+          onInstallDeps={() => void handleInstallDeps()}
           uiScale={uiScale}
           onUpdateUiScale={handleUpdateUiScale}
           appVersion={appVersion}

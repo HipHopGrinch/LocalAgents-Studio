@@ -60,6 +60,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Agent tools (scoped to workspace root in the main process)
   execTool: (root, name, args) => ipcRenderer.invoke('tools:exec', root, name, args),
   typecheckWorkspace: (root, opts) => ipcRenderer.invoke('workspace:typecheck', root, opts),
+  installWorkspaceDeps: (root, opts) => ipcRenderer.invoke('workspace:installDeps', root, opts),
+  hasPackageJson: root => ipcRenderer.invoke('workspace:hasPackageJson', root),
   webSearch: (baseUrl, query) => ipcRenderer.invoke('web:search', baseUrl, query),
   generateImage: (url, model, prompt) => ipcRenderer.invoke('image:generate', url, model, prompt),
 

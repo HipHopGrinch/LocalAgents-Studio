@@ -13,7 +13,8 @@ import {
   Zap,
   Cloud,
   Sliders,
-  RotateCcw
+  RotateCcw,
+  Package
 } from 'lucide-react';
 
 interface HeaderProps {
@@ -33,6 +34,10 @@ interface HeaderProps {
   onTokenStatsScopeChange?: (scope: 'global' | 'project') => void;
   /** False when no workspace is open — Project scope still toggleable but shows zeros. */
   hasProject?: boolean;
+  /** Show Install deps when package.json exists in the open project. */
+  canInstallDeps?: boolean;
+  installingDeps?: boolean;
+  onInstallDeps?: () => void;
   uiScale: number;
   onUpdateUiScale: (scale: number) => void;
   appVersion?: string;
@@ -56,6 +61,9 @@ export const Header: React.FC<HeaderProps> = ({
   tokenStatsScope = 'global',
   onTokenStatsScopeChange,
   hasProject = false,
+  canInstallDeps = false,
+  installingDeps = false,
+  onInstallDeps,
   uiScale,
   onUpdateUiScale,
   appVersion,
@@ -308,6 +316,19 @@ export const Header: React.FC<HeaderProps> = ({
                 )}
               </div>
             </div>
+
+            {canInstallDeps && onInstallDeps && (
+              <button
+                type="button"
+                onClick={onInstallDeps}
+                disabled={installingDeps}
+                className="flex items-center gap-1 px-2 py-1 text-[11px] rounded border bg-[#18181b] border-[#27272a] text-zinc-300 hover:text-white hover:border-zinc-600 disabled:opacity-50 transition shrink-0"
+                title="Sanitize known-bad package names and run npm install"
+              >
+                <Package className={`w-3.5 h-3.5 text-amber-400 ${installingDeps ? 'animate-pulse' : ''}`} />
+                <span>{installingDeps ? 'Installing…' : 'Install deps'}</span>
+              </button>
+            )}
 
             <button
               onClick={onRefreshNodes}

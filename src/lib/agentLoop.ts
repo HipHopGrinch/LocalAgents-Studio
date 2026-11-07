@@ -95,6 +95,38 @@ export async function executeTool(tool: ToolCall, deps: ToolExecutorDeps): Promi
 
     if (tool.name === 'run_command') {
       const cmd = tool.body || tool.args?.command || '';
+      // Sanitize known-bad package names before any npm install the model runs.
+      if (
+        /npm\s+i(nstall)?\b/i.test(cmd) &&
+        deps.workspacePath &&
+        window.electronAPI?.installWorkspaceDeps
+      ) {
+        try {
+          const res = await window.electronAPI.installWorkspaceDeps(deps.workspacePath, {
+            timeoutMs: 300000
+          });
+          const rewrite = res.rewritten?.length
+            ? `\nRewrote deps: ${res.rewritten.join('; ')}`
+            : '';
+          return {
+            ...next,
+            status: res.ok ? 'done' : 'error',
+            result: res.ok
+              ? `Exit code: 0${rewrite}\n${(res.output || '').slice(-8000)}`
+              : `Exit code: ${res.code ?? 1}${res.timedOut ? ' (timed out)' : ''}${rewrite}\n${(
+                  res.output ||
+                  res.error ||
+                  ''
+                ).slice(-8000)}`
+          };
+        } catch (err: any) {
+          return {
+            ...next,
+            status: 'error',
+            result: err?.message || String(err)
+          };
+        }
+      }
       if (isDestructiveCommand(cmd)) {
         return {
           ...next,
@@ -189,6 +221,73 @@ export function isWritableTool(name: string): boolean {
   return name === 'write_file' || name === 'edit_file';
 }
 
+function isPackageJsonToolPath(tool: ToolCall): boolean {
+  const p = (tool.args?.path || '').replace(/\\/g, '/');
+  return /(^|\/)package\.json$/i.test(p);
+}
+
+/**
+ * After package.json is written/edited, install deps via Studio (sanitizes bad
+ * names like react-three-fiber, runs npm install in the terminal).
+ */
+async function maybeInstallAfterPackageJsonWrite(
+  tools: ToolCall[],
+  deps: ToolExecutorDeps
+): Promise<ToolCall[]> {
+  const wrotePkg = tools.some(
+    t =>
+      isWritableTool(t.name) &&
+      t.status === 'done' &&
+      isPackageJsonToolPath(t)
+  );
+  if (!wrotePkg || !deps.workspacePath || !window.electronAPI?.installWorkspaceDeps) {
+    return tools;
+  }
+  const alreadyInstalling = tools.some(
+    t =>
+      t.name === 'run_command' &&
+      /npm\s+i(nstall)?\b/i.test(t.body || t.args?.command || '')
+  );
+  if (alreadyInstalling) return tools;
+
+  const installTool: ToolCall = {
+    id: `auto-npm-install-${Date.now()}`,
+    name: 'run_command',
+    args: { command: 'npm install' },
+    body: 'npm install',
+    status: 'running'
+  };
+  try {
+    const res = await window.electronAPI.installWorkspaceDeps(deps.workspacePath, {
+      timeoutMs: 300000
+    });
+    const rewrite = res.rewritten?.length ? `\nRewrote: ${res.rewritten.join('; ')}` : '';
+    return [
+      ...tools,
+      {
+        ...installTool,
+        status: res.ok ? 'done' : 'error',
+        result: res.ok
+          ? `Exit code: 0\n(auto) npm install after package.json${rewrite}\n${(res.output || '').slice(-4000)}`
+          : `Exit code: ${res.code ?? 1}\n(auto) npm install failed${rewrite}\n${(
+              res.output ||
+              res.error ||
+              ''
+            ).slice(-4000)}`
+      }
+    ];
+  } catch (err: any) {
+    return [
+      ...tools,
+      {
+        ...installTool,
+        status: 'error',
+        result: `(auto) npm install error: ${err?.message || err}`
+      }
+    ];
+  }
+}
+
 /** Auto-apply write_file and edit_file tools; returns updated tool list. */
 export async function autoApplyWritableTools(
   tools: ToolCall[],
@@ -202,7 +301,7 @@ export async function autoApplyWritableTools(
       out.push(tool);
     }
   }
-  return out;
+  return maybeInstallAfterPackageJsonWrite(out, deps);
 }
 
 /** Stable key for identical inspect tools in one batch (path/query/terminal). */

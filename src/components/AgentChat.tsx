@@ -1946,6 +1946,42 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         window.electronAPI?.typecheckWorkspace &&
         workspacePath
       ) {
+        // Ensure project typescript exists before contract tsc (packaged Studio cannot rely on npx).
+        try {
+          const pkgProbe = await window.electronAPI.execTool(workspacePath, 'exists', {
+            path: 'package.json'
+          });
+          const tsProbe = await window.electronAPI.execTool(workspacePath, 'exists', {
+            path: 'node_modules/typescript/package.json'
+          });
+          if (pkgProbe.exists && !tsProbe.exists && window.electronAPI.installWorkspaceDeps) {
+            patchPipelineMsg({
+              display: `📦 Installing npm dependencies before contract typecheck…`
+            });
+            const inst = await window.electronAPI.installWorkspaceDeps(workspacePath, {
+              timeoutMs: 300000
+            });
+            if (!inst.ok) {
+              patchPipelineMsg({
+                display: `⚠️ npm install failed before contract check — continuing with Studio TypeScript if available.\n\`\`\`\n${(
+                  inst.output ||
+                  inst.error ||
+                  ''
+                ).slice(0, 1200)}\n\`\`\``
+              });
+            } else {
+              const rewriteNote = inst.rewritten?.length
+                ? `\nRewrote: ${inst.rewritten.join('; ')}`
+                : '';
+              patchPipelineMsg({
+                display: `✅ Dependencies installed.${rewriteNote}\n📝 Typechecking shared contract \`${manifest.contractFile}\`…`
+              });
+            }
+          }
+        } catch (instErr) {
+          console.warn('Pre-contract npm install skipped:', instErr);
+        }
+
         let check = await window.electronAPI.typecheckWorkspace(workspacePath, {
           mode: 'contract',
           file: manifest.contractFile,

@@ -785,7 +785,8 @@ ${planSection}
 Respond ONLY with a valid JSON object. Do NOT write full implementation bodies in the JSON.
 1. \`stack\`: one of "typescript", "static-web", "python", "go", "rust", "node", "native-win32".
 2. \`contractFile\` + \`contractCode\`:
-   - typescript: prefer \`src/types/swarm-contract.ts\` with real shared types that typecheck alone.
+   - typescript: prefer \`src/types/swarm-contract.ts\` with real shared types that typecheck **alone** (no \`import\` from \`three\`, \`react\`, \`@react-three/fiber\`, etc. until deps are installed — use plain interfaces/types only).
+   - For R3F / Three.js apps, put \`@react-three/fiber\` in package.json (never the obsolete unscoped \`react-three-fiber\` name).
    - static-web / python / go / rust / node / native-win32: prefer \`SWARM.md\` with SHORT shared notes (names, APIs, rules). Markdown is fine — not TypeScript unless the stack is typescript.
 3. \`tasks\`: 2–4 distinct \`filePath\`s (never the contract file). List foundation files **before** files that import them. Each needs SHORT \`instructions\` (1–3 sentences). Never paste Intent Analysis, option lists, or the approved-plan essay into \`instructions\` or \`contractCode\`.
 4. \`dependsOn\` (REQUIRED when a file imports/uses another task file): array of those \`filePath\` strings. Example: logic that imports models → \`"dependsOn": ["internal/models/game.go"]\`. Omit or \`[]\` only when the file truly needs nothing else from this task list (contract is always written first).
@@ -826,12 +827,21 @@ Example (TypeScript):
   "stack": "typescript",
   "tasks": [
     {
+      "filePath": "package.json",
+      "complexity": "low",
+      "preferredRole": "@coder",
+      "requiredExports": [],
+      "requiredImports": [],
+      "dependsOn": [],
+      "instructions": "Vite + React + typescript. Use @react-three/fiber (scoped), never react-three-fiber."
+    },
+    {
       "filePath": "src/example.ts",
       "complexity": "high",
       "preferredRole": "@coder",
       "requiredExports": ["export function run(): void"],
       "requiredImports": ["import type { Example } from './types/swarm-contract';"],
-      "dependsOn": [],
+      "dependsOn": ["package.json"],
       "instructions": "Implement run() using the shared contract."
     }
   ]
@@ -857,7 +867,9 @@ ${JSON.stringify(previous, null, 2)}
 ### TSC ERRORS
 ${tscError}
 
-Return the FULL corrected JSON manifest (same schema). Fix \`contractCode\` so \`tsc --noEmit\` succeeds. JSON only.`;
+Return the FULL corrected JSON manifest (same schema). Fix \`contractCode\` so \`tsc --noEmit\` succeeds.
+Prefer plain exported types/interfaces with **no** third-party imports in \`contractCode\` (workers import packages later).
+If package.json is wrong, use \`@react-three/fiber\` not \`react-three-fiber\`. JSON only.`;
 }
 
 export function buildSwarmWorkerPrompt(opts: {
@@ -1003,9 +1015,8 @@ function preferredToNodeRole(preferred: SwarmPreferredRole): NodeRole {
 
 function roleMatches(n: EndpointNode, preferred: SwarmPreferredRole): boolean {
   // Explicit allow-list only (Auto does not get a role bonus).
-  if (preferred === '@coder') {
-    return nodeHasExplicitRole(n, 'coder') || nodeHasExplicitRole(n, 'planner');
-  }
+  // @coder must NOT treat Planner-only nodes as coders (that stole jobs from Ubuntu/Laptop).
+  if (preferred === '@coder') return nodeHasExplicitRole(n, 'coder');
   if (preferred === '@docs') return nodeHasExplicitRole(n, 'docs');
   if (preferred === '@reviewer') return nodeHasExplicitRole(n, 'reviewer');
   return false;
@@ -1013,9 +1024,7 @@ function roleMatches(n: EndpointNode, preferred: SwarmPreferredRole): boolean {
 
 /** Hard eligibility: Auto or allow-list includes the swarm preferred role. */
 function nodeAllowsPreferred(n: EndpointNode, preferred: SwarmPreferredRole): boolean {
-  if (preferred === '@coder') {
-    return nodeAllowsRole(n, 'coder') || nodeAllowsRole(n, 'planner');
-  }
+  // Planner/Reviewer/Docs-only nodes must not receive @coder file jobs.
   return nodeAllowsRole(n, preferredToNodeRole(preferred));
 }
 
@@ -1109,7 +1118,23 @@ export function assignSwarmTasksToCluster(
 
   return sortedTasks.map(task => {
     const eligible = activeNodes.filter(n => nodeAllowsPreferred(n, task.preferredRole));
-    const candidates = eligible.length > 0 ? eligible : activeNodes;
+    // Never fall back to Planner/Reviewer-only GPUs for @coder work.
+    const candidates =
+      eligible.length > 0
+        ? eligible
+        : activeNodes.filter(n => nodeAllowsRole(n, preferredToNodeRole(task.preferredRole)));
+    if (!candidates.length) {
+      return {
+        task,
+        node: activeNodes[0],
+        model: pickBestModelForComplexity(
+          activeNodes[0],
+          toConductorComplexity(task.complexity)
+        ),
+        usedFrontierBackup,
+        skippedReason: `No node allows role ${task.preferredRole} — check Allowed Roles`
+      };
+    }
     let bestNode = candidates[0];
     let bestScore = Infinity;
 

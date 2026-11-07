@@ -574,6 +574,18 @@ export interface ElectronAPI {
     timedOut?: boolean;
     mode?: string;
   }>;
+  installWorkspaceDeps: (
+    root: string,
+    opts?: { timeoutMs?: number }
+  ) => Promise<{
+    ok: boolean;
+    code?: number;
+    output?: string;
+    error?: string;
+    timedOut?: boolean;
+    rewritten?: string[];
+  }>;
+  hasPackageJson: (root: string) => Promise<{ exists: boolean }>;
 
   executeCommand: (command: string, cwd?: string) => Promise<{ code?: number }>;
   killCommand: () => Promise<{ success: boolean }>;

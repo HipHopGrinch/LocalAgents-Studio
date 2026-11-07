@@ -10,6 +10,11 @@ const os = require('os');
 const crypto = require('crypto');
 const { spawn, execFile } = require('child_process');
 const webConsole = require('./webConsole.cjs');
+const {
+  sanitizePackageJsonContent,
+  sanitizePackageJsonObject,
+  isPackageJsonPath
+} = require('./npmDeps.cjs');
 
 // Per-user settings live under AppData — NEVER inside the install dir or portable EXE.
 // Must be set before app.ready().
@@ -936,8 +941,12 @@ ipcMain.handle('fs:read-file', async (_e, filePath) => {
 
 ipcMain.handle('fs:write-file', async (_e, filePath, content) => {
   try {
+    let body = content;
+    if (isPackageJsonPath(filePath)) {
+      body = sanitizePackageJsonContent(String(content ?? '')).content;
+    }
     await fsp.mkdir(path.dirname(filePath), { recursive: true });
-    await fsp.writeFile(filePath, content, 'utf-8');
+    await fsp.writeFile(filePath, body, 'utf-8');
     return { success: true };
   } catch (err) {
     return { error: err.message };
@@ -1118,9 +1127,21 @@ async function toolSearch(root, args) {
 
 async function toolWriteFile(root, args) {
   const abs = resolveScoped(root, args.path);
+  let body = args.content ?? '';
+  let note = '';
+  if (isPackageJsonPath(args.path || abs)) {
+    const sanitized = sanitizePackageJsonContent(body);
+    body = sanitized.content;
+    if (sanitized.changed.length) {
+      note = ` (rewrote deps: ${sanitized.changed.join('; ')})`;
+    }
+  }
   await fsp.mkdir(path.dirname(abs), { recursive: true });
-  await fsp.writeFile(abs, args.content ?? '', 'utf-8');
-  return { content: `Wrote ${formatBytes(Buffer.byteLength(args.content ?? ''))} to ${args.path}`, path: abs };
+  await fsp.writeFile(abs, body, 'utf-8');
+  return {
+    content: `Wrote ${formatBytes(Buffer.byteLength(body))} to ${args.path}${note}`,
+    path: abs
+  };
 }
 
 ipcMain.handle('tools:exec', async (_e, root, name, args) => {
@@ -1228,44 +1249,94 @@ ipcMain.handle('image:generate', async (_e, nodeUrl, model, prompt) => {
 // WORKSPACE TYPECHECK (Conductor Swarm contract / repair)
 // ==========================================
 
-function findTscBinary(workspaceRoot) {
-  const candidates = [
-    path.join(workspaceRoot, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc'),
-    path.join(__dirname, '..', 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc')
-  ];
-  for (const c of candidates) {
-    if (fs.existsSync(c)) return c;
+/**
+ * Prefer workspace tsc, then Studio-bundled typescript (require.resolve).
+ * Never use `npx --no-install tsc` — that hits the wrong npm package.
+ * @returns {{ kind: 'bin', path: string } | { kind: 'node', script: string } | null}
+ */
+function findTscRunner(workspaceRoot) {
+  const win = process.platform === 'win32';
+  const workspaceBin = path.join(
+    workspaceRoot || '',
+    'node_modules',
+    '.bin',
+    win ? 'tsc.cmd' : 'tsc'
+  );
+  if (workspaceRoot && fs.existsSync(workspaceBin)) {
+    return { kind: 'bin', path: workspaceBin };
+  }
+
+  const studioBin = path.join(__dirname, '..', 'node_modules', '.bin', win ? 'tsc.cmd' : 'tsc');
+  if (fs.existsSync(studioBin)) {
+    return { kind: 'bin', path: studioBin };
+  }
+
+  try {
+    const pkgJson = require.resolve('typescript/package.json');
+    const tsDir = path.dirname(pkgJson);
+    const nmBin = path.join(tsDir, '..', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc');
+    if (fs.existsSync(nmBin)) {
+      return { kind: 'bin', path: nmBin };
+    }
+    const script = path.join(tsDir, 'bin', 'tsc');
+    const scriptJs = script + '.js';
+    if (fs.existsSync(script) || fs.existsSync(scriptJs)) {
+      return { kind: 'node', script: fs.existsSync(script) ? script : scriptJs };
+    }
+  } catch {
+    // typescript not resolvable from packaged app
   }
   return null;
 }
 
 function runTsc(cwd, args, timeoutMs = 90000) {
   return new Promise(resolve => {
-    const bin = findTscBinary(cwd);
+    const runner = findTscRunner(cwd);
+    if (!runner) {
+      return resolve({
+        code: -1,
+        output:
+          'TypeScript not available — open the project and use Install dependencies (needs typescript in package.json), or reinstall Studio.',
+        timedOut: false,
+        skipped: false,
+        missingTsc: true
+      });
+    }
+
     let output = '';
     let timedOut = false;
     let proc;
     try {
-      if (bin) {
-        proc = spawn(bin, args, { cwd, env: process.env, windowsHide: true, shell: process.platform === 'win32' });
+      if (runner.kind === 'bin') {
+        proc = spawn(runner.path, args, {
+          cwd,
+          env: process.env,
+          windowsHide: true,
+          shell: process.platform === 'win32'
+        });
       } else {
-        // Fallback: npx tsc (may download; prefer local install)
-        proc = spawn(
-          process.platform === 'win32' ? 'npx.cmd' : 'npx',
-          ['--no-install', 'tsc', ...args],
-          { cwd, env: process.env, windowsHide: true, shell: true }
-        );
+        // Electron's execPath is the app binary — run as Node via ELECTRON_RUN_AS_NODE.
+        proc = spawn(process.execPath, [runner.script, ...args], {
+          cwd,
+          env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+          windowsHide: true,
+          shell: false
+        });
       }
     } catch (err) {
       return resolve({ code: -1, output: err.message, timedOut: false, skipped: false });
     }
 
-    const onData = d => { output += d.toString(); };
+    const onData = d => {
+      output += d.toString();
+    };
     proc.stdout.on('data', onData);
     proc.stderr.on('data', onData);
     const timer = setTimeout(() => {
       timedOut = true;
-      try { proc.kill(); } catch {}
+      try {
+        proc.kill();
+      } catch {}
     }, timeoutMs);
     proc.on('close', code => {
       clearTimeout(timer);
@@ -1300,18 +1371,32 @@ ipcMain.handle('workspace:typecheck', async (_e, root, opts = {}) => {
       // Isolated check so worker projects without a full tsconfig still validate the contract
       const args = [
         '--noEmit',
-        '--pretty', 'false',
+        '--pretty',
+        'false',
         '--strict',
         '--skipLibCheck',
-        '--target', 'ES2020',
-        '--module', 'ESNext',
-        '--moduleResolution', 'node',
+        '--target',
+        'ES2020',
+        '--module',
+        'ESNext',
+        '--moduleResolution',
+        'node',
         '--esModuleInterop',
-        '--jsx', 'react-jsx',
-        '--lib', 'DOM,ES2020,DOM.Iterable',
+        '--jsx',
+        'react-jsx',
+        '--lib',
+        'DOM,ES2020,DOM.Iterable',
         abs
       ];
       const res = await runTsc(root, args, timeoutMs);
+      if (res.missingTsc) {
+        return {
+          ok: false,
+          error: res.output,
+          output: res.output,
+          mode: 'contract'
+        };
+      }
       const tail = (res.output || '').slice(-14000);
       return {
         ok: res.code === 0 && !res.timedOut,
@@ -1332,6 +1417,14 @@ ipcMain.handle('workspace:typecheck', async (_e, root, opts = {}) => {
       };
     }
     const res = await runTsc(root, ['--noEmit', '--pretty', 'false'], timeoutMs);
+    if (res.missingTsc) {
+      return {
+        ok: false,
+        error: res.output,
+        output: res.output,
+        mode: 'workspace'
+      };
+    }
     const tail = (res.output || '').slice(-16000);
     return {
       ok: res.code === 0 && !res.timedOut,
@@ -1343,6 +1436,68 @@ ipcMain.handle('workspace:typecheck', async (_e, root, opts = {}) => {
     };
   } catch (err) {
     return { ok: false, error: err.message, output: err.message };
+  }
+});
+
+/**
+ * Sanitize package.json (known bad LLM package names) then npm install.
+ */
+ipcMain.handle('workspace:installDeps', async (_e, root, opts = {}) => {
+  try {
+    if (!root || !fs.existsSync(root)) {
+      return { ok: false, error: 'Workspace root missing', output: '' };
+    }
+    const pkgPath = path.join(root, 'package.json');
+    if (!fs.existsSync(pkgPath)) {
+      return { ok: false, error: 'No package.json in workspace', output: '' };
+    }
+
+    let rewritten = [];
+    try {
+      const raw = await fsp.readFile(pkgPath, 'utf-8');
+      const pkg = JSON.parse(raw);
+      const { json, changed, rewritten: did } = sanitizePackageJsonObject(pkg);
+      if (did) {
+        await fsp.writeFile(pkgPath, JSON.stringify(json, null, 2) + '\n', 'utf-8');
+        rewritten = changed;
+        echoTerminal(
+          `\n[Install deps] Rewrote package.json dependencies:\n  ${changed.join('\n  ')}\n`
+        );
+      }
+    } catch (err) {
+      return { ok: false, error: `Invalid package.json: ${err.message}`, output: err.message };
+    }
+
+    const timeoutMs = opts.timeoutMs || 300000;
+    echoTerminal(`\n> npm install\n`);
+    const res = await runPowerShell('npm install', root, {
+      timeoutMs,
+      echo: true,
+      capture: true
+    });
+    const tail =
+      (res.output || '').length > 16000
+        ? '[...truncated...]\n' + res.output.slice(-16000)
+        : res.output || '';
+    const ok = res.code === 0 && !res.timedOut;
+    return {
+      ok,
+      code: res.code,
+      output: tail,
+      timedOut: !!res.timedOut,
+      rewritten
+    };
+  } catch (err) {
+    return { ok: false, error: err.message, output: err.message };
+  }
+});
+
+ipcMain.handle('workspace:hasPackageJson', async (_e, root) => {
+  try {
+    if (!root) return { exists: false };
+    return { exists: fs.existsSync(path.join(root, 'package.json')) };
+  } catch {
+    return { exists: false };
   }
 });
 

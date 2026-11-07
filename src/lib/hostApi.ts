@@ -306,6 +306,8 @@ export function createWebHostApi(token: string): Promise<ElectronAPI> {
 
       execTool: (root, name, args) => invoke('tools:exec', [root, name, args]),
       typecheckWorkspace: (root, opts) => invoke('workspace:typecheck', [root, opts]),
+      installWorkspaceDeps: (root, opts) => invoke('workspace:installDeps', [root, opts]),
+      hasPackageJson: root => invoke('workspace:hasPackageJson', [root]),
       webSearch: (baseUrl, query) => invoke('web:search', [baseUrl, query]),
       generateImage: (url, model, prompt) => invoke('image:generate', [url, model, prompt]),
 

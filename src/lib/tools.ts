@@ -597,6 +597,7 @@ When a command fails (non-zero exit), diagnose from the output, fix with <edit_f
 ### Mandatory Rules:
 - MANDATORY: When the user asks you to build, create, or write code (e.g. "build a webpage", "create a python script"), you MUST invoke <write_file path="...">. DO NOT respond only with conversational text and raw markdown code blocks. The user expects the file to be created on their computer.
 - After writing code that should be verified, run a relevant command (<run_command>) and fix failures from the terminal output before stopping.
+- package.json: use scoped names that exist on npm (e.g. \`@react-three/fiber\`, never unscoped \`react-three-fiber\` for v8+). After writing package.json, run \`npm install\` once and fix ETARGET/404 from the output.
 - Paths are relative to the workspace root. Do not prefix with leading slash.
 - State a brief 1-2 sentence description before or after the tool tags.`;
 

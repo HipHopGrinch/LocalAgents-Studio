@@ -26,8 +26,20 @@ export const PlannerPlanPanel: React.FC<PlannerPlanPanelProps> = ({
       <div className="flex items-center gap-1.5 text-[10px] uppercase font-bold tracking-wider text-sky-300/90 shrink-0">
         <ListChecks className="w-3 h-3" />
         <span>Planner plan · {plan.status}</span>
+        {plan.delivery && (
+          <span className="ml-auto text-[9px] normal-case font-semibold px-1.5 py-0.5 rounded bg-sky-600/20 text-sky-200 border border-sky-500/30">
+            {plan.delivery}
+          </span>
+        )}
       </div>
       <p className="text-[11px] text-zinc-300 mt-1 leading-snug shrink-0">{plan.summary}</p>
+      {isPaused && plan.status === 'active' && (
+        <div className="mt-1.5 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[10px] text-amber-100 leading-snug shrink-0">
+          Paused{plan.resumePhase ? ` at ${plan.resumePhase}` : ''}. Closing Studio keeps this
+          checkpoint — press <span className="font-semibold text-emerald-300">Play</span> to
+          resume the active step.
+        </div>
+      )}
       <ol className="mt-2 space-y-1.5 list-none overflow-y-auto min-h-0 flex-1 pr-0.5">
         {plan.steps.map(step => {
           const active = plan.activeStepId === step.id;

@@ -63,6 +63,9 @@ export function looksLikePlannerProse(text: string): boolean {
   const t = (text || '').trim();
   if (!t) return false;
   if (/<plan_options\b/i.test(t)) return true;
+  if (/<review_plan\b/i.test(t)) return true;
+  if (/<review_delta\b/i.test(t)) return true;
+  if (/<execution_plan\b/i.test(t)) return true;
   if (/###\s*Intent Analysis/i.test(t)) return true;
   if (/Please pick an option/i.test(t)) return true;
   if (/Options for Architecture/i.test(t)) return true;
@@ -71,6 +74,16 @@ export function looksLikePlannerProse(text: string): boolean {
   // Multiple numbered architecture options = plan dump, not code
   const optionHits = (t.match(/\*\*Option\s*\d+/gi) || []).length + (t.match(/<option\s+id=/gi) || []).length;
   if (optionHits >= 2 && t.length > 400) return true;
+  return false;
+}
+
+/** Obvious stubs that must not Yay interaction / AI / integration steps. */
+export function looksLikePlaceholderCode(text: string): boolean {
+  const t = text || '';
+  if (/Placeholder for actual/i.test(t)) return true;
+  if (/TODO:\s*(implement|wire|raycast|drag)/i.test(t)) return true;
+  if (/console\.log\(\s*['"]Handling piece drag/i.test(t)) return true;
+  if (/not implemented yet/i.test(t)) return true;
   return false;
 }
 

@@ -66,9 +66,22 @@ import {
   partitionSwarmTasksIntoWaves,
   queueAssignmentsByGpu,
   shouldRejectPlannerWrite,
+  looksLikePlaceholderCode,
+  looksLikePlannerProse,
   type SwarmAssignment,
   type SwarmManifest
 } from '../lib/swarmContract';
+import {
+  activityLabelOf,
+  popActivity,
+  pushActivity,
+  type StudioActivity
+} from '../lib/studioActivity';
+import {
+  deliveryToStack,
+  looksLikeRealIndexHtml,
+  scaffoldFilesForStack
+} from '../lib/projectScaffold';
 import {
   MAX_COMMAND_FIX_ATTEMPTS,
   autoApplyWritableTools,
@@ -355,6 +368,25 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const [mobileControlsOpen, setMobileControlsOpen] = useState(false);
   /** Banner after user picks a plan option — Coder is running the locked plan */
   const [executingPlanNotice, setExecutingPlanNotice] = useState<string | null>(null);
+  /** Nested activity so Generating chrome stays up during install/tsc/Pass gaps. */
+  const [activityStack, setActivityStack] = useState<StudioActivity[]>([]);
+  const activityStackRef = useRef<StudioActivity[]>([]);
+  const beginActivity = (
+    phase: StudioActivity['phase'],
+    label: string,
+    detail?: string
+  ) => {
+    const next = pushActivity(activityStackRef.current, phase, label, detail);
+    activityStackRef.current = next;
+    setActivityStack(next);
+    setExecutingPlanNotice(activityLabelOf(next));
+  };
+  const endActivity = () => {
+    const next = popActivity(activityStackRef.current);
+    activityStackRef.current = next;
+    setActivityStack(next);
+    setExecutingPlanNotice(activityLabelOf(next));
+  };
   const chatBottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const activeAbortsRef = useRef<(() => void)[]>([]);
@@ -641,7 +673,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           isStreaming,
           activityLabel: isStreaming
             ? streamingActivityLabel(latestAssistant)
-            : undefined,
+            : activityLabelOf(activityStackRef.current) || executingPlanNotice || undefined,
           targetNodeId,
           targetModel,
           executingPlanNotice,
@@ -664,6 +696,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     targetNodeId,
     targetModel,
     executingPlanNotice,
+    activityStack,
     messages
   ]);
 
@@ -1869,7 +1902,52 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         return;
       }
 
+      // ── Scaffold gate (stack from locked delivery) ──
+      const lockedDelivery =
+        lockedPlan?.delivery || plannerPlanRef.current?.delivery || undefined;
+      const scaffoldStack =
+        deliveryToStack(lockedDelivery) ||
+        (/\breact|typescript|vite|r3f|three\b/i.test(userText) ? 'typescript' : null);
+      if (scaffoldStack && workspacePath && window.electronAPI?.writeFile) {
+        beginActivity('install', 'Scaffolding project', scaffoldStack);
+        try {
+          const files = scaffoldFilesForStack(scaffoldStack);
+          for (const f of files) {
+            const abs = `${workspacePath.replace(/[\\/]+$/, '')}${
+              workspacePath.includes('\\') ? '\\' : '/'
+            }${f.path.replace(/\//g, workspacePath.includes('\\') ? '\\' : '/')}`;
+            let shouldWrite = true;
+            try {
+              const existing = await window.electronAPI.readFile?.(abs);
+              if (existing?.content != null) {
+                if (f.path === 'index.html' && looksLikeRealIndexHtml(existing.content)) {
+                  shouldWrite = false;
+                } else if (f.path !== 'index.html' && String(existing.content).trim()) {
+                  shouldWrite = false;
+                } else if (
+                  f.path === 'index.html' &&
+                  !looksLikeRealIndexHtml(existing.content)
+                ) {
+                  shouldWrite = true; // replace plan prose
+                }
+              }
+            } catch {
+              /* missing — write */
+            }
+            if (shouldWrite) {
+              await window.electronAPI.writeFile(abs, f.content);
+            }
+          }
+          patchPipelineMsg({
+            display: `🧱 Ensured ${scaffoldStack} scaffold (package/tsconfig/entry) before Pass 1…`
+          });
+        } finally {
+          endActivity();
+        }
+      }
+
       // ── Pass 1: Generate Shared Contract & Manifest ──
+      beginActivity('pass1', 'Pass 1 — Lead Architect', architect.node.name);
       const swarmTaskText = lockedPlan
         ? `${userText}\n\n${formatApprovedPlanForSwarm(lockedPlan)}`
         : userText;
@@ -1955,12 +2033,20 @@ export const AgentChat: React.FC<AgentChatProps> = ({
             path: 'node_modules/typescript/package.json'
           });
           if (pkgProbe.exists && !tsProbe.exists && window.electronAPI.installWorkspaceDeps) {
-            patchPipelineMsg({
-              display: `📦 Installing npm dependencies before contract typecheck…`
-            });
-            const inst = await window.electronAPI.installWorkspaceDeps(workspacePath, {
-              timeoutMs: 300000
-            });
+            beginActivity('install', 'npm install', 'before contract typecheck');
+            let inst: { ok?: boolean; output?: string; error?: string; rewritten?: string[] } = {
+              ok: false
+            };
+            try {
+              patchPipelineMsg({
+                display: `📦 Installing npm dependencies before contract typecheck…`
+              });
+              inst = await window.electronAPI.installWorkspaceDeps(workspacePath, {
+                timeoutMs: 300000
+              });
+            } finally {
+              endActivity();
+            }
             if (!inst.ok) {
               patchPipelineMsg({
                 display: `⚠️ npm install failed before contract check — continuing with Studio TypeScript if available.\n\`\`\`\n${(
@@ -2069,6 +2155,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           });
         }
       }
+
+      endActivity(); // Pass 1 done
+      beginActivity('pass2', 'Pass 2 — file workers');
 
       // ── Pass 2: Fan out by dependency waves (parallel within a wave) ──
       const taskWaves = partitionSwarmTasksIntoWaves(manifest.tasks);
@@ -2282,9 +2371,10 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         });
 
         if (wsCheck.skipped) {
+          // Missing tsconfig must fail — never treat skip as green.
           patchPipelineMsg(m => ({
             ...m,
-            display: `✅ Conductor Swarm finished ${assignments.length} worker file(s). ${wsCheck.output || 'No tsconfig — skipped project typecheck.'}`
+            display: `⚠️ Conductor Swarm finished ${assignments.length} worker file(s), but project typecheck was skipped (${wsCheck.output || 'no tsconfig'}). Scaffold a tsconfig and re-run verify — this is NOT a pass.`
           }));
         } else if (wsCheck.ok) {
           patchPipelineMsg(m => ({
@@ -2393,6 +2483,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         display: `⚠️ Conductor Swarm error: ${err?.message || err}`
       });
     } finally {
+      activityStackRef.current = [];
+      setActivityStack([]);
       setIsStreaming(false);
       activeAbortsRef.current = [];
     }
@@ -3959,13 +4051,23 @@ ${progressForPrompt() || '(empty)'}`;
     const touchedPaths = collectWrittenPaths(messagesRef.current);
     const reviewPaths = [...touchedPaths, ...stepFiles];
     const filesHint = reviewPaths.length
-      ? `Files to verify:\n${reviewPaths.slice(0, 16).join('\n')}`
+      ? `Files to verify:\n${reviewPaths.slice(0, 24).join('\n')}`
       : 'Review from chat context and the step task list.';
+    beginActivity('review', `Reviewer on step #${step.id}`, step.title);
     const filesBody = await buildTouchedFilesContext(workspacePath, reviewPaths, {
-      maxFiles: 10,
-      maxCharsPerFile: 12000,
-      maxTotalChars: 48000
+      maxFiles: 16,
+      maxCharsPerFile: 10000,
+      maxTotalChars: 64000
     });
+
+    // Soft pre-check: placeholder / planner prose in touched files → force Nay notes
+    const placeholderHits: string[] = [];
+    for (const block of (filesBody || '').split(/---+\s*/)) {
+      if (looksLikePlaceholderCode(block) || looksLikePlannerProse(block)) {
+        const pathLine = block.match(/`([^`]+)`/)?.[1] || 'file';
+        placeholderHits.push(pathLine);
+      }
+    }
 
     const reviewPrompt = `${formatStepForReviewer(plan, step)}
 
@@ -3976,6 +4078,11 @@ ${filesBody || '(No file bodies loaded — use at most two read_file calls, then
 Work log:
 ${progressForPrompt() || '(empty)'}
 
+Compatibility rules for this step:
+- Nay if files contain planner/reviewer prose, Intent Analysis, or obvious stubs (Placeholder for actual, empty TODOs).
+- Nay if imports/types disagree across the files above (duplicate parallel modules for the same concern).
+- Yay only if the step's tasks are concretely implemented — not sketched.
+${placeholderHits.length ? `\nStudio pre-scan found likely stubs/prose in: ${placeholderHits.slice(0, 8).join(', ')}. Prefer Nay unless those are false positives.\n` : ''}
 After reviewing the files above, emit <step_verdict> immediately. Do not re-read the same paths.`;
 
     ephemeralWorkerRef.current = true;
@@ -4000,6 +4107,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     });
 
     if (stopRequestedRef.current) {
+      endActivity();
       setPlanPaused(true);
       setPlanResumePhase('review');
       restorePlannerControl(
@@ -4007,6 +4115,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       );
       return;
     }
+    endActivity();
 
     const latest =
       reviewMsg ||
@@ -4137,6 +4246,11 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     const reworkCount = effectiveStepReworkCount(String(stuck.id), stuck.reworkCount);
 
     setPlanPaused(false);
+    beginActivity(
+      'escalate',
+      `Escalating step #${stuck.id}`,
+      `${reworkCount} Nays → Planner fix steps`
+    );
     setExecutingPlanNotice(
       `Step #${stuck.id} hit ${reworkCount} Nays — Planner appending fix steps…`
     );
@@ -4208,6 +4322,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       { reworkNays: reworkCount }
     );
     commitPlannerPlan(plan);
+    endActivity();
 
     const next = getActiveStep(plan);
     setExecutingPlanNotice(
@@ -4375,10 +4490,14 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
     let plan = createPlanFromParsed(parsed, {
       conversationId: conversationIdRef.current || undefined,
       chosenOptionId: option.id,
-      chosenOptionTitle: option.title
+      chosenOptionTitle: option.title,
+      ...(approved.delivery ? { delivery: approved.delivery } : {})
     });
     // Same conversation: keep finished steps and append the new lock.
     plan = appendPlannerPlan(plannerPlanRef.current, plan);
+    if (approved.delivery && !plan.delivery) {
+      plan = { ...plan, delivery: approved.delivery, updatedAt: Date.now() };
+    }
     plan = activateNextStep(plan);
     commitPlannerPlan(plan);
     setExecutingPlanNotice(
@@ -4865,10 +4984,15 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
   const conductorInfo = findLeadArchitect(nodes) || findFastestConductor(nodes);
   const latestAssistant = [...messages].reverse().find(m => m.role === 'assistant');
   const peerStreaming = !!(peerConductor?.isStreaming && !isStreaming);
-  const showStreamingUi = isStreaming || peerStreaming;
+  const localActivityLabel = activityLabelOf(activityStack);
+  const showStreamingUi =
+    isStreaming || peerStreaming || !!localActivityLabel || !!executingPlanNotice;
   const activityLabel = isStreaming
     ? streamingActivityLabel(latestAssistant)
-    : peerConductor?.activityLabel || 'Generating';
+    : localActivityLabel ||
+      peerConductor?.activityLabel ||
+      executingPlanNotice ||
+      'Working';
 
   const handleNewChatClick = () => {
     if (isStreaming) {

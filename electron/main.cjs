@@ -939,14 +939,33 @@ ipcMain.handle('fs:read-file', async (_e, filePath) => {
   }
 });
 
+async function atomicWriteFile(filePath, body) {
+  await fsp.mkdir(path.dirname(filePath), { recursive: true });
+  const tmp = filePath + '.tmp';
+  await fsp.writeFile(tmp, body, 'utf-8');
+  try {
+    // Keep last-good copy for plan/progress recovery
+    if (
+      fs.existsSync(filePath) &&
+      (filePath.includes(`${path.sep}.localagents${path.sep}plans${path.sep}`) ||
+        filePath.includes(`${path.sep}.localagents${path.sep}progress${path.sep}`))
+    ) {
+      await fsp.copyFile(filePath, filePath + '.bak').catch(() => {});
+    }
+    await fsp.rename(tmp, filePath);
+  } catch {
+    await fsp.copyFile(tmp, filePath);
+    await fsp.unlink(tmp).catch(() => {});
+  }
+}
+
 ipcMain.handle('fs:write-file', async (_e, filePath, content) => {
   try {
     let body = content;
     if (isPackageJsonPath(filePath)) {
       body = sanitizePackageJsonContent(String(content ?? '')).content;
     }
-    await fsp.mkdir(path.dirname(filePath), { recursive: true });
-    await fsp.writeFile(filePath, body, 'utf-8');
+    await atomicWriteFile(filePath, body);
     return { success: true };
   } catch (err) {
     return { error: err.message };

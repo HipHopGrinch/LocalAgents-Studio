@@ -5,7 +5,8 @@ import {
   PlannerStepStatus,
   PlannerTask,
   ExecutionTaskStatus,
-  ExecutionQueue
+  ExecutionQueue,
+  DeliveryTarget
 } from '../types';
 
 export function plannerPlanPath(root: string, conversationId: string): string {
@@ -16,6 +17,54 @@ export function plannerPlanPath(root: string, conversationId: string): string {
 
 function touch(plan: PlannerPlan, patch: Partial<PlannerPlan> = {}): PlannerPlan {
   return { ...plan, ...patch, updatedAt: Date.now() };
+}
+
+function newStepUid(): string {
+  return `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function taskLetter(index: number): string {
+  let n = index;
+  let out = '';
+  do {
+    out = String.fromCharCode(97 + (n % 26)) + out;
+    n = Math.floor(n / 26) - 1;
+  } while (n >= 0);
+  return out;
+}
+
+/**
+ * Assign display ids 1..N in array order. Preserves step.uid for identity;
+ * remaps activeStepId and task ids to match the new display numbers.
+ */
+export function renumberPlannerSteps(plan: PlannerPlan): PlannerPlan {
+  if (!plan.steps.length) return plan;
+
+  const activeBefore = plan.steps.find(s => String(s.id) === String(plan.activeStepId));
+  const activeUid = activeBefore?.uid || (activeBefore ? String(activeBefore.id) : null);
+  const activeIndex = activeBefore
+    ? plan.steps.findIndex(s => String(s.id) === String(plan.activeStepId))
+    : -1;
+
+  const steps: PlannerStep[] = plan.steps.map((s, i) => {
+    const uid = s.uid || String(s.id) || newStepUid();
+    const displayId = String(i + 1);
+    const tasks = s.tasks.map((t, ti) => ({
+      ...t,
+      id: `${displayId}${taskLetter(ti)}`
+    }));
+    return { ...s, uid, id: displayId, tasks };
+  });
+
+  let activeStepId: string | null = null;
+  if (activeUid) {
+    const match = steps.find(s => String(s.uid) === String(activeUid));
+    activeStepId = match?.id ?? (activeIndex >= 0 ? steps[activeIndex]?.id ?? null : null);
+  } else if (activeIndex >= 0) {
+    activeStepId = steps[activeIndex]?.id ?? null;
+  }
+
+  return touch(plan, { steps, activeStepId });
 }
 
 export function getActiveStep(plan: PlannerPlan | null | undefined): PlannerStep | undefined {
@@ -307,10 +356,12 @@ export function createPlanFromParsed(
     conversationId?: string;
     chosenOptionId?: string;
     chosenOptionTitle?: string;
+    delivery?: DeliveryTarget;
   }
 ): PlannerPlan {
   const steps: PlannerStep[] = parsed.steps.map(s => ({
     id: s.id,
+    uid: newStepUid(),
     title: s.title,
     ...(s.description ? { description: s.description } : {}),
     status: 'pending' as PlannerStepStatus,
@@ -323,7 +374,7 @@ export function createPlanFromParsed(
     }))
   }));
   const first = steps[0];
-  return {
+  const plan: PlannerPlan = {
     id: `plan-${Date.now()}`,
     summary: parsed.summary || 'Execution plan',
     status: 'active' as PlannerPlanStatus,
@@ -332,8 +383,10 @@ export function createPlanFromParsed(
     updatedAt: Date.now(),
     ...(opts?.conversationId ? { conversationId: opts.conversationId } : {}),
     ...(opts?.chosenOptionId ? { chosenOptionId: opts.chosenOptionId } : {}),
-    ...(opts?.chosenOptionTitle ? { chosenOptionTitle: opts.chosenOptionTitle } : {})
+    ...(opts?.chosenOptionTitle ? { chosenOptionTitle: opts.chosenOptionTitle } : {}),
+    ...(opts?.delivery ? { delivery: opts.delivery } : {})
   };
+  return renumberPlannerSteps(plan);
 }
 
 export type IncomingFixSteps = {
@@ -359,35 +412,6 @@ export function insertFixStepsAfter(
   const afterIdx = plan.steps.findIndex(s => String(s.id) === String(afterStepId));
   if (afterIdx < 0 || !incoming.steps.length) return plan;
 
-  const usedStepIds = new Set(plan.steps.map(s => String(s.id)));
-  const usedTaskIds = new Set(plan.steps.flatMap(s => s.tasks.map(t => String(t.id))));
-
-  const remapStepId = (raw: string, index: number): string => {
-    let id = String(raw || `fix-${index + 1}`);
-    if (!usedStepIds.has(id)) {
-      usedStepIds.add(id);
-      return id;
-    }
-    let n = plan.steps.length + index + 1;
-    while (usedStepIds.has(String(n))) n += 1;
-    id = String(n);
-    usedStepIds.add(id);
-    return id;
-  };
-
-  const remapTaskId = (raw: string, stepId: string, tIndex: number): string => {
-    let id = String(raw || `${stepId}${String.fromCharCode(97 + tIndex)}`);
-    if (!usedTaskIds.has(id)) {
-      usedTaskIds.add(id);
-      return id;
-    }
-    let n = 1;
-    while (usedTaskIds.has(`${stepId}-${n}`)) n += 1;
-    id = `${stepId}-${n}`;
-    usedTaskIds.add(id);
-    return id;
-  };
-
   const nays = opts?.reworkNays ?? plan.steps[afterIdx]?.reworkCount ?? 0;
   const priorNote = plan.steps[afterIdx]?.reviewNote;
   const escalateNote = [
@@ -397,16 +421,18 @@ export function insertFixStepsAfter(
     .filter(Boolean)
     .join(' ');
 
+  // Temporary ids — renumberPlannerSteps assigns final 1..N display ids.
   const newSteps: PlannerStep[] = incoming.steps.map((s, i) => {
-    const stepId = remapStepId(s.id, i);
+    const uid = newStepUid();
     return {
-      id: stepId,
+      id: `fix-${uid}`,
+      uid,
       title: s.title,
       ...(s.description ? { description: s.description } : {}),
       status: (i === 0 ? 'in_progress' : 'pending') as PlannerStepStatus,
       reworkCount: 0,
       tasks: s.tasks.map((t, ti) => ({
-        id: remapTaskId(t.id, stepId, ti),
+        id: `tmp-${ti}`,
         title: t.title,
         description: t.description,
         ...(t.file ? { file: t.file } : {}),
@@ -421,6 +447,7 @@ export function insertFixStepsAfter(
     if (i === afterIdx) {
       steps.push({
         ...s,
+        uid: s.uid || String(s.id) || newStepUid(),
         status: 'completed' as PlannerStepStatus,
         reviewNote: escalateNote,
         tasks: s.tasks.map(t => ({
@@ -431,23 +458,32 @@ export function insertFixStepsAfter(
       });
       steps.push(...newSteps);
     } else {
-      steps.push(s);
+      steps.push({ ...s, uid: s.uid || String(s.id) || newStepUid() });
     }
   }
 
-  const firstNew = newSteps[0];
+  const firstNewUid = newSteps[0]?.uid;
   const summary =
     incoming.summary && incoming.summary !== plan.summary
       ? `${plan.summary} · ${incoming.summary}`
       : plan.summary;
 
-  return touch(plan, {
+  const draft = touch(plan, {
     summary,
     status: 'active' as PlannerPlanStatus,
     steps,
-    activeStepId: firstNew?.id ?? null,
+    activeStepId: newSteps[0]?.id ?? null,
     resumePhase: 'coder'
   });
+
+  const renumbered = renumberPlannerSteps(draft);
+  if (firstNewUid) {
+    const first = renumbered.steps.find(s => s.uid === firstNewUid);
+    if (first) {
+      return touch(renumbered, { activeStepId: first.id, resumePhase: 'coder' });
+    }
+  }
+  return renumbered;
 }
 
 /**
@@ -458,76 +494,57 @@ export function appendPlannerPlan(
   existing: PlannerPlan | null | undefined,
   incoming: PlannerPlan
 ): PlannerPlan {
-  if (!existing?.steps?.length) return incoming;
+  if (!existing?.steps?.length) return renumberPlannerSteps(incoming);
 
-  const usedStepIds = new Set(existing.steps.map(s => String(s.id)));
-  const usedTaskIds = new Set(
-    existing.steps.flatMap(s => s.tasks.map(t => String(t.id)))
-  );
-
-  const remapStepId = (raw: string, index: number): string => {
-    let id = String(raw || index + 1);
-    if (!usedStepIds.has(id)) {
-      usedStepIds.add(id);
-      return id;
-    }
-    let n = existing.steps.length + index + 1;
-    while (usedStepIds.has(String(n))) n += 1;
-    id = String(n);
-    usedStepIds.add(id);
-    return id;
-  };
-
-  const remapTaskId = (raw: string, stepId: string, tIndex: number): string => {
-    let id = String(raw || `${stepId}${String.fromCharCode(97 + tIndex)}`);
-    if (!usedTaskIds.has(id)) {
-      usedTaskIds.add(id);
-      return id;
-    }
-    let n = 1;
-    while (usedTaskIds.has(`${stepId}-${n}`)) n += 1;
-    id = `${stepId}-${n}`;
-    usedTaskIds.add(id);
-    return id;
-  };
-
-  const priorSteps: PlannerStep[] = existing.steps.map(s =>
-    s.status === 'in_progress' || s.status === 'pending'
-      ? { ...s, status: 'completed' as PlannerStepStatus }
-      : s
-  );
+  const priorSteps: PlannerStep[] = existing.steps.map(s => ({
+    ...s,
+    uid: s.uid || String(s.id) || newStepUid(),
+    status:
+      s.status === 'in_progress' || s.status === 'pending'
+        ? ('completed' as PlannerStepStatus)
+        : s.status
+  }));
 
   const newSteps: PlannerStep[] = incoming.steps.map((s, i) => {
-    const stepId = remapStepId(s.id, i);
+    const uid = s.uid || newStepUid();
     return {
       ...s,
-      id: stepId,
+      id: `append-${uid}`,
+      uid,
       status: (i === 0 ? 'in_progress' : 'pending') as PlannerStepStatus,
       tasks: s.tasks.map((t, ti) => ({
         ...t,
-        id: remapTaskId(t.id, stepId, ti),
+        id: `tmp-${ti}`,
         status: (i === 0 ? 'pending' : t.status) as ExecutionTaskStatus
       }))
     };
   });
 
-  const firstNew = newSteps[0];
+  const firstNewUid = newSteps[0]?.uid;
   const summary =
     incoming.summary && incoming.summary !== existing.summary
       ? `${existing.summary} · ${incoming.summary}`
       : existing.summary || incoming.summary;
 
-  return {
+  const draft: PlannerPlan = {
     ...existing,
     id: incoming.id || existing.id,
     summary,
     status: 'active' as PlannerPlanStatus,
     steps: [...priorSteps, ...newSteps],
-    activeStepId: firstNew?.id ?? null,
+    activeStepId: newSteps[0]?.id ?? null,
     updatedAt: Date.now(),
     ...(incoming.chosenOptionId ? { chosenOptionId: incoming.chosenOptionId } : {}),
-    ...(incoming.chosenOptionTitle ? { chosenOptionTitle: incoming.chosenOptionTitle } : {})
+    ...(incoming.chosenOptionTitle ? { chosenOptionTitle: incoming.chosenOptionTitle } : {}),
+    ...(incoming.delivery ? { delivery: incoming.delivery } : {})
   };
+
+  const renumbered = renumberPlannerSteps(draft);
+  if (firstNewUid) {
+    const first = renumbered.steps.find(s => s.uid === firstNewUid);
+    if (first) return { ...renumbered, activeStepId: first.id };
+  }
+  return renumbered;
 }
 
 /** Materialize Review fix queue into a PlannerPlan for the Conductor panel. */

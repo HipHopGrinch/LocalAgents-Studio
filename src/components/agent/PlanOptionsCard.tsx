@@ -1,6 +1,7 @@
 import React from 'react';
 import { CheckCircle2, ListChecks } from 'lucide-react';
 import { PlanOption } from '../../types';
+import { deliveryBadgeLabel } from '../../lib/projectScaffold';
 
 export interface PlanOptionsCardProps {
   options: PlanOption[];
@@ -22,11 +23,16 @@ export const PlanOptionsCard: React.FC<PlanOptionsCardProps> = ({
     <div className="mt-3 space-y-2 pt-2 border-t border-[#31313e]">
       <div className="flex items-center space-x-1.5 text-[10px] uppercase font-bold text-amber-300/90 tracking-wider">
         <ListChecks className="w-3 h-3" />
-        <span>{options.some(o => o.action === 'paid' || o.action === 'copy') ? 'Stuck loop' : 'Choose a plan'}</span>
+        <span>
+          {options.some(o => o.action === 'paid' || o.action === 'copy')
+            ? 'Stuck loop'
+            : 'Choose how to build it'}
+        </span>
       </div>
       <div className="space-y-1.5">
         {options.map(opt => {
           const selected = selectedId === opt.id;
+          const deliveryLabel = deliveryBadgeLabel(opt.delivery);
           return (
             <button
               key={opt.id}
@@ -43,9 +49,14 @@ export const PlanOptionsCard: React.FC<PlanOptionsCardProps> = ({
             >
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0">
-                  <div className="text-[11px] font-semibold text-zinc-100 flex items-center gap-1.5">
+                  <div className="text-[11px] font-semibold text-zinc-100 flex items-center gap-1.5 flex-wrap">
                     {opt.action !== 'paid' && opt.action !== 'copy' && (
                       <span className="font-mono text-indigo-300">Option {opt.id}</span>
+                    )}
+                    {deliveryLabel && (
+                      <span className="text-[9px] px-1.5 py-0.5 rounded bg-sky-600/25 text-sky-200 border border-sky-500/30 uppercase tracking-wide">
+                        {deliveryLabel}
+                      </span>
                     )}
                     <span className="truncate">{opt.title}</span>
                   </div>

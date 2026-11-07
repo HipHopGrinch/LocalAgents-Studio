@@ -153,11 +153,23 @@ export interface AgentPersona {
   autoApproveCommands: boolean;
 }
 
+/** How the user wants the app delivered — locked at option pick time. */
+export type DeliveryTarget =
+  | 'web'
+  | 'electron'
+  | 'python'
+  | 'native'
+  | 'go'
+  | 'rust'
+  | 'node';
+
 /** A single architecture choice offered by the Planner. */
 export interface PlanOption {
   id: string;
   title: string;
   description: string;
+  /** Platform / runtime for this option (Web, Electron, Python, Native, …). */
+  delivery?: DeliveryTarget;
   /** stop = record the choice and do not start the coder. copy = clipboard. paid = confirm a paid API call. retry-local = different approach on largest local. */
   action?: 'run' | 'stop' | 'copy' | 'paid' | 'retry-local';
 }
@@ -173,6 +185,8 @@ export interface ApprovedPlan {
   approvedAt: number;
   /** Full planner markdown (options block stripped) for agent context */
   planMarkdown?: string;
+  /** Locked delivery from the chosen option (scaffold + verify read this). */
+  delivery?: DeliveryTarget;
 }
 
 /** Planner-owned execution plan: steps contain coder tasks; Reviewer Yay/Nay per step. */
@@ -189,7 +203,10 @@ export interface PlannerTask {
 }
 
 export interface PlannerStep {
+  /** Display number as string ("1", "2", …) — renumbered after inserts. */
   id: string;
+  /** Stable identity across renumbers; seeded from id when missing. */
+  uid?: string;
   title: string;
   description?: string;
   status: PlannerStepStatus;
@@ -214,11 +231,16 @@ export interface PlannerPlan {
   /** Architecture option that produced this plan */
   chosenOptionId?: string;
   chosenOptionTitle?: string;
+  /** Locked delivery target from plan options (web / electron / python / native / …). */
+  delivery?: DeliveryTarget;
   /**
    * Checkpoint for seamless Play after Pause / app reopen.
    * coder = implement (or finish tools); review = Reviewer Yay/Nay; verdict = apply pending Yay/Nay.
    */
   resumePhase?: PlannerResumePhase;
+  /** Last verify / install command stored for Resume idempotency. */
+  verifyCommand?: string | null;
+  lastVerifyOk?: boolean;
 }
 
 /** One agent chat thread (Cursor/VS Code-style conversation). */

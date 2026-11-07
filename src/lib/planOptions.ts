@@ -1,4 +1,5 @@
-import { ApprovedPlan, ChatMessage, PlanOption, ReviewFixPlan, ReviewFixTask } from '../types';
+import { ApprovedPlan, ChatMessage, DeliveryTarget, PlanOption, ReviewFixPlan, ReviewFixTask } from '../types';
+import { inferDeliveryFromText, normalizeDelivery } from './projectScaffold';
 
 /** Protocol appended to Planner system prompts so options are UI-parseable. */
 export const PLANNER_PROTOCOL = `## Planner → Coder workflow (MANDATORY)
@@ -7,21 +8,24 @@ You are in **Planner mode**. Do NOT implement or write project files yet (no <wr
 
 ### Intent bending
 - Prefer matching the user's **delivery goal**, not a default stack.
-- If they say "open in browser", "static site", "HTML page", or similar → bias toward static HTML/CSS/JS unless they explicitly ask for React/Vite/Next.
-- If they ask for React/SPA/components → offer that as an option, not the only path.
-- Ask **only** decisions that change architecture (stack, single-node vs Swarm, scope). Do not spam questions.
+- The **first decision** the user must see is **how to build it** (platform): Web, Electron desktop, Python, or Native Windows — plus Go/Rust when relevant.
+- If they say "open in browser", "static site", "HTML page", or similar → bias toward Web (static HTML or Vite).
+- If they ask for React/SPA/3D-in-browser → Web with React/Vite (and R3F when 3D).
+- Ask **only** decisions that change architecture (platform, single-node vs Swarm, scope). Do not spam questions.
 
 ### Required output shape
 1. Brief intent analysis (2–4 sentences) and assumptions.
 2. A concrete proposed plan: phases and key files.
-3. **2–4 numbered options** with short tradeoffs (e.g. static HTML vs React; Swarm vs single-node; minimal vs full scope).
+3. **2–4 numbered options**. For greenfield apps, options MUST cover distinct **delivery** platforms when plausible (at least Web + one of Electron / Python / Native). Lead each title with the platform.
 
-You MUST end with a machine-readable block (prefer XML). Example:
+You MUST end with a machine-readable block (prefer XML). Every \`<option>\` MUST include a \`delivery\` attribute: \`web\` | \`electron\` | \`python\` | \`native\` | \`go\` | \`rust\` | \`node\`.
+
+Example:
 
 <plan_options>
-<option id="1" title="Static HTML store">Single index.html + CSS/JS; opens directly in the browser. Fastest path.</option>
-<option id="2" title="React + Vite app">Componentized SPA; needs npm install/dev server. Better for growth.</option>
-<option id="3" title="Static HTML via Swarm">Same static site, but parallel file workers if multi-file.</option>
+<option id="1" delivery="web" title="Web — Vite + React + R3F">Browser 3D app; npm install + vite. Best for high-quality WebGL and quick iteration.</option>
+<option id="2" delivery="electron" title="Electron — desktop shell">Installable desktop window wrapping the same React/Three stack.</option>
+<option id="3" delivery="python" title="Python — Pygame/desktop">Native-feeling Python GUI; simpler packaging, different 3D quality tradeoffs.</option>
 </plan_options>
 
 Also list the same options in human-readable markdown (Option 1 / Option 2 …). Wait for the user to pick before any implementation.`;
@@ -560,16 +564,27 @@ export function formatApprovedPlanForSwarm(plan: ApprovedPlan): string {
   const title = (plan.chosenOptionTitle || '').toLowerCase();
   const desc = (plan.chosenOptionDescription || '').toLowerCase();
   const blob = `${title} ${desc} ${plan.originalUserRequest || ''}`.toLowerCase();
+  const delivery = plan.delivery;
   let stackHint =
     'Infer stack from the chosen option. Prefer HTML/CSS/JS for static sites; TypeScript contract workflow only when React/TypeScript was chosen.';
-  if (/\b(c\+\+|cpp|win32|gdi|msvc|native)\b/.test(blob) && !/\belectron\b/.test(blob)) {
+  if (delivery === 'native' || (/\b(c\+\+|cpp|win32|gdi|msvc|native)\b/.test(blob) && !/\belectron\b/.test(blob))) {
     stackHint =
       'Stack MUST be "native-win32". contractFile = "SWARM.md" (short shared notes in markdown, not TypeScript). Tasks: real .cpp/.h/.rc/.bat (or .cs) paths with concrete per-file instructions. Do NOT invent a TypeScript SPA.';
+  } else if (delivery === 'python') {
+    stackHint =
+      'Stack MUST be "python". Tasks are .py modules + requirements.txt. Do NOT invent a React/TypeScript SPA unless the option explicitly says so.';
+  } else if (delivery === 'electron' || delivery === 'node') {
+    stackHint =
+      'Stack MUST be "node" (Electron/desktop Node). package.json + TypeScript/JS entry; shared contractFile when using React.';
+  } else if (
+    delivery === 'web' ||
+    (/\breact|typescript|\.tsx|vite|r3f|three\b/.test(blob) && !/\bstatic html\b/.test(blob))
+  ) {
+    stackHint =
+      'Stack MUST be "typescript" with a shared TypeScript contractFile. Use Vite + React 18. Pin react@18 for R3F compatibility.';
   } else if (/\b(static|html|css)\b/.test(blob) && !/\breact|typescript\b/.test(blob)) {
     stackHint =
       'Stack MUST be "static-web". Tasks like index.html, styles.css, app.js. Minimal or markdown contractFile — do NOT force React/TypeScript.';
-  } else if (/\breact|typescript|\.tsx\b/.test(blob)) {
-    stackHint = 'Stack "typescript" with a shared TypeScript contractFile is appropriate.';
   }
 
   return `APPROVED USER PLAN (already chosen — follow exactly):
@@ -578,6 +593,7 @@ Original request: ${plan.originalUserRequest}
 
 Chosen option (#${plan.chosenOptionId}): ${plan.chosenOptionTitle}
 ${plan.chosenOptionDescription}
+${delivery ? `Locked delivery: ${delivery}` : ''}
 
 ${stackHint}
 
@@ -602,12 +618,15 @@ export function stripPlanOptionMarkup(text: string): string {
   return out.replace(/\n{3,}/g, '\n\n').trim();
 }
 
-function normalizeOption(raw: Partial<PlanOption>, index: number): PlanOption | null {
+function normalizeOption(raw: Partial<PlanOption> & { delivery?: string }, index: number): PlanOption | null {
   const id = String(raw.id ?? index + 1).trim() || String(index + 1);
   const title = (raw.title || '').trim() || `Option ${id}`;
   const description = (raw.description || '').trim() || title;
   if (!title && !description) return null;
-  return { id, title, description };
+  const delivery =
+    normalizeDelivery(raw.delivery) ||
+    inferDeliveryFromText(`${title} ${description}`);
+  return { id, title, description, ...(delivery ? { delivery } : {}) };
 }
 
 function parseXmlPlanOptions(text: string): PlanOption[] {
@@ -626,7 +645,8 @@ function parseXmlPlanOptions(text: string): PlanOption[] {
       {
         id: attrs.id || String(i + 1),
         title: attrs.title || '',
-        description: (m[2] || attrs.description || '').trim()
+        description: (m[2] || attrs.description || '').trim(),
+        delivery: attrs.delivery
       },
       i
     );
@@ -781,6 +801,9 @@ export function buildApprovedPlan(
   option: PlanOption,
   originalUserRequest: string
 ): ApprovedPlan {
+  const delivery: DeliveryTarget | undefined =
+    option.delivery ||
+    inferDeliveryFromText(`${option.title} ${option.description} ${originalUserRequest || ''}`);
   return {
     summary: planMsg.planSummary || stripPlanOptionMarkup(planMsg.display || planMsg.raw || ''),
     planMarkdown: stripPlanOptionMarkup(planMsg.raw || planMsg.display || ''),
@@ -789,6 +812,7 @@ export function buildApprovedPlan(
     chosenOptionDescription: option.description,
     allOptions: planMsg.planOptions || [option],
     originalUserRequest: originalUserRequest || planMsg.planSummary || '',
-    approvedAt: Date.now()
+    approvedAt: Date.now(),
+    ...(delivery ? { delivery } : {})
   };
 }

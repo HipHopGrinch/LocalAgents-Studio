@@ -188,6 +188,18 @@ export interface StepVerdict {
 
 /** Auto Coder↔Reviewer reworks per step before Planner escalation. */
 export const MAX_STEP_REWORKS = 2;
+/** How many times a plan may grow via Nay escalation before we stop. */
+export const MAX_PLAN_ESCALATIONS = 2;
+/** Hard ceiling so a failing file cannot become a 100-step plan. */
+export const MAX_PLAN_STEPS = 18;
+
+export function normalizeStepTitle(title: string): string {
+  return (title || '')
+    .replace(/^(fix:\s*)+/i, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
 
 /** Apply Reviewer Yay/Nay to the active (or named) step. */
 export function applyStepVerdict(plan: PlannerPlan, verdict: StepVerdict): PlannerPlan {
@@ -315,7 +327,7 @@ ${step.description ? `${step.description}\n` : ''}${note}
 ### Tasks
 ${tasks.join('\n') || '(no open tasks)'}
 
-Implement every open task above. Use edit_file/write_file on the files listed (and any others you must touch). Prefer edit_file when the current file body is provided below. Do not start later plan steps.`;
+Implement every open task above. Use edit_file/write_file on the files listed only. Prefer edit_file when the current file body is provided below. The file body must be valid source (import/export/code) — never a review, plan, or <plan_options> essay. Do not start later plan steps. Do not create a parallel file (app.ts beside App.tsx, ui.ts beside UIOverlay).`;
 }
 
 /** Prompt for Reviewer verifying one step. */
@@ -411,6 +423,22 @@ export function insertFixStepsAfter(
 ): PlannerPlan {
   const afterIdx = plan.steps.findIndex(s => String(s.id) === String(afterStepId));
   if (afterIdx < 0 || !incoming.steps.length) return plan;
+  if ((plan.escalationCount || 0) >= MAX_PLAN_ESCALATIONS) return plan;
+  if (plan.steps.length >= MAX_PLAN_STEPS) return plan;
+
+  const existingTitles = new Set(plan.steps.map(s => normalizeStepTitle(s.title)));
+  const fresh = incoming.steps
+    .map(s => ({
+      ...s,
+      title: (s.title || 'Repair the failing files').replace(/^(fix:\s*)+/i, '').trim()
+    }))
+    .filter(s => {
+      const key = normalizeStepTitle(s.title);
+      return key.length > 0 && !existingTitles.has(key);
+    })
+    .slice(0, 1);
+  if (!fresh.length) return plan;
+  const stepsToAdd = fresh;
 
   const nays = opts?.reworkNays ?? plan.steps[afterIdx]?.reworkCount ?? 0;
   const priorNote = plan.steps[afterIdx]?.reviewNote;
@@ -422,7 +450,7 @@ export function insertFixStepsAfter(
     .join(' ');
 
   // Temporary ids — renumberPlannerSteps assigns final 1..N display ids.
-  const newSteps: PlannerStep[] = incoming.steps.map((s, i) => {
+  const newSteps: PlannerStep[] = stepsToAdd.map((s, i) => {
     const uid = newStepUid();
     return {
       id: `fix-${uid}`,
@@ -473,7 +501,9 @@ export function insertFixStepsAfter(
     status: 'active' as PlannerPlanStatus,
     steps,
     activeStepId: newSteps[0]?.id ?? null,
-    resumePhase: 'coder'
+    resumePhase: 'coder',
+    escalationCount: (plan.escalationCount || 0) + 1,
+    blockedReason: undefined
   });
 
   const renumbered = renumberPlannerSteps(draft);

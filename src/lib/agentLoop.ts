@@ -1,5 +1,7 @@
 import { ChatMessage, ToolCall } from '../types';
 import { applyEdits, formatToolResult, READ_ONLY_TOOLS } from './tools';
+import { shouldRejectPlannerWrite } from './swarmContract';
+import { shadowOwnedPath } from './projectBrain';
 import { pickImageTarget, placeholderSvg } from './imageRouting';
 
 /** Fallback when settings.maxAgentSteps is missing. */
@@ -44,6 +46,8 @@ export interface ToolExecutorDeps {
   onExecuteToolCommand: (command: string) => Promise<string>;
   nodes?: import('../types').EndpointNode[];
   searxngUrl?: string;
+  /** Live owned-file list so writes cannot invent a parallel module. */
+  getOwnedFiles?: () => string[];
 }
 
 /** Execute one tool without mutating the input; returns a new ToolCall. */
@@ -56,6 +60,21 @@ export async function executeTool(tool: ToolCall, deps: ToolExecutorDeps): Promi
     if (tool.name === 'write_file') {
       const filePath = tool.args?.path || 'file';
       let content = tool.body || '';
+      if (shouldRejectPlannerWrite(filePath, content)) {
+        return {
+          ...next,
+          status: 'error',
+          result: `Rejected write to ${filePath}: body is a plan/review essay, not source. Edit the real file with valid code only.`
+        };
+      }
+      const shadow = shadowOwnedPath(deps.getOwnedFiles?.() || [], filePath);
+      if (shadow) {
+        return {
+          ...next,
+          status: 'error',
+          result: `Rejected ${filePath}: that module already exists as ${shadow}. Edit ${shadow} instead of creating a second copy.`
+        };
+      }
       // Ensure JSON files never have accidental markdown code fence wrappers
       if (filePath.toLowerCase().endsWith('.json') && content.trim().startsWith('```')) {
         content = content.replace(/^\s*```[a-zA-Z0-9_\-\+#]*[ \t]*\r?\n?/, '').replace(/\r?\n?```\s*$/, '');

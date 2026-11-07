@@ -124,6 +124,19 @@ function stemOf(path: string): string {
  * If a worker invents a parallel file for a module we already own
  * (`Board.tsx` vs `CheckersBoard.tsx`), return the existing path.
  */
+/** Block a second entrypoint (`src/app.ts` beside `src/App.tsx`). */
+export function shadowOwnedPath(owned: string[], candidate: string): string | null {
+  const rel = (candidate || '').replace(/\\/g, '/').replace(/^\.?\//, '');
+  const lower = rel.toLowerCase();
+  const has = (p: string) => owned.some(o => o.replace(/\\/g, '/').toLowerCase() === p);
+  if ((lower === 'src/app.ts' || lower === 'app.ts') && has('src/app.tsx')) return 'src/App.tsx';
+  if (lower === 'src/ui.ts' || lower === 'ui.ts') {
+    const overlay = owned.find(o => /uioverlay\.tsx$/i.test(o.replace(/\\/g, '/')));
+    if (overlay) return overlay.replace(/\\/g, '/');
+  }
+  return preferredExistingPath(owned, rel);
+}
+
 export function preferredExistingPath(owned: string[], candidate: string): string | null {
   const rel = (candidate || '').replace(/\\/g, '/');
   if (!rel) return null;

@@ -241,6 +241,10 @@ export interface PlannerPlan {
   /** Last verify / install command stored for Resume idempotency. */
   verifyCommand?: string | null;
   lastVerifyOk?: boolean;
+  /** How many times Nay escalation has appended steps. Capped. */
+  escalationCount?: number;
+  /** Set when the loop stops instead of appending more Fix steps. */
+  blockedReason?: string;
 }
 
 /** One agent chat thread (Cursor/VS Code-style conversation). */

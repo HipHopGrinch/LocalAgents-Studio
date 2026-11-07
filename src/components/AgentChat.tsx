@@ -226,6 +226,8 @@ import {
   isPlanActive,
   markAllStepTasks,
   markStepInProgress,
+  MAX_PLAN_ESCALATIONS,
+  MAX_PLAN_STEPS,
   MAX_STEP_REWORKS,
   parsePlannerPlanJson,
   plannerPlanFromReviewQueue,
@@ -878,7 +880,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     onApplyFileWrite,
     onExecuteToolCommand: executeTrackedCommand,
     nodes,
-    searxngUrl
+    searxngUrl,
+    getOwnedFiles: () => projectBrainRef.current.ownedFiles
   };
 
   // Sync permissions when the persona changes. Do not stamp the persona's
@@ -4373,7 +4376,8 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     const fromChat = messagesRef.current.filter(
       m =>
         m.stepVerdict?.result === 'nay' &&
-        (!m.stepVerdict.stepId || String(m.stepVerdict.stepId) === String(stepId))
+        !!m.stepVerdict.stepId &&
+        String(m.stepVerdict.stepId) === String(stepId)
     ).length;
     return Math.max(
       stepRework || 0,
@@ -4405,6 +4409,19 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       }
     }
     const reworkCount = effectiveStepReworkCount(String(stuck.id), stuck.reworkCount);
+    const escalations = plan.escalationCount || 0;
+    if (escalations >= MAX_PLAN_ESCALATIONS || plan.steps.length >= MAX_PLAN_STEPS) {
+      const reason = `Stopped after ${plan.steps.length} steps. Step #${stuck.id} is still failing and more "Fix" steps would repeat the same files. Last note: ${(stuck.reviewNote || 'verify failed').slice(0, 280)}`;
+      commitPlannerPlan({
+        ...plan,
+        blockedReason: reason,
+        resumePhase: 'coder',
+        updatedAt: Date.now()
+      });
+      setPlanPaused(true);
+      restorePlannerControl(reason);
+      return;
+    }
 
     setPlanPaused(false);
     beginActivity(
@@ -4476,12 +4493,21 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
 
     plan = plannerPlanRef.current;
     if (!plan) return;
+    const before = plan.steps.length;
     plan = insertFixStepsAfter(
       plan,
       String(stuck.id),
       { summary: parsed.summary, steps: parsed.steps },
       { reworkNays: reworkCount }
     );
+    if (plan.steps.length === before) {
+      const reason = `Stopped. Step #${stuck.id} failed and a new fix step would duplicate work already on the plan (${plan.steps.length} steps).`;
+      commitPlannerPlan({ ...plan, blockedReason: reason, updatedAt: Date.now() });
+      setPlanPaused(true);
+      endActivity();
+      restorePlannerControl(reason);
+      return;
+    }
     commitPlannerPlan(plan);
     endActivity();
 

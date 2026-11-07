@@ -110,11 +110,28 @@ export function sanitizeTaskInstructions(
   return clean;
 }
 
+const SOURCE_EXT = /\.(bat|cmd|ps1|h|hpp|c|cpp|cc|cxx|rc|cs|py|go|rs|js|jsx|ts|tsx|html|css|json)$/i;
+
+/** Essay dumped into a source file (no import/export, starts like a review). */
+export function looksLikeSourceProse(path: string, body: string): boolean {
+  const p = (path || '').toLowerCase();
+  if (!/\.(ts|tsx|js|jsx|py|css)$/.test(p)) return false;
+  const head = (body || '').trim().slice(0, 600);
+  if (!head) return false;
+  if (looksLikePlannerProse(head)) return true;
+  const startsAsCode = /^(import |export |\/\*|\/\/|const |let |function |class |type |interface |#|['"]use |<)/.test(
+    head
+  );
+  const startsAsEssay =
+    /^(this is|the (build|primary|goal|file)|i will |identified |surgical |here is|in order to)\b/i.test(head);
+  return startsAsEssay && !startsAsCode;
+}
+
 /** True when a write_file body is planner prose for a path that should be real source. */
 export function shouldRejectPlannerWrite(path: string, body: string): boolean {
-  if (!looksLikePlannerProse(body)) return false;
   const p = (path || '').toLowerCase();
-  return /\.(bat|cmd|ps1|h|hpp|c|cpp|cc|cxx|rc|cs|py|go|rs|js|jsx|ts|tsx|html|css|json)$/i.test(p);
+  if (!SOURCE_EXT.test(p)) return false;
+  return looksLikePlannerProse(body) || looksLikeSourceProse(path, body);
 }
 
 /** Same Ollama URL shares one GPU, even if two node entries point at it. */

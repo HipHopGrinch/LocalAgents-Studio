@@ -459,7 +459,10 @@ ${opts.stepDescription ? `${opts.stepDescription}\n` : ''}
 ${history || '(no detailed notes — inspect the stuck step tasks and files)'}
 
 ### Your job
-Emit a small <execution_plan> with **1–3 new fix steps** that knock out those Nays.
+Emit a small <execution_plan> with **exactly 1 new fix step** that edits the files already named.
+- Do not prefix the title with "Fix:" if the stuck title already says Fix.
+- Do not add a build-verification step. Verification is automatic.
+- Do not create a second file for a module that already exists.
 - Each step needs concrete coder <task> items with file= when known.
 - Do NOT restate completed steps. Do NOT emit <plan_options>. Do NOT implement code yourself.
 - Later pending product steps stay in the Conductor list; you only add the fix packet.

@@ -620,6 +620,8 @@ export interface BuildSystemPromptOptions {
   nodes?: EndpointNode[];
   /** Node currently running inference (may differ from Dev) */
   inferenceNodeId?: string;
+  /** Durable project brief, owned files, rules — injected on every role. */
+  projectContext?: string;
 }
 
 export function buildSystemPrompt(
@@ -649,6 +651,7 @@ export function buildSystemPrompt(
   if (opts?.nodes?.length) {
     parts.push(buildDevHostPromptSection(opts.nodes, opts.inferenceNodeId));
   }
+  if (opts?.projectContext?.trim()) parts.push(opts.projectContext.trim());
   if (lockPlanMode) {
     parts.push(EXECUTION_PLAN_LOCK_PROTOCOL);
     if (agent.toolsEnabled) {

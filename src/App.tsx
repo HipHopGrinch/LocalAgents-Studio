@@ -600,9 +600,8 @@ export const App: React.FC = () => {
         let forWs = fromDisk.length ? fromDisk : fromSettings;
         let active = loaded.activeConversationId || undefined;
         if (wantNewChat) {
-          // Same as New Chat: discard every prior thread for this project.
           const fresh = createConversation(workspacePath, selectedAgentId);
-          forWs = [fresh];
+          forWs = [fresh, ...forWs];
           active = fresh.id;
         } else if (!forWs.some(c => c.id === active)) {
           if (!forWs.length) {
@@ -765,19 +764,44 @@ export const App: React.FC = () => {
     openWorkspace(chosen);
   };
 
-  /** New Chat wipes all prior threads for this project — one blank conversation only. */
+  /** New Chat adds a thread. Project brain and older chats stay. */
   const handleNewChat = () => {
     const fresh = createConversation(workspacePath, selectedAgentId);
     setActiveConversationId(fresh.id);
     setSettings(prev => {
+      const existing = conversationsForWorkspace(prev.conversations, workspacePath);
       const conversations = replaceWorkspaceConversations(prev.conversations, workspacePath, [
-        fresh
+        fresh,
+        ...existing
       ]);
       const next = {
         ...prev,
         conversations,
         activeConversationId: fresh.id
       };
+      if (window.electronAPI) {
+        window.electronAPI.saveSettings(next);
+        if (workspacePath) {
+          window.electronAPI.saveProjectChats(workspacePath, {
+            conversations: conversationsForWorkspace(conversations, workspacePath),
+            activeConversationId: fresh.id
+          });
+          markChatsSaved();
+        }
+      }
+      return next;
+    });
+  };
+
+  /** Explicit wipe of chat threads. Project files and project.json stay. */
+  const handleClearProjectChats = () => {
+    const fresh = createConversation(workspacePath, selectedAgentId);
+    setActiveConversationId(fresh.id);
+    setSettings(prev => {
+      const conversations = replaceWorkspaceConversations(prev.conversations, workspacePath, [
+        fresh
+      ]);
+      const next = { ...prev, conversations, activeConversationId: fresh.id };
       if (window.electronAPI) {
         window.electronAPI.saveSettings(next);
         if (workspacePath) {
@@ -1277,6 +1301,7 @@ export const App: React.FC = () => {
     onMessagesChange: handleMessagesChange,
     onConversationPatch: handleConversationPatch,
     onNewChat: handleNewChat,
+    onClearProjectChats: handleClearProjectChats,
     onSelectConversation: handleSelectConversation,
     onDeleteConversation: handleDeleteConversation,
     onToggleModelThinking: handleToggleModelThinking,

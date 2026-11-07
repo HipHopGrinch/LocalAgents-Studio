@@ -82,6 +82,19 @@ import {
   looksLikeRealIndexHtml,
   scaffoldFilesForStack
 } from '../lib/projectScaffold';
+import { verifyCommandForStack, type DeliveryStack } from '../lib/deliveryIntent';
+import {
+  emptyProjectBrain,
+  extractAtMentions,
+  formatProjectBrainForPrompt,
+  parseProjectBrain,
+  preferredExistingPath,
+  projectBrainPath,
+  rememberOwnedFile,
+  rulesCandidatePaths,
+  shouldPreserveContract,
+  type ProjectBrain
+} from '../lib/projectBrain';
 import {
   MAX_COMMAND_FIX_ATTEMPTS,
   autoApplyWritableTools,
@@ -268,6 +281,8 @@ interface AgentChatProps {
     >
   ) => void;
   onNewChat: () => void;
+  /** Wipe chat threads only. Project brain and source files stay. */
+  onClearProjectChats?: () => void;
   onSelectConversation: (id: string) => void;
   onDeleteConversation: (id: string) => void;
   /** Persist think on/off for a model on a node */
@@ -313,6 +328,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   onMessagesChange,
   onConversationPatch,
   onNewChat,
+  onClearProjectChats,
   onSelectConversation,
   onDeleteConversation,
   onToggleModelThinking,
@@ -387,6 +403,26 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     setActivityStack(next);
     setExecutingPlanNotice(activityLabelOf(next));
   };
+  const [projectBrain, setProjectBrain] = useState<ProjectBrain>(emptyProjectBrain());
+  const projectBrainRef = useRef<ProjectBrain>(emptyProjectBrain());
+  const projectRulesRef = useRef('');
+  const [pinnedFiles, setPinnedFiles] = useState<string[]>([]);
+  const commitProjectBrain = (next: ProjectBrain) => {
+    const stamped = { ...next, updatedAt: Date.now() };
+    projectBrainRef.current = stamped;
+    setProjectBrain(stamped);
+    if (!workspacePath || !window.electronAPI?.writeFile) return;
+    void window.electronAPI.writeFile(projectBrainPath(workspacePath), JSON.stringify(stamped, null, 2));
+  };
+  const projectContextForPrompt = () =>
+    formatProjectBrainForPrompt(projectBrainRef.current, projectRulesRef.current);
+  const noteOwnedPath = (rel: string | undefined) => {
+    if (!rel) return;
+    const next = rememberOwnedFile(projectBrainRef.current, rel);
+    if (next !== projectBrainRef.current && next.ownedFiles.length !== projectBrainRef.current.ownedFiles.length) {
+      commitProjectBrain(next);
+    }
+  };
   const chatBottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const activeAbortsRef = useRef<(() => void)[]>([]);
@@ -446,6 +482,25 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     setPlannerPlanView(next);
     syncReworkCountsFromPlan(next);
     onConversationPatch?.({ plannerPlan: next });
+    if (next?.steps?.length) {
+      const todo = next.steps.map(s => ({
+        id: String(s.id),
+        title: s.title,
+        status: s.status
+      }));
+      const brain = projectBrainRef.current;
+      const same =
+        brain.todo.length === todo.length &&
+        brain.todo.every((t, i) => t.id === todo[i].id && t.status === todo[i].status);
+      if (!same) {
+        commitProjectBrain({
+          ...brain,
+          todo,
+          ...(next.delivery ? { delivery: next.delivery } : {}),
+          ...(next.verifyCommand ? { verifyCommand: next.verifyCommand } : {})
+        });
+      }
+    }
     const id = conversationIdRef.current;
     if (!workspacePath || !id || !window.electronAPI?.writeFile) return;
     if (next) {
@@ -757,6 +812,34 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     };
   }, [conversation?.id, workspacePath]);
 
+  // Project brain + rules survive New Chat and compaction.
+  useEffect(() => {
+    if (!workspacePath || !window.electronAPI?.readFile) return;
+    let cancel = false;
+    (async () => {
+      const brainRes = await window.electronAPI.readFile(projectBrainPath(workspacePath));
+      const brain = brainRes.content
+        ? parseProjectBrain(brainRes.content) || emptyProjectBrain()
+        : emptyProjectBrain();
+      const ruleChunks: string[] = [];
+      for (const p of rulesCandidatePaths(workspacePath)) {
+        try {
+          const res = await window.electronAPI.readFile(p);
+          if (res.content?.trim()) ruleChunks.push(res.content.trim());
+        } catch {
+          /* optional */
+        }
+      }
+      if (cancel) return;
+      projectRulesRef.current = ruleChunks.join('\n\n').slice(0, 6000);
+      projectBrainRef.current = brain;
+      setProjectBrain(brain);
+    })();
+    return () => {
+      cancel = true;
+    };
+  }, [workspacePath]);
+
   // Persist message edits up to App (skip one tick after conversation switch)
   useEffect(() => {
     if (skipPersistRef.current) {
@@ -772,10 +855,28 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     ? workspaceFiles.slice(0, 80).map(f => (f.isDirectory ? `📁 ${f.name}/` : `📄 ${f.name}`)).join('\n')
     : '(empty workspace or loading)';
 
+  const executeTrackedCommand = async (command: string) => {
+    beginActivity('tool', 'Terminal', command.slice(0, 90));
+    try {
+      const out = await onExecuteToolCommand(command);
+      commitProjectBrain({
+        ...projectBrainRef.current,
+        lastTerminal: {
+          command: command.slice(0, 240),
+          output: (out || '').slice(-1800),
+          at: Date.now()
+        }
+      });
+      return out;
+    } finally {
+      endActivity();
+    }
+  };
+
   const toolDeps = {
     workspacePath,
     onApplyFileWrite,
-    onExecuteToolCommand,
+    onExecuteToolCommand: executeTrackedCommand,
     nodes,
     searxngUrl
   };
@@ -1319,6 +1420,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
             ? null
             : approvedPlanRef.current,
         progressLog: progressForPrompt(),
+        projectContext: projectContextForPrompt(),
         nodes,
         inferenceNodeId: routeNode.id
       });
@@ -1568,16 +1670,28 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     };
 
     const loadExistingSnippets = async (): Promise<string> => {
-      if (!workspaceFiles?.length || !window.electronAPI) return '';
-      const files = workspaceFiles
-        .filter(f => !f.isDirectory && /\.(ts|tsx|js|jsx|json)$/i.test(f.name))
-        .slice(0, 5);
+      if (!window.electronAPI || !workspacePath) return '';
+      const sep = workspacePath.includes('\\') ? '\\' : '/';
+      const rels = new Set<string>();
+      const contract = projectBrainRef.current.contractFile;
+      if (contract) rels.add(contract.replace(/\\/g, '/'));
+      for (const owned of projectBrainRef.current.ownedFiles) rels.add(owned.replace(/\\/g, '/'));
+      for (const f of workspaceFiles || []) {
+        if (f.isDirectory) continue;
+        if (!/\.(ts|tsx|js|jsx|py|html|css)$/i.test(f.name)) continue;
+        const rel = f.path.startsWith(workspacePath)
+          ? f.path.slice(workspacePath.length).replace(/^[\\/]/, '').replace(/\\/g, '/')
+          : f.name;
+        rels.add(rel);
+        if (rels.size >= 14) break;
+      }
       const chunks: string[] = [];
-      for (const f of files) {
+      for (const rel of [...rels].slice(0, 12)) {
         try {
-          const res = await window.electronAPI.readFile(f.path);
+          const abs = `${workspacePath.replace(/[\\/]+$/, '')}${sep}${rel.replace(/\//g, sep)}`;
+          const res = await window.electronAPI.readFile(abs);
           if (res.content != null) {
-            chunks.push(`### ${f.name}\n\`\`\`\n${res.content.slice(0, 2500)}\n\`\`\``);
+            chunks.push(`### ${rel}\n\`\`\`\n${res.content.slice(0, 2200)}\n\`\`\``);
           }
         } catch {
           /* skip */
@@ -1621,6 +1735,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
 
       const workerSystemPrompt = buildSystemPrompt(currentAgent, workspacePath, workspaceOverview, {
         progressLog: progressForPrompt(),
+        projectContext: projectContextForPrompt(),
         nodes,
         inferenceNodeId: node.id
       });
@@ -1719,6 +1834,18 @@ export const AgentChat: React.FC<AgentChatProps> = ({
                 'Rejected: body looks like planner/option prose, not source for this path. Rewrite with real file contents only.'
             };
           }
+          if (t.name === 'write_file') {
+            const candidate = t.args?.path || expectedFilePath || '';
+            const existing = preferredExistingPath(projectBrainRef.current.ownedFiles, candidate);
+            if (existing) {
+              return {
+                ...t,
+                status: 'error' as const,
+                result: `Rejected parallel module \`${candidate}\`. Edit the owned file \`${existing}\` instead of creating a second copy.`
+              };
+            }
+          }
+          noteOwnedPath(t.args?.path || expectedFilePath);
           return t;
         });
 
@@ -1955,6 +2082,14 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       try {
         const snippets = await loadExistingSnippets();
         const swarmDevHost = buildDevHostPromptSection(nodes, architect.node.id);
+        const lockedContractRel = projectBrainRef.current.contractFile;
+        const existingContractBody = lockedContractRel
+          ? await readWorkspaceRel(lockedContractRel)
+          : undefined;
+        const contractLockNote =
+          projectBrainRef.current.contractLocked && existingContractBody
+            ? `\n\nEXISTING LOCKED CONTRACT (${lockedContractRel}) — extend these exports; do not delete domain types or replace the file with a smaller unrelated schema:\n\`\`\`\n${existingContractBody.slice(0, 6000)}\n\`\`\`\n`
+            : '';
         const architectPrompt = buildLeadArchitectPrompt(
           swarmTaskText,
           workspaceOverview,
@@ -1969,7 +2104,10 @@ export const AgentChat: React.FC<AgentChatProps> = ({
             content:
               'You are the Lead Architect (@coder). Respond ONLY with a valid JSON object for the Swarm manifest. No markdown outside JSON. Workspace/installs/run_command target the Dev PC where Studio is open — not necessarily this inference host.'
           },
-          { role: 'user', content: architectPrompt }
+          {
+            role: 'user',
+            content: `${architectPrompt}\n${projectContextForPrompt()}${contractLockNote}`
+          }
         ];
         const architectBody: Record<string, unknown> = {
           model: architect.model,
@@ -2007,7 +2145,25 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         })…`
       });
 
+      const priorContract = await readWorkspaceRel(manifest.contractFile);
+      if (priorContract && shouldPreserveContract(priorContract, manifest.contractCode)) {
+        manifest = { ...manifest, contractCode: priorContract };
+        patchPipelineMsg({
+          display: `🔒 Kept existing contract \`${manifest.contractFile}\` — incoming rewrite would drop domain types. Workers will extend owned files.`
+        });
+      }
       const writeOk = await onApplyFileWrite(manifest.contractFile, manifest.contractCode);
+      noteOwnedPath(manifest.contractFile);
+      commitProjectBrain({
+        ...projectBrainRef.current,
+        contractFile: manifest.contractFile,
+        contractLocked: true,
+        stack: (manifest.stack as DeliveryStack) || projectBrainRef.current.stack,
+        verifyCommand:
+          manifest.verifyCommand ||
+          verifyCommandForStack((manifest.stack as DeliveryStack) || 'typescript') ||
+          projectBrainRef.current.verifyCommand
+      });
       if (writeOk) {
         updateProgress(log => noteSavedFiles(log, [{ name: 'write_file', status: 'done', args: { path: manifest.contractFile } }]));
       }
@@ -2119,6 +2275,10 @@ export const AgentChat: React.FC<AgentChatProps> = ({
             recordTok(architect.node, repairRes.stats);
             const repaired = parseSwarmManifest(repairRes.content, swarmTaskText);
             if (repaired) {
+              const keep = await readWorkspaceRel(repaired.contractFile || manifest.contractFile);
+              if (keep && shouldPreserveContract(keep, repaired.contractCode)) {
+                repaired.contractCode = keep;
+              }
               manifest = repaired;
               const repairedOk = await onApplyFileWrite(manifest.contractFile, manifest.contractCode);
               if (repairedOk) {
@@ -2351,7 +2511,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           ...m,
           display: `${m.display || ''}\n\n🔍 Verifying ${manifest.stack}: \`${manifest.verifyCommand}\``
         }));
-        const output = await onExecuteToolCommand(manifest.verifyCommand);
+        const output = await executeTrackedCommand(manifest.verifyCommand);
         const failed = /Exit code:\s*(?!0\b)\d+/i.test(output) || /timed out/i.test(output);
         patchPipelineMsg(m => ({
           ...m,
@@ -2651,6 +2811,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         stepVerdictMode: !!stepVerdictMode,
         approvedPlan: readOnlyMode || contractMode || lockPlanMode ? null : approvedPlan,
         progressLog: progressForPrompt(),
+        projectContext: projectContextForPrompt(),
         nodes,
         inferenceNodeId: routedNode.id
       });
@@ -4333,6 +4494,75 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     await dispatchActiveStep();
   };
 
+  /** Compiler/build must pass before a step can Yay. */
+  const verifyBeforeYay = async (): Promise<{ ok: boolean; output: string }> => {
+    if (!workspacePath) return { ok: true, output: '' };
+    beginActivity('verify', 'Verify before Yay');
+    try {
+      const brain = projectBrainRef.current;
+      const stack =
+        brain.stack ||
+        deliveryToStack(brain.delivery || plannerPlanRef.current?.delivery) ||
+        'typescript';
+      if (
+        (stack === 'typescript' || stack === 'node') &&
+        window.electronAPI?.typecheckWorkspace
+      ) {
+        const r = await window.electronAPI.typecheckWorkspace(workspacePath, {
+          mode: 'workspace',
+          timeoutMs: 90000
+        });
+        const output = r.output || r.error || '';
+        if (r.skipped || !r.ok) {
+          const note = r.skipped
+            ? output || 'Typecheck skipped (no tsconfig) — not a pass.'
+            : output;
+          commitProjectBrain({
+            ...projectBrainRef.current,
+            lastVerifyOk: false,
+            lastVerifyNote: note.slice(0, 800)
+          });
+          return { ok: false, output: note };
+        }
+      }
+      const plan = plannerPlanRef.current;
+      const active = getActiveStep(plan);
+      const laterOpen =
+        plan?.steps.filter(
+          s =>
+            s.id !== active?.id &&
+            (s.status === 'pending' || s.status === 'failed' || s.status === 'in_progress')
+        ).length ?? 0;
+      if (laterOpen === 0) {
+        const cmd =
+          brain.verifyCommand ||
+          (stack === 'typescript' || stack === 'node' ? 'npm run build' : verifyCommandForStack(stack));
+        if (cmd) {
+          const out = await executeTrackedCommand(cmd);
+          const failed = /Exit code:\s*(?!0\b)\d+/i.test(out) || /error TS\d+/i.test(out);
+          commitProjectBrain({
+            ...projectBrainRef.current,
+            verifyCommand: cmd,
+            lastVerifyOk: !failed,
+            lastVerifyNote: (out || '').slice(-800)
+          });
+          if (failed) return { ok: false, output: out || 'verify failed' };
+        }
+      } else {
+        commitProjectBrain({
+          ...projectBrainRef.current,
+          lastVerifyOk: true,
+          lastVerifyNote: 'typecheck passed'
+        });
+      }
+      return { ok: true, output: '' };
+    } catch (err: any) {
+      return { ok: false, output: err?.message || String(err) };
+    } finally {
+      endActivity();
+    }
+  };
+
   /** Apply Yay/Nay to durable plan, then next step or rework / escalate. */
   const applyStepVerdictAndContinue = async (
     verdictMsg: ChatMessage | null,
@@ -4345,10 +4575,20 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     let plan = plannerPlanRef.current;
     if (!plan) return;
 
+    let result = v.result;
+    let notes = v.notes;
+    if (result === 'yay') {
+      const gate = await verifyBeforeYay();
+      if (!gate.ok) {
+        result = 'nay';
+        notes = `Verify failed — step cannot Yay.\n${(gate.output || '').slice(0, 1600)}`;
+      }
+    }
+
     plan = applyStepVerdict(plan, {
       stepId: v.stepId,
-      result: v.result,
-      notes: v.notes
+      result,
+      notes
     });
     commitPlannerPlan(plan);
 
@@ -4371,7 +4611,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       return;
     }
 
-    if (v.result === 'nay') {
+    if (result === 'nay') {
       const sid = String(v.stepId || '');
       const stuck = plan.steps.find(s => String(s.id) === sid);
       const nextCount = effectiveStepReworkCount(sid, stuck?.reworkCount);
@@ -4406,6 +4646,14 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     const original = findPlanOriginalRequest(messagesRef.current, planMsg);
     const approved = buildApprovedPlan(planMsg, option, original);
     approvedPlanRef.current = approved;
+    commitProjectBrain({
+      ...projectBrainRef.current,
+      brief: projectBrainRef.current.brief || approved.originalUserRequest || option.title,
+      delivery: approved.delivery || projectBrainRef.current.delivery,
+      stack:
+        deliveryToStack(approved.delivery) ||
+        projectBrainRef.current.stack
+    });
     executionQueueRef.current = null;
     stepReworkCountRef.current = {};
     // Keep the previous plan visible under Conductor until the new lock commits.
@@ -4637,6 +4885,9 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         : '');
     setInput('');
     setPendingImages([]);
+    if (!projectBrainRef.current.brief) {
+      commitProjectBrain({ ...projectBrainRef.current, brief: userText.slice(0, 1200) });
+    }
     updateProgress(log => noteUserTurn(log, userText));
     fitContext(modelMaxCtx(selectedNode, activeTargetModel));
     resetAgentLoopBudget();
@@ -4644,9 +4895,29 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
     stuckRef.current = { key: '', stage: 'none' };
     ephemeralWorkerRef.current = false;
 
-    let fullPrompt = userText;
+    const mentionRels = [...new Set([...pinnedFiles, ...extractAtMentions(userText)])];
+    let pinnedBlock = '';
+    if (mentionRels.length && window.electronAPI?.readFile && workspacePath) {
+      const sep = workspacePath.includes('\\') ? '\\' : '/';
+      const chunks: string[] = [];
+      for (const rel of mentionRels.slice(0, 6)) {
+        try {
+          const abs = `${workspacePath.replace(/[\\/]+$/, '')}${sep}${rel.replace(/\//g, sep)}`;
+          const res = await window.electronAPI.readFile(abs);
+          if (res.content != null) {
+            chunks.push(`### @${rel}\n\`\`\`\n${res.content.slice(0, 8000)}\n\`\`\``);
+            noteOwnedPath(rel);
+          }
+        } catch {
+          chunks.push(`### @${rel}\n(unreadable)`);
+        }
+      }
+      if (chunks.length) pinnedBlock = `${chunks.join('\n\n')}\n\n`;
+    }
+
+    let fullPrompt = `${pinnedBlock}User Task / Request:\n${userText}`;
     if (includeActiveFile && activeTab) {
-      fullPrompt = `[Active File: ${activeTab.name}]\n\`\`\`${activeTab.language}\n${activeTab.content}\n\`\`\`\n\nUser Task / Request:\n${userText}`;
+      fullPrompt = `[Active File: ${activeTab.name}]\n\`\`\`${activeTab.language}\n${activeTab.content}\n\`\`\`\n\n${fullPrompt}`;
     }
 
     // Match "option 1" / "1" / title against the last pending Planner options
@@ -5430,11 +5701,29 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
               <Shrink className="w-3.5 h-3.5 text-emerald-400" />
               <span>Compact</span>
             </button>
+            {onClearProjectChats && (
+              <button
+                type="button"
+                onClick={() => {
+                  if (
+                    window.confirm(
+                      'Clear all chat threads for this project? Source files and the project brain stay.'
+                    )
+                  ) {
+                    onClearProjectChats();
+                  }
+                }}
+                className="flex items-center space-x-1 px-1.5 py-1 rounded text-[11px] font-medium text-zinc-500 hover:text-rose-200 hover:bg-[#202026] border border-transparent hover:border-[#2a2a36] transition"
+                title="Clear chat history only"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            )}
             <button
               type="button"
               onClick={handleNewChatClick}
               className="flex items-center space-x-1 px-1.5 py-1 rounded text-[11px] font-medium text-zinc-300 hover:text-white hover:bg-[#202026] border border-transparent hover:border-[#2a2a36] transition"
-              title="New chat — clears all project chat history (Ctrl+L)"
+              title="New chat — keeps this project's history and project brain (Ctrl+L)"
             >
               <Plus className="w-3.5 h-3.5 text-indigo-400" />
               <span>New</span>
@@ -5498,7 +5787,31 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
             </div>
           </div>
         ) : (
-          messages.map(msg => (
+          <>
+          {planPaused && isPlanActive(plannerPlanView) && (
+            <div className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-100">
+              <div className="font-semibold text-amber-200">Resume unfinished work</div>
+              <p className="mt-1 text-amber-100/90 leading-relaxed">
+                {projectBrain.brief
+                  ? projectBrain.brief.slice(0, 220)
+                  : plannerPlanView?.summary || 'An active plan is waiting.'}
+              </p>
+              <p className="mt-1 text-zinc-400">
+                Step {plannerPlanView?.activeStepId || '—'}
+                {plannerPlanView?.resumePhase ? ` · ${plannerPlanView.resumePhase}` : ''}
+                {projectBrain.delivery ? ` · ${projectBrain.delivery}` : ''}
+                {projectBrain.lastVerifyOk === false ? ' · last verify failed' : ''}
+              </p>
+              <button
+                type="button"
+                onClick={() => void resumeActivePlan()}
+                className="mt-2 px-2 py-1 rounded border border-emerald-500/50 bg-emerald-600/20 text-emerald-200 text-[10px] font-semibold"
+              >
+                Resume
+              </button>
+            </div>
+          )}
+          {messages.map(msg => (
             <div
               key={msg.id}
               className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}
@@ -5663,7 +5976,8 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                 })()}
               </div>
             </div>
-          ))
+          ))}
+          </>
         )}
         <div ref={chatBottomRef} />
       </div>
@@ -5671,6 +5985,31 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       {/* Input Composer */}
       <div className="p-3 border-t border-[#27272a] bg-[#121215]">
         {showStreamingUi && <ActivityIndicator label={activityLabel} />}
+        {projectBrain.lastTerminal && (
+          <div className="mb-2 px-2 py-1.5 rounded-md bg-[#0e0e12] border border-[#2a2a36] text-[10px] text-zinc-400 font-mono truncate" title={projectBrain.lastTerminal.output}>
+            <span className="text-emerald-400/90">$</span> {projectBrain.lastTerminal.command}
+          </div>
+        )}
+        {(pinnedFiles.length > 0 || projectBrain.ownedFiles.length > 0) && (
+          <div className="mb-2 flex flex-wrap gap-1">
+            {pinnedFiles.map(p => (
+              <button
+                key={p}
+                type="button"
+                onClick={() => setPinnedFiles(prev => prev.filter(x => x !== p))}
+                className="text-[9px] px-1.5 py-0.5 rounded border border-indigo-500/40 bg-indigo-600/15 text-indigo-200"
+                title="Unpin from the next message"
+              >
+                @{p} ×
+              </button>
+            ))}
+            {projectBrain.contractLocked && projectBrain.contractFile && (
+              <span className="text-[9px] px-1.5 py-0.5 rounded border border-sky-500/30 text-sky-200">
+                contract locked
+              </span>
+            )}
+          </div>
+        )}
         {isPlanActive(plannerPlanView) && (
           <div className="mb-2 px-2 py-1.5 rounded-md bg-indigo-600/15 border border-indigo-500/30 text-[10px] text-indigo-100/90 leading-snug">
             Talk to <span className="font-semibold">Planner</span> — use{' '}
@@ -5748,6 +6087,22 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
             title="Attach screenshot or image"
           >
             <ImagePlus className="w-4 h-4" />
+          </button>
+          <button
+            type="button"
+            disabled={isStreaming || !activeTab}
+            onClick={() => {
+              if (!activeTab || !workspacePath) return;
+              const rel = activeTab.path.startsWith(workspacePath)
+                ? activeTab.path.slice(workspacePath.length).replace(/^[\\/]/, '').replace(/\\/g, '/')
+                : activeTab.name;
+              setPinnedFiles(prev => (prev.includes(rel) ? prev : [...prev, rel].slice(0, 8)));
+              setInput(prev => (prev.includes(`@${rel}`) ? prev : `${prev}${prev ? ' ' : ''}@${rel}`));
+            }}
+            className="shrink-0 p-2 mb-0.5 text-zinc-400 hover:text-sky-300 hover:bg-[#1e1e24] rounded-md transition disabled:opacity-30"
+            title="Pin the active editor file into the next message (@file)"
+          >
+            <span className="text-[11px] font-mono">@</span>
           </button>
           <div className="relative flex-1">
             <textarea

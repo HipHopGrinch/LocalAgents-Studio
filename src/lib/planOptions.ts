@@ -618,7 +618,10 @@ export function stripPlanOptionMarkup(text: string): string {
   return out.replace(/\n{3,}/g, '\n\n').trim();
 }
 
-function normalizeOption(raw: Partial<PlanOption> & { delivery?: string }, index: number): PlanOption | null {
+function normalizeOption(
+  raw: { id?: string; title?: string; description?: string; delivery?: string; action?: PlanOption['action'] },
+  index: number
+): PlanOption | null {
   const id = String(raw.id ?? index + 1).trim() || String(index + 1);
   const title = (raw.title || '').trim() || `Option ${id}`;
   const description = (raw.description || '').trim() || title;

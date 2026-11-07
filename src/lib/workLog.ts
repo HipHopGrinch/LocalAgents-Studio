@@ -127,6 +127,10 @@ function section(md: string, name: string, until?: string): string {
   return (end ? md.slice(from, from + end.index) : md.slice(from)).trim();
 }
 
+function isNoiseLog(line: string): boolean {
+  return /HTTP\/1\.[01]/.test(line) || /File not found/.test(line) && /404/.test(line);
+}
+
 function bullets(block: string): string[] {
   return block
     .split('\n')
@@ -152,6 +156,7 @@ export function parseWorkLog(md: string): WorkLog {
     next: (() => {
       if (!next || next === '(none)') return '';
       const line = oneLine(next, 400);
+      if (isNoiseLog(line)) return '';
       return isDurableStep(line) ? line : '';
     })(),
     asked: bullets(section(text, 'Already asked')).slice(-MAX_ASKED)
@@ -165,7 +170,7 @@ export function hasWorkLog(log: WorkLog): boolean {
 /** First real user request seeds the log. Bug reports stick until a related file is saved. */
 export function noteUserTurn(log: WorkLog, text: string): WorkLog {
   const line = text.replace(/\s+/g, ' ').trim();
-  if (!line) return log;
+  if (!line || isNoiseLog(line)) return log;
   const request = log.request || line.slice(0, 800);
   if (/^continue:/i.test(line)) return { ...log, request };
 

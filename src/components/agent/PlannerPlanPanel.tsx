@@ -33,6 +33,11 @@ export const PlannerPlanPanel: React.FC<PlannerPlanPanelProps> = ({
         )}
       </div>
       <p className="text-[11px] text-zinc-300 mt-1 leading-snug shrink-0">{plan.summary}</p>
+      {plan.steps.some(s => s.tasks.some(t => t.file)) && (
+        <p className="mt-1 text-[9px] text-zinc-500 shrink-0 truncate" title={plan.steps.flatMap(s => s.tasks.map(t => t.file || '')).filter(Boolean).join(', ')}>
+          Files: {plan.steps.flatMap(s => s.tasks.map(t => t.file).filter(Boolean)).slice(0, 4).join(' · ')}
+        </p>
+      )}
       {isPaused && plan.status === 'active' && (
         <div className="mt-1.5 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[10px] text-amber-100 leading-snug shrink-0">
           Paused{plan.resumePhase ? ` at ${plan.resumePhase}` : ''}. Closing Studio keeps this

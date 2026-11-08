@@ -137,6 +137,7 @@ import {
   resolveModelNumCtx,
   type DynamicCtxRole
 } from '../lib/contextSize';
+import { resolveModelFit } from '../lib/clusterInventory';
 import {
   ASSIST_MAX_PREDICT,
   contextOverflow,
@@ -951,6 +952,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const activeTargetModel = effectiveModels.includes(targetModel)
     ? targetModel
     : (getPreferredModelForNode(selectedNode, currentAgent.model) || effectiveModels[0] || '');
+  const activeTargetMaxCtx = activeTargetModel
+    ? resolveModelNumCtx(selectedNode, activeTargetModel, currentAgent.numCtx)
+    : 0;
 
   const benchmarkStat = selectedNode?.benchmarks?.[activeTargetModel];
   const selectedModelInfo =
@@ -1434,7 +1438,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         progressLog: progressForPrompt(),
         projectContext: projectContextForPrompt(),
         nodes,
-        inferenceNodeId: routeNode.id
+        inferenceNodeId: routeNode.id,
+        inferenceModel: routeModel
       });
       // Ephemeral workers: only this turn + tool feedback. Planner keeps full chat memory.
       const historySlice = freshContinue
@@ -1754,11 +1759,16 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         progressLog: progressForPrompt(),
         projectContext: projectContextForPrompt(),
         nodes,
-        inferenceNodeId: node.id
+        inferenceNodeId: node.id,
+        inferenceModel: model
       });
+      const workerFit = resolveModelFit(node, model, 'coder', coderAgent.numCtx);
+      const fittedWorkerPrompt = `${workerFit.section}\n\n${userPrompt}${
+        workerFit.packingLine ? `\n\n${workerFit.packingLine}` : ''
+      }`;
       const workerMsgs = [
         { role: 'system', content: workerSystemPrompt },
-        { role: 'user', content: userPrompt }
+        { role: 'user', content: fittedWorkerPrompt }
       ];
       const body = withThink(
         {
@@ -2830,21 +2840,37 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         progressLog: progressForPrompt(),
         projectContext: projectContextForPrompt(),
         nodes,
-        inferenceNodeId: routedNode.id
+        inferenceNodeId: routedNode.id,
+        inferenceModel: routedModel
       });
-      const actionableUserPrompt = lockPlanMode
-        ? `${fullPrompt}\n\n[PLANNER LOCK DIRECTIVE: Break the chosen option into ordered steps with coder tasks. End with <execution_plan>. Do NOT write deliverable files. Do NOT emit <plan_options>.]`
-        : stepVerdictMode
-          ? `${fullPrompt}\n\n[REVIEWER STEP DIRECTIVE: Verify ONLY the active plan step. End with <step_verdict> yay or nay. Do NOT write files or invent a new plan.]`
-          : planMode
-            ? `${fullPrompt}\n\n[PLANNER DIRECTIVE: Analyze intent, propose a concrete plan, and end with 2–4 options in a <plan_options> block. Do NOT write deliverable files yet.]`
-            : reviewMode
-              ? `${fullPrompt}\n\n[REVIEWER DIRECTIVE: Report findings and end with a <review_plan> block (tasks if fixes are needed, summary-only if clean). Do NOT write or edit files.]`
-              : contractMode
-                ? `${fullPrompt}\n\n[PLANNER CONTRACT DIRECTIVE: Lock a fix contract for the review tasks. You may write a shared contract file. End with <fix_contract>. Do NOT emit <plan_options>. Do not implement the full fix list — Coder runs next.]`
-                : pinRoute
-                  ? `${fullPrompt}\n\n[EXECUTION DIRECTIVE: Fix the existing files with <edit_file path="..."> search/replace blocks. Do not rewrite a whole file when a search/replace will do. Do not add a new feature.]`
-                  : `${fullPrompt}\n\n[EXECUTION DIRECTIVE: If this request asks to create, build, or modify an application, script, or file, you MUST emit <write_file path="filename.ext">...complete code...</write_file> tags so the files are written directly to the user's computer. Do NOT just reply with conversational instructions.]`;
+      const fitRole = stepVerdictMode || reviewMode
+        ? 'reviewer'
+        : planMode || lockPlanMode || contractMode
+          ? 'planner'
+          : 'coder';
+      const turnFit = resolveModelFit(routedNode, routedModel, fitRole, agent.numCtx);
+      const withModelFit = (body: string) => {
+        const packing =
+          !planMode && !lockPlanMode && !contractMode && turnFit.packingLine
+            ? `\n\n${turnFit.packingLine}`
+            : '';
+        return `${turnFit.section}\n\n${body}${packing}`;
+      };
+      const actionableUserPrompt = withModelFit(
+        lockPlanMode
+          ? `${fullPrompt}\n\n[PLANNER LOCK DIRECTIVE: Break the chosen option into ordered steps with coder tasks. End with <execution_plan>. Do NOT write deliverable files. Do NOT emit <plan_options>.]`
+          : stepVerdictMode
+            ? `${fullPrompt}\n\n[REVIEWER STEP DIRECTIVE: Verify ONLY the active plan step. End with <step_verdict> yay or nay. Do NOT write files or invent a new plan.]`
+            : planMode
+              ? `${fullPrompt}\n\n[PLANNER DIRECTIVE: Analyze intent, propose a concrete plan, and end with 2–4 options in a <plan_options> block. Do NOT write deliverable files yet.]`
+              : reviewMode
+                ? `${fullPrompt}\n\n[REVIEWER DIRECTIVE: Report findings and end with a <review_plan> block (tasks if fixes are needed, summary-only if clean). Do NOT write or edit files.]`
+                : contractMode
+                  ? `${fullPrompt}\n\n[PLANNER CONTRACT DIRECTIVE: Lock a fix contract for the review tasks. You may write a shared contract file. End with <fix_contract>. Do NOT emit <plan_options>. Do not implement the full fix list — Coder runs next.]`
+                  : pinRoute
+                    ? `${fullPrompt}\n\n[EXECUTION DIRECTIVE: Fix the existing files with <edit_file path="..."> search/replace blocks. Do not rewrite a whole file when a search/replace will do. Do not add a new feature.]`
+                    : `${fullPrompt}\n\n[EXECUTION DIRECTIVE: If this request asks to create, build, or modify an application, script, or file, you MUST emit <write_file path="filename.ext">...complete code...</write_file> tags so the files are written directly to the user's computer. Do NOT just reply with conversational instructions.]`
+      );
       const ollamaImages = attachedImages.map(toOllamaBase64);
 
       // Cleared worker context: do not send the Planner brainstorm / prior turns.
@@ -4129,16 +4155,26 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
     // titles alone caused incomplete edits → Reviewer Nay → infinite rework loops.
     const stepFiles = collectStepFilePaths(step);
     const recentWrites = collectWrittenPaths(messagesRef.current);
+    const coderRoute = resolveRoute(`Implement plan step #${step.id}: ${step.title}`, coderAgent);
+    const coderFit = coderRoute
+      ? resolveModelFit(
+          coderRoute.routedNode,
+          coderRoute.routedModel,
+          'coder',
+          coderAgent.numCtx
+        )
+      : null;
     const filesBody = await buildTouchedFilesContext(
       workspacePath,
       [...stepFiles, ...recentWrites],
-      {
+      coderFit?.caps || {
         maxFiles: 10,
         maxCharsPerFile: 12000,
         maxTotalChars: 48000
       }
     );
-    const coderPrompt = `${formatStepForCoders(plan, step)}
+    const packing = coderFit?.packingLine ? `\n\n${coderFit.packingLine}` : '';
+    const coderPrompt = `${formatStepForCoders(plan, step)}${packing}
 
 ${
   filesBody ||
@@ -4147,7 +4183,11 @@ ${
 
 Work log:
 ${progressForPrompt() || '(empty)'}`;
-    setExecutingPlanNotice(`Coder(s) on step #${step.id}: ${step.title}…`);
+    setExecutingPlanNotice(
+      coderFit
+        ? `Coder(s) on step #${step.id}: ${step.title} · ${coderFit.tier} · ${coderFit.maxCtx} ctx…`
+        : `Coder(s) on step #${step.id}: ${step.title}…`
+    );
 
     try {
       if (isPipelineMode) {
@@ -4232,11 +4272,14 @@ ${progressForPrompt() || '(empty)'}`;
       ? `Files to verify:\n${reviewPaths.slice(0, 24).join('\n')}`
       : 'Review from chat context and the step task list.';
     beginActivity('review', `Reviewer on step #${step.id}`, step.title);
-    const filesBody = await buildTouchedFilesContext(workspacePath, reviewPaths, {
-      maxFiles: 16,
-      maxCharsPerFile: 10000,
-      maxTotalChars: 64000
-    });
+    const reviewFit = resolveModelFit(target.node, target.model, 'reviewer', reviewerAgent.numCtx);
+    const filesBody = await buildTouchedFilesContext(
+      workspacePath,
+      reviewPaths,
+      reviewFit.tier === 'tight'
+        ? reviewFit.caps
+        : { maxFiles: 16, maxCharsPerFile: 10000, maxTotalChars: 64000 }
+    );
 
     // Soft pre-check: placeholder / planner prose in touched files → force Nay notes
     const placeholderHits: string[] = [];
@@ -4728,14 +4771,28 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       const allowedFiles = [...new Set([...errorFiles, ...stepFiles])].slice(0, 14);
 
       const runHealCoder = async (promptExtra: string, notice: string, pin?: { node: EndpointNode; model: string }) => {
-        const filesBody = await buildTouchedFilesContext(workspacePath, allowedFiles, {
-          maxFiles: 10,
-          maxCharsPerFile: 12000,
-          maxTotalChars: 48000
-        });
+        const healRoute =
+          pin ||
+          (() => {
+            const r = resolveRoute(`Heal step #${stuck.id}`, coderAgent);
+            return r ? { node: r.routedNode, model: r.routedModel } : undefined;
+          })();
+        const healFit = healRoute
+          ? resolveModelFit(healRoute.node, healRoute.model, 'coder', coderAgent.numCtx)
+          : null;
+        const filesBody = await buildTouchedFilesContext(
+          workspacePath,
+          allowedFiles,
+          healFit?.caps || {
+            maxFiles: 10,
+            maxCharsPerFile: 12000,
+            maxTotalChars: 48000
+          }
+        );
         const healPrompt = `### Heal pass (compiler-driven)
 You are fixing compile/verify errors for plan step #${stuck.id}: ${stuck.title}.
 ${stuck.reviewNote ? `Reviewer note: ${stuck.reviewNote}` : ''}
+${healFit?.packingLine ? `\n${healFit.packingLine}` : ''}
 
 Rules:
 - Edit ONLY these files (prefer edit_file): ${allowedFiles.map(f => `\`${f}\``).join(', ') || '(paths named in the errors)'}
@@ -5849,12 +5906,22 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
             <div className="flex flex-col space-y-1">
               <span className="text-zinc-500 font-medium flex items-center justify-between">
                 <span>Node Model</span>
-                {benchmarkStat && (
-                  <span className="text-amber-400 font-mono text-[9px] flex items-center space-x-0.5">
-                    <Zap className="w-2.5 h-2.5" />
-                    <span>{benchmarkStat.evalTokPerSec} t/s</span>
-                  </span>
-                )}
+                <span className="flex items-center gap-1.5 font-mono text-[9px]">
+                  {activeTargetMaxCtx > 0 && (
+                    <span
+                      className="text-sky-400/90"
+                      title="Studio max context for this model (Hardware Settings). Worker prompts are shaped to this ceiling."
+                    >
+                      {activeTargetMaxCtx.toLocaleString()} ctx
+                    </span>
+                  )}
+                  {benchmarkStat && (
+                    <span className="text-amber-400 flex items-center space-x-0.5">
+                      <Zap className="w-2.5 h-2.5" />
+                      <span>{benchmarkStat.evalTokPerSec} t/s</span>
+                    </span>
+                  )}
+                </span>
               </span>
               <select
                 value={activeTargetModel}
@@ -6128,7 +6195,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                 <span>
                   <b>Active Target:</b>{' '}
                   {selectedNode && activeTargetModel
-                    ? <>{selectedNode.name} → <code className="text-indigo-300">{activeTargetModel}</code> {benchmarkStat ? `(~${benchmarkStat.evalTokPerSec} tok/s)` : ''}</>
+                    ? <>{selectedNode.name} → <code className="text-indigo-300">{activeTargetModel}</code>{activeTargetMaxCtx > 0 ? ` · ${activeTargetMaxCtx.toLocaleString()} ctx` : ''}{benchmarkStat ? ` (~${benchmarkStat.evalTokPerSec} tok/s)` : ''}</>
                     : <span className="text-amber-400">none — enable a model on this node</span>}
                 </span>
               </div>

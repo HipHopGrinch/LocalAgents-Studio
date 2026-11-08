@@ -8,6 +8,7 @@ import {
   formatApprovedPlanContext
 } from './planOptions';
 import { DELIVERY_POLICY, TOOLCHAIN_PLAYBOOK } from './deliveryIntent';
+import { formatClusterInventory } from './clusterInventory';
 
 const NODE_ROLES: NodeRole[] = ['coder', 'reviewer', 'docs', 'planner'];
 
@@ -626,6 +627,8 @@ export interface BuildSystemPromptOptions {
   nodes?: EndpointNode[];
   /** Node currently running inference (may differ from Dev) */
   inferenceNodeId?: string;
+  /** Model that will actually run this turn (Auto-Node may differ from persona.model). */
+  inferenceModel?: string;
   /** Durable project brief, owned files, rules — injected on every role. */
   projectContext?: string;
 }
@@ -658,6 +661,10 @@ export function buildSystemPrompt(
     parts.push(buildDevHostPromptSection(opts.nodes, opts.inferenceNodeId));
   }
   if (opts?.projectContext?.trim()) parts.push(opts.projectContext.trim());
+  const plannerControlled = planMode || lockPlanMode || contractMode;
+  if (plannerControlled && opts?.nodes?.length) {
+    parts.push(formatClusterInventory(opts.nodes, { fallbackNumCtx: agent.numCtx }));
+  }
   if (lockPlanMode) {
     parts.push(EXECUTION_PLAN_LOCK_PROTOCOL);
     if (agent.toolsEnabled) {
@@ -702,7 +709,8 @@ export function buildSystemPrompt(
     }
   } else {
     if (agent.toolsEnabled) {
-      const isSmall = isSmallModel(agent.model);
+      const routedModel = opts?.inferenceModel || agent.model;
+      const isSmall = isSmallModel(routedModel);
       if (isSmall) {
         parts.push(SMALL_MODEL_TOOL_PROTOCOL);
       } else {

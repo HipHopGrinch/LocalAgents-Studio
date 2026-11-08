@@ -192,6 +192,8 @@ export const MAX_STEP_REWORKS = 2;
 export const MAX_PLAN_ESCALATIONS = 2;
 /** Hard ceiling so a failing file cannot become a 100-step plan. */
 export const MAX_PLAN_STEPS = 18;
+/** Compiler-driven heal attempts after the escalation wall (no new steps). */
+export const MAX_HEAL_ATTEMPTS = 2;
 
 export function normalizeStepTitle(title: string): string {
   return (title || '')

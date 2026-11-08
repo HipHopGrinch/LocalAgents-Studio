@@ -989,7 +989,7 @@ Output the complete file using:
 <write_file path="${task.filePath}">
 ...complete source for this path only...
 </write_file>
-Never put Intent Analysis, option lists, or markdown plans inside the write_file body.`;
+Output ONLY valid source code inside <write_file>. Do not include conversational preambles, summaries, reviews, or plans. Never put Intent Analysis, option lists, or markdown plans inside the write_file body.`;
 }
 
 export function buildRepairWorkerPrompt(opts: {
@@ -1027,7 +1027,8 @@ ${opts.tscErrors}
 Output a corrected full file via:
 <write_file path="${opts.task.filePath}">
 ...fixed code...
-</write_file>`;
+</write_file>
+Output ONLY valid source code inside <write_file> — no conversational text, no summaries, and no planning essays.`;
 }
 
 function nodeTokPerSec(n: EndpointNode, model: string): number {

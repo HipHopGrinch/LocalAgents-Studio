@@ -14,6 +14,7 @@ export type StudioActivityPhase =
   | 'install'
   | 'verify'
   | 'escalate'
+  | 'heal'
   | 'resume'
   | 'project-review'
   | 'other';

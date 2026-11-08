@@ -40,9 +40,22 @@ export const PlannerPlanPanel: React.FC<PlannerPlanPanelProps> = ({
       )}
       {isPaused && plan.status === 'active' && (
         <div className="mt-1.5 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[10px] text-amber-100 leading-snug shrink-0">
-          Paused{plan.resumePhase ? ` at ${plan.resumePhase}` : ''}. Closing Studio keeps this
-          checkpoint — press <span className="font-semibold text-emerald-300">Play</span> to
-          resume the active step.
+          {plan.blockedReason ? (
+            <>
+              <span className="font-semibold text-amber-200">Blocked</span>
+              {typeof plan.healAttempts === 'number' ? ` · heal ${plan.healAttempts}` : ''}.{' '}
+              {plan.blockedReason.slice(0, 180)}
+              {plan.blockedReason.length > 180 ? '…' : ''} Press{' '}
+              <span className="font-semibold text-emerald-300">Heal and continue</span> (Play) to
+              run compiler-driven heal without adding steps.
+            </>
+          ) : (
+            <>
+              Paused{plan.resumePhase ? ` at ${plan.resumePhase}` : ''}. Closing Studio keeps this
+              checkpoint — press <span className="font-semibold text-emerald-300">Play</span> to
+              resume the active step.
+            </>
+          )}
         </div>
       )}
       <ol className="mt-2 space-y-1.5 list-none overflow-y-auto min-h-0 flex-1 pr-0.5">
@@ -98,7 +111,12 @@ export const PlannerPlanPanel: React.FC<PlannerPlanPanelProps> = ({
                       type="button"
                       onClick={onResume}
                       disabled={isBusy}
-                      title="Resume this step — Auto-apply / Auto-review / Swarm stay as checked"
+                      title={
+                        plan.blockedReason
+                          ? 'Heal and continue — run stack verify and one compiler-driven Coder pass'
+                          : 'Resume this step — Auto-apply / Auto-review / Swarm stay as checked'
+                      }
+                      aria-label={plan.blockedReason ? 'Heal and continue' : 'Resume'}
                       className={`p-1 rounded border transition ${
                         isBusy
                           ? 'border-[#2a2a36] text-zinc-600 cursor-default opacity-50'

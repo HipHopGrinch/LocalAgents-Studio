@@ -137,16 +137,34 @@ export function shadowOwnedPath(owned: string[], candidate: string): string | nu
   return preferredExistingPath(owned, rel);
 }
 
+const GENERIC_STEMS = new Set([
+  'index',
+  'main',
+  'mod',
+  'types',
+  'test',
+  'tests',
+  'util',
+  'utils',
+  'config',
+  'common',
+  'contract',
+  'app'
+]);
+
 export function preferredExistingPath(owned: string[], candidate: string): string | null {
   const rel = (candidate || '').replace(/\\/g, '/');
   if (!rel) return null;
   const cStem = stemOf(rel);
-  if (cStem.length < 4) return null;
+  if (cStem.length < 4 || GENERIC_STEMS.has(cStem)) return null;
+  const isHtml = (p: string) => /\.html?$/i.test(p);
+  const candIsHtml = isHtml(rel);
   for (const o of owned) {
     const ownedRel = o.replace(/\\/g, '/');
     if (ownedRel.toLowerCase() === rel.toLowerCase()) return null;
+    if (candIsHtml !== isHtml(ownedRel)) continue;
     const oStem = stemOf(ownedRel);
-    if (oStem.length >= 4 && oStem === cStem) return ownedRel;
+    if (oStem.length >= 4 && !GENERIC_STEMS.has(oStem) && oStem === cStem) return ownedRel;
   }
   return null;
 }

@@ -61,7 +61,13 @@ export function unfence(body: string): string {
     return inner;
   }
 
-  // 3. Trailing unmatched fence
+  // 3. Model had conversational intro before a code fence inside <write_file>
+  const embeddedFence = b.match(/^[^\r\n`~]{0,300}\r?\n\s*(`{3,}|~{3,})[a-zA-Z0-9_\-\+#]*[ \t]*\r?\n([\s\S]*?)\r?\n\1\s*$/);
+  if (embeddedFence) {
+    return embeddedFence[2];
+  }
+
+  // 4. Trailing unmatched fence
   b = b.replace(/\r?\n(`{3,}|~{3,})\s*$/, '');
 
   return b;

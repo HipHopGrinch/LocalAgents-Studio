@@ -245,6 +245,10 @@ export interface PlannerPlan {
   escalationCount?: number;
   /** Set when the loop stops instead of appending more Fix steps. */
   blockedReason?: string;
+  /** Compiler-heal attempts on the stuck step (does not grow the plan). */
+  healAttempts?: number;
+  /** Last compiler error fingerprint from heal/verify. */
+  lastErrorFingerprint?: string;
 }
 
 /** One agent chat thread (Cursor/VS Code-style conversation). */

@@ -1,4 +1,4 @@
-﻿import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   AgentPersona,
   ApprovedPlan,
@@ -95,6 +95,14 @@ import {
   shouldPreserveContract,
   type ProjectBrain
 } from '../lib/projectBrain';
+import {
+  errorFingerprint,
+  filesFromErrors,
+  formatErrorsForCoder,
+  parseCompilerErrors,
+  resolveVerifyCommand,
+  verifyOutputFailed
+} from '../lib/verifyGate';
 import {
   MAX_COMMAND_FIX_ATTEMPTS,
   autoApplyWritableTools,
@@ -226,6 +234,7 @@ import {
   isPlanActive,
   markAllStepTasks,
   markStepInProgress,
+  MAX_HEAL_ATTEMPTS,
   MAX_PLAN_ESCALATIONS,
   MAX_PLAN_STEPS,
   MAX_STEP_REWORKS,
@@ -1736,7 +1745,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         return;
       }
 
-      const workerSystemPrompt = buildSystemPrompt(currentAgent, workspacePath, workspaceOverview, {
+      const workerSystemPrompt = buildSystemPrompt(coderAgent, workspacePath, workspaceOverview, {
+        planMode: false,
+        reviewMode: false,
+        contractMode: false,
+        lockPlanMode: false,
+        stepVerdictMode: false,
         progressLog: progressForPrompt(),
         projectContext: projectContextForPrompt(),
         nodes,
@@ -1751,7 +1765,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           model,
           messages: workerMsgs,
           options: {
-            temperature: currentAgent.temperature,
+            temperature: coderAgent.temperature,
             num_ctx: chatNumCtx(node, model, workerMsgs, { role: 'coder', createIntent: true })
           }
         },
@@ -4520,16 +4534,22 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     await dispatchActiveStep();
   };
 
-  /** Compiler/build must pass before a step can Yay. */
-  const verifyBeforeYay = async (): Promise<{ ok: boolean; output: string }> => {
-    if (!workspacePath) return { ok: true, output: '' };
-    beginActivity('verify', 'Verify before Yay');
+  /** Always run the stack verify command — never fake a mid-plan green. */
+  const runProjectVerify = async (): Promise<{
+    ok: boolean;
+    output: string;
+    fingerprint: string;
+  }> => {
+    if (!workspacePath) return { ok: true, output: '', fingerprint: 'none' };
+    beginActivity('verify', 'Project verify');
     try {
       const brain = projectBrainRef.current;
       const stack =
         brain.stack ||
         deliveryToStack(brain.delivery || plannerPlanRef.current?.delivery) ||
         'typescript';
+      const cmd = resolveVerifyCommand(stack, brain.verifyCommand || plannerPlanRef.current?.verifyCommand);
+
       if (
         (stack === 'typescript' || stack === 'node') &&
         window.electronAPI?.typecheckWorkspace
@@ -4538,54 +4558,333 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
           mode: 'workspace',
           timeoutMs: 90000
         });
-        const output = r.output || r.error || '';
+        const tscOut = r.output || r.error || '';
         if (r.skipped || !r.ok) {
           const note = r.skipped
-            ? output || 'Typecheck skipped (no tsconfig) — not a pass.'
-            : output;
+            ? tscOut || 'Typecheck skipped (no tsconfig) — not a pass.'
+            : tscOut;
+          const errors = parseCompilerErrors(note);
+          const fingerprint = errorFingerprint(errors);
           commitProjectBrain({
             ...projectBrainRef.current,
             lastVerifyOk: false,
             lastVerifyNote: note.slice(0, 800)
           });
-          return { ok: false, output: note };
+          return { ok: false, output: note, fingerprint };
         }
       }
-      const plan = plannerPlanRef.current;
-      const active = getActiveStep(plan);
-      const laterOpen =
-        plan?.steps.filter(
-          s =>
-            s.id !== active?.id &&
-            (s.status === 'pending' || s.status === 'failed' || s.status === 'in_progress')
-        ).length ?? 0;
-      if (laterOpen === 0) {
-        const cmd =
-          brain.verifyCommand ||
-          (stack === 'typescript' || stack === 'node' ? 'npm run build' : verifyCommandForStack(stack));
-        if (cmd) {
-          const out = await executeTrackedCommand(cmd);
-          const failed = /Exit code:\s*(?!0\b)\d+/i.test(out) || /error TS\d+/i.test(out);
-          commitProjectBrain({
-            ...projectBrainRef.current,
-            verifyCommand: cmd,
-            lastVerifyOk: !failed,
-            lastVerifyNote: (out || '').slice(-800)
-          });
-          if (failed) return { ok: false, output: out || 'verify failed' };
-        }
-      } else {
+
+      if (!cmd) {
         commitProjectBrain({
           ...projectBrainRef.current,
           lastVerifyOk: true,
-          lastVerifyNote: 'typecheck passed'
+          lastVerifyNote: 'no verify command for stack'
+        });
+        return { ok: true, output: '', fingerprint: 'none' };
+      }
+
+      const out = await executeTrackedCommand(cmd);
+      const failed = verifyOutputFailed(out);
+      const errors = parseCompilerErrors(out);
+      const fingerprint = errorFingerprint(errors);
+      commitProjectBrain({
+        ...projectBrainRef.current,
+        verifyCommand: cmd,
+        lastVerifyOk: !failed,
+        lastVerifyNote: (out || '').slice(-800)
+      });
+      if (plannerPlanRef.current) {
+        commitPlannerPlan({
+          ...plannerPlanRef.current,
+          verifyCommand: cmd,
+          lastVerifyOk: !failed,
+          lastErrorFingerprint: fingerprint,
+          updatedAt: Date.now()
         });
       }
-      return { ok: true, output: '' };
+      return { ok: !failed, output: out || '', fingerprint };
     } catch (err: any) {
-      return { ok: false, output: err?.message || String(err) };
+      const msg = err?.message || String(err);
+      commitProjectBrain({
+        ...projectBrainRef.current,
+        lastVerifyOk: false,
+        lastVerifyNote: msg.slice(0, 800)
+      });
+      return { ok: false, output: msg, fingerprint: 'err' };
     } finally {
       endActivity();
+    }
+  };
+
+  /** Compiler/build must pass before a step can Yay. */
+  const verifyBeforeYay = async (): Promise<{ ok: boolean; output: string }> => {
+    const r = await runProjectVerify();
+    return { ok: r.ok, output: r.output };
+  };
+
+  /** Advance the stuck step after heal verify passes (no Reviewer round-trip). */
+  const advanceAfterHealVerify = async (stepId: string, fingerprint: string, note: string) => {
+    let plan = plannerPlanRef.current;
+    if (!plan) return;
+    plan = applyStepVerdict(plan, {
+      stepId,
+      result: 'yay',
+      notes: note
+    });
+    commitPlannerPlan({
+      ...plan,
+      blockedReason: undefined,
+      lastErrorFingerprint: fingerprint,
+      updatedAt: Date.now()
+    });
+    if (plan.status === 'completed') {
+      setPlanPaused(false);
+      restorePlannerControl('Heal: verify passed — plan complete.');
+      return;
+    }
+    const next = getActiveStep(plan);
+    if (next) {
+      setExecutingPlanNotice(`Heal: verify OK — starting step #${next.id}: ${next.title}`);
+      await dispatchActiveStep();
+    } else {
+      restorePlannerControl('Heal: verify passed — plan complete.');
+    }
+  };
+
+  /**
+   * Compiler-driven heal when blocked / escalation would no-op.
+   * Does not append steps or bump escalationCount. Max MAX_HEAL_ATTEMPTS per plan.
+   */
+  const healBlockedPlan = async (): Promise<void> => {
+    if (isStreaming) return;
+    let plan = plannerPlanRef.current;
+    if (!plan || !isPlanActive(plan)) {
+      setExecutingPlanNotice('No active plan to heal.');
+      return;
+    }
+
+    const stuck =
+      getActiveStep(plan) ||
+      plan.steps.find(s => s.status === 'failed') ||
+      plan.steps.find(s => s.status === 'in_progress');
+    if (!stuck) {
+      restorePlannerControl('Nothing to heal — no stuck step.');
+      return;
+    }
+
+    const attempts = plan.healAttempts || 0;
+    if (attempts >= MAX_HEAL_ATTEMPTS) {
+      const reason = `Heal failed after ${attempts} attempts on step #${stuck.id}. Fix the listed compile errors locally, then press Heal again or start a new plan.`;
+      commitPlannerPlan({ ...plan, blockedReason: reason, updatedAt: Date.now() });
+      setPlanPaused(true);
+      restorePlannerControl(reason);
+      return;
+    }
+
+    stopRequestedRef.current = false;
+    setPlanPaused(false);
+    resetAgentLoopBudget();
+    commitPlannerPlan({
+      ...plan,
+      blockedReason: undefined,
+      healAttempts: attempts + 1,
+      resumePhase: 'coder',
+      activeStepId: stuck.id,
+      updatedAt: Date.now()
+    });
+    beginActivity(
+      'heal',
+      `Heal step #${stuck.id}`,
+      `attempt ${attempts + 1}/${MAX_HEAL_ATTEMPTS}`
+    );
+    setExecutingPlanNotice(
+      `Heal and continue — verifying project (attempt ${attempts + 1}/${MAX_HEAL_ATTEMPTS})…`
+    );
+
+    try {
+      let verify = await runProjectVerify();
+      if (stopRequestedRef.current) {
+        setPlanPaused(true);
+        endActivity();
+        restorePlannerControl('Paused during Heal verify — press Heal and continue to retry.');
+        return;
+      }
+      if (verify.ok) {
+        endActivity();
+        await advanceAfterHealVerify(
+          String(stuck.id),
+          verify.fingerprint,
+          'Heal: stack verify passed — advancing.'
+        );
+        return;
+      }
+
+      let errors = parseCompilerErrors(verify.output);
+      let fingerprint = verify.fingerprint || errorFingerprint(errors);
+      const prevFp = plannerPlanRef.current?.lastErrorFingerprint;
+      const errorBlock = formatErrorsForCoder(errors, verify.output);
+      const errorFiles = filesFromErrors(errors);
+      const stepFiles = collectStepFilePaths(stuck);
+      const allowedFiles = [...new Set([...errorFiles, ...stepFiles])].slice(0, 14);
+
+      const runHealCoder = async (promptExtra: string, notice: string, pin?: { node: EndpointNode; model: string }) => {
+        const filesBody = await buildTouchedFilesContext(workspacePath, allowedFiles, {
+          maxFiles: 10,
+          maxCharsPerFile: 12000,
+          maxTotalChars: 48000
+        });
+        const healPrompt = `### Heal pass (compiler-driven)
+You are fixing compile/verify errors for plan step #${stuck.id}: ${stuck.title}.
+${stuck.reviewNote ? `Reviewer note: ${stuck.reviewNote}` : ''}
+
+Rules:
+- Edit ONLY these files (prefer edit_file): ${allowedFiles.map(f => `\`${f}\``).join(', ') || '(paths named in the errors)'}
+- Do not invent new architecture or append plan steps.
+- No prose-as-file. Emit real code edits only.
+- Stop when the listed errors are addressed.
+
+${errorBlock}
+
+${promptExtra}
+
+${filesBody || '(No file bodies preloaded — call read_file for each path, then edit_file.)'}
+
+Work log:
+${progressForPrompt() || '(empty)'}`;
+
+        ephemeralWorkerRef.current = true;
+        onSelectAgent(coderAgent.id);
+        onConversationPatch?.({ agentId: coderAgent.id });
+        setExecutingPlanNotice(notice);
+        await runSingleNodeTurn({
+          userText: `Heal step #${stuck.id}: fix compiler errors`,
+          fullPrompt: healPrompt,
+          agent: coderAgent,
+          planMode: false,
+          approvedPlan: approvedPlanRef.current,
+          skipUserAppend: true,
+          notice,
+          freshContext: true,
+          ...(pin ? { pinRoute: pin } : {})
+        });
+      };
+
+      // Skip another local coder if this fingerprint already survived a prior heal attempt.
+      const skipLocal = !!prevFp && prevFp === fingerprint && attempts >= 1;
+
+      if (!skipLocal) {
+        await runHealCoder(
+          '',
+          `Heal: local Coder on ${errorFiles.length || allowedFiles.length || '?'} error file(s)…`
+        );
+        if (stopRequestedRef.current) {
+          setPlanPaused(true);
+          endActivity();
+          restorePlannerControl('Paused during Heal Coder — press Heal and continue to retry.');
+          return;
+        }
+        verify = await runProjectVerify();
+        if (verify.ok) {
+          endActivity();
+          await advanceAfterHealVerify(
+            String(stuck.id),
+            verify.fingerprint,
+            'Heal: local Coder fixed verify — advancing.'
+          );
+          return;
+        }
+        errors = parseCompilerErrors(verify.output);
+        const afterLocalFp = verify.fingerprint || errorFingerprint(errors);
+        // Unchanged fingerprint → do not retry local; go frontier once.
+        if (afterLocalFp === fingerprint) {
+          setExecutingPlanNotice('Heal: same errors after local Coder — trying frontier brief…');
+        }
+        fingerprint = afterLocalFp;
+      } else {
+        setExecutingPlanNotice('Heal: same error fingerprint as last attempt — skipping local, trying frontier…');
+      }
+
+      // One frontier Planner→Coder bind (free-tier brief → local apply), else largest local with fresh approach.
+      const stuckPayload = `${errorBlock}\n\nFingerprint: ${fingerprint}\nStep: #${stuck.id} ${stuck.title}`;
+      let brief: string | null = null;
+      try {
+        brief = await requestFreeTierBrief(
+          'Local heal did not clear these compile errors. Give one short concrete fix plan naming files and edits. Do not rewrite whole files.',
+          stuckPayload
+        );
+      } catch (err: any) {
+        window.electronAPI?.writeLog?.('warn', `heal frontier: ${err?.message || err}`);
+      }
+
+      const big = pickLargestLocalTarget(nodes);
+      if (brief && big) {
+        await runHealCoder(
+          `### Frontier heal brief\nApply this solution. Do not repeat the failed approach.\n\n${brief}`,
+          `Heal: applying frontier brief on ${big.node.name} · ${big.model}…`,
+          big
+        );
+      } else if (big) {
+        await runHealCoder(
+          'Previous local attempt failed. Use a different concrete approach; edit only the listed error files.',
+          `Heal: retry differently on ${big.node.name} · ${big.model}…`,
+          big
+        );
+      } else {
+        const reason = `Heal failed on step #${stuck.id}: no local model online to apply fixes.\n${(verify.output || '').slice(-600)}`;
+        commitPlannerPlan({
+          ...(plannerPlanRef.current || plan),
+          blockedReason: reason,
+          lastErrorFingerprint: fingerprint,
+          updatedAt: Date.now()
+        });
+        setPlanPaused(true);
+        endActivity();
+        restorePlannerControl(reason);
+        return;
+      }
+
+      if (stopRequestedRef.current) {
+        setPlanPaused(true);
+        endActivity();
+        restorePlannerControl('Paused during Heal frontier pass — press Heal and continue to retry.');
+        return;
+      }
+
+      verify = await runProjectVerify();
+      if (verify.ok) {
+        endActivity();
+        await advanceAfterHealVerify(
+          String(stuck.id),
+          verify.fingerprint,
+          'Heal: frontier pass cleared verify — advancing.'
+        );
+        return;
+      }
+
+      errors = parseCompilerErrors(verify.output);
+      fingerprint = verify.fingerprint || errorFingerprint(errors);
+      const snippet = (verify.output || '').slice(-700);
+      const reason = `Heal failed on step #${stuck.id} (attempt ${attempts + 1}/${MAX_HEAL_ATTEMPTS}). Remaining errors:\n${snippet}`;
+      commitPlannerPlan({
+        ...(plannerPlanRef.current || plan),
+        blockedReason: reason,
+        lastErrorFingerprint: fingerprint,
+        resumePhase: 'coder',
+        updatedAt: Date.now()
+      });
+      setPlanPaused(true);
+      endActivity();
+      restorePlannerControl(reason);
+    } catch (err: any) {
+      const reason = `Heal failed: ${err?.message || err}`;
+      commitPlannerPlan({
+        ...(plannerPlanRef.current || plan),
+        blockedReason: reason,
+        updatedAt: Date.now()
+      });
+      setPlanPaused(true);
+      endActivity();
+      restorePlannerControl(reason);
     }
   };
 
@@ -5066,6 +5365,22 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
     }
   };
 
+  /** True when escalate would only re-set blockedReason (Resume dead-loop). */
+  const escalateWouldNoOp = (plan: PlannerPlan, stepId?: string | number | null) => {
+    if (plan.blockedReason) return true;
+    const escalations = plan.escalationCount || 0;
+    if (escalations >= MAX_PLAN_ESCALATIONS || plan.steps.length >= MAX_PLAN_STEPS) return true;
+    const stuck =
+      (stepId != null && plan.steps.find(s => String(s.id) === String(stepId))) ||
+      getActiveStep(plan);
+    if (!stuck) return false;
+    return (
+      stuck.status === 'failed' &&
+      effectiveStepReworkCount(String(stuck.id), stuck.reworkCount) > MAX_STEP_REWORKS &&
+      (escalations >= MAX_PLAN_ESCALATIONS || plan.steps.length >= MAX_PLAN_STEPS)
+    );
+  };
+
   /** Resume from the saved checkpoint (coder / review / verdict) — not a blind step restart. */
   const resumeActivePlan = async () => {
     if (isStreaming) return;
@@ -5082,6 +5397,18 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
 
     const step = getActiveStep(plan);
     const stepId = step?.id;
+
+    // Blocked / escalation wall → compiler heal (do not re-escalate into the same pause).
+    if (
+      plan.blockedReason ||
+      (step &&
+        step.status === 'failed' &&
+        effectiveStepReworkCount(String(step.id), step.reworkCount) > MAX_STEP_REWORKS &&
+        escalateWouldNoOp(plan, step.id))
+    ) {
+      await healBlockedPlan();
+      return;
+    }
 
     const pendingVerdict = [...messagesRef.current].reverse().find(
       m =>
@@ -5135,12 +5462,16 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       phase = 'review';
     }
 
-    // Already past the Nay rework cap — Play escalates to Planner instead of another Review.
+    // Past Nay rework cap but escalate still can grow the plan — escalate; else heal.
     if (
       step &&
       step.status === 'failed' &&
       effectiveStepReworkCount(String(step.id), step.reworkCount) > MAX_STEP_REWORKS
     ) {
+      if (escalateWouldNoOp(plan, step.id)) {
+        await healBlockedPlan();
+        return;
+      }
       await escalateStepToPlannerFixes(String(step.id));
       return;
     }
@@ -5816,24 +6147,36 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
           <>
           {planPaused && isPlanActive(plannerPlanView) && (
             <div className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-100">
-              <div className="font-semibold text-amber-200">Resume unfinished work</div>
+              <div className="font-semibold text-amber-200">
+                {plannerPlanView?.blockedReason ? 'Heal and continue' : 'Resume unfinished work'}
+              </div>
               <p className="mt-1 text-amber-100/90 leading-relaxed">
-                {projectBrain.brief
-                  ? projectBrain.brief.slice(0, 220)
-                  : plannerPlanView?.summary || 'An active plan is waiting.'}
+                {plannerPlanView?.blockedReason
+                  ? plannerPlanView.blockedReason.slice(0, 320)
+                  : projectBrain.brief
+                    ? projectBrain.brief.slice(0, 220)
+                    : plannerPlanView?.summary || 'An active plan is waiting.'}
               </p>
               <p className="mt-1 text-zinc-400">
                 Step {plannerPlanView?.activeStepId || '—'}
                 {plannerPlanView?.resumePhase ? ` · ${plannerPlanView.resumePhase}` : ''}
                 {projectBrain.delivery ? ` · ${projectBrain.delivery}` : ''}
                 {projectBrain.lastVerifyOk === false ? ' · last verify failed' : ''}
+                {typeof plannerPlanView?.healAttempts === 'number'
+                  ? ` · heal ${plannerPlanView.healAttempts}/${MAX_HEAL_ATTEMPTS}`
+                  : ''}
               </p>
+              {projectBrain.lastVerifyOk === false && projectBrain.lastVerifyNote && (
+                <pre className="mt-1 max-h-24 overflow-auto rounded bg-black/30 px-2 py-1 text-[9px] text-rose-200/90 whitespace-pre-wrap">
+                  {projectBrain.lastVerifyNote.slice(-500)}
+                </pre>
+              )}
               <button
                 type="button"
                 onClick={() => void resumeActivePlan()}
                 className="mt-2 px-2 py-1 rounded border border-emerald-500/50 bg-emerald-600/20 text-emerald-200 text-[10px] font-semibold"
               >
-                Resume
+                {plannerPlanView?.blockedReason ? 'Heal and continue' : 'Resume'}
               </button>
             </div>
           )}

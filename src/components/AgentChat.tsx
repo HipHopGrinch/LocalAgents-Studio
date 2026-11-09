@@ -239,10 +239,12 @@ import {
   MAX_PLAN_ESCALATIONS,
   MAX_PLAN_STEPS,
   MAX_STEP_REWORKS,
+  notesLookLikeVerifyFailure,
   parsePlannerPlanJson,
   plannerPlanFromReviewQueue,
   plannerPlanPath,
-  serializePlannerPlan
+  serializePlannerPlan,
+  stepLooksLikeFixStep
 } from '../lib/plannerPlan';
 import {
   buildContinuationReviewPrompt,
@@ -4467,16 +4469,26 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     }
     const reworkCount = effectiveStepReworkCount(String(stuck.id), stuck.reworkCount);
     const escalations = plan.escalationCount || 0;
-    if (escalations >= MAX_PLAN_ESCALATIONS || plan.steps.length >= MAX_PLAN_STEPS) {
-      const reason = `Stopped after ${plan.steps.length} steps. Step #${stuck.id} is still failing and more "Fix" steps would repeat the same files. Last note: ${(stuck.reviewNote || 'verify failed').slice(0, 280)}`;
+    // Cap, or step is already a Fix pass → compiler heal (no redundant Fix: steps).
+    if (
+      escalations >= MAX_PLAN_ESCALATIONS ||
+      plan.steps.length >= MAX_PLAN_STEPS ||
+      stepLooksLikeFixStep(stuck.title) ||
+      notesLookLikeVerifyFailure(stuck.reviewNote || nayNotes[0] || '')
+    ) {
+      setExecutingPlanNotice(
+        `Step #${stuck.id} needs a compiler heal (no new Fix steps)…`
+      );
       commitPlannerPlan({
         ...plan,
-        blockedReason: reason,
+        blockedReason:
+          plan.blockedReason ||
+          `Heal needed on step #${stuck.id} — fix steps would be redundant.`,
         resumePhase: 'coder',
+        activeStepId: stuck.id,
         updatedAt: Date.now()
       });
-      setPlanPaused(true);
-      restorePlannerControl(reason);
+      await healBlockedPlan();
       return;
     }
 
@@ -4558,11 +4570,19 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       { reworkNays: reworkCount }
     );
     if (plan.steps.length === before) {
-      const reason = `Stopped. Step #${stuck.id} failed and a new fix step would duplicate work already on the plan (${plan.steps.length} steps).`;
-      commitPlannerPlan({ ...plan, blockedReason: reason, updatedAt: Date.now() });
-      setPlanPaused(true);
+      // Title already on the plan (e.g. "Core game logic … fix") — heal in place.
       endActivity();
-      restorePlannerControl(reason);
+      commitPlannerPlan({
+        ...plannerPlanRef.current!,
+        blockedReason: `Heal needed on step #${stuck.id} — a new Fix step would duplicate work already on the plan.`,
+        resumePhase: 'coder',
+        activeStepId: stuck.id,
+        updatedAt: Date.now()
+      });
+      setExecutingPlanNotice(
+        `Step #${stuck.id}: Fix step would duplicate — running compiler heal…`
+      );
+      await healBlockedPlan();
       return;
     }
     commitPlannerPlan(plan);
@@ -4677,6 +4697,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     commitPlannerPlan({
       ...plan,
       blockedReason: undefined,
+      healAttempts: 0,
       lastErrorFingerprint: fingerprint,
       updatedAt: Date.now()
     });
@@ -4998,6 +5019,21 @@ ${progressForPrompt() || '(empty)'}`;
       const stuck = plan.steps.find(s => String(s.id) === sid);
       const nextCount = effectiveStepReworkCount(sid, stuck?.reworkCount);
       if (nextCount > MAX_STEP_REWORKS) {
+        // Verify/compile failures and existing Fix steps → heal, do not grow the plan.
+        if (
+          stepLooksLikeFixStep(stuck?.title || '') ||
+          notesLookLikeVerifyFailure(notes || stuck?.reviewNote || '')
+        ) {
+          commitPlannerPlan({
+            ...plan,
+            blockedReason: `Heal needed on step #${sid} after ${nextCount} Nays (compiler/verify).`,
+            resumePhase: 'coder',
+            activeStepId: stuck?.id || plan.activeStepId,
+            updatedAt: Date.now()
+          });
+          await healBlockedPlan();
+          return;
+        }
         await escalateStepToPlannerFixes(sid);
         return;
       }
@@ -5008,8 +5044,16 @@ ${progressForPrompt() || '(empty)'}`;
       return;
     }
 
-    // Yay — reworkCount cleared on the plan via applyStepVerdict
-    const next = getActiveStep(plan);
+    // Yay — clear heal counter so later steps get a fresh heal budget
+    if (plannerPlanRef.current) {
+      commitPlannerPlan({
+        ...plannerPlanRef.current,
+        healAttempts: 0,
+        blockedReason: undefined,
+        updatedAt: Date.now()
+      });
+    }
+    const next = getActiveStep(plannerPlanRef.current || plan);
     if (next) {
       setExecutingPlanNotice(`Step Yay — starting step #${next.id}: ${next.title}`);
       await dispatchActiveStep();

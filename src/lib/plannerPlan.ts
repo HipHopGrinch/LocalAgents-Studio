@@ -193,7 +193,17 @@ export const MAX_PLAN_ESCALATIONS = 2;
 /** Hard ceiling so a failing file cannot become a 100-step plan. */
 export const MAX_PLAN_STEPS = 18;
 /** Compiler-driven heal attempts after the escalation wall (no new steps). */
-export const MAX_HEAL_ATTEMPTS = 2;
+export const MAX_HEAL_ATTEMPTS = 3;
+
+/** True when a step is already a repair pass — appending another Fix: would duplicate. */
+export function stepLooksLikeFixStep(title: string): boolean {
+  return /\bfix\b|repair|rework|resolve\b.*\b(error|tsc|type|compile)/i.test(title || '');
+}
+
+/** Reviewer/verify notes that are compile failures — prefer heal over new plan steps. */
+export function notesLookLikeVerifyFailure(notes: string): boolean {
+  return /verify failed|error TS\d+|could not compile|^error(\[|:)/im.test(notes || '');
+}
 
 export function normalizeStepTitle(title: string): string {
   return (title || '')

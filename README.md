@@ -4,7 +4,7 @@ An autonomous, distributed local-agent IDE built for a multi-PC Ollama cluster w
 
 **Discord:** https://discord.gg/ZVkmUfXwW
 
-**User guide:** [GitHub wiki](https://github.com/HipHopGrinch/LocalAgents-Studio/wiki) — install, Ollama, nodes, models, projects, the agent, Swarm, and logs.
+**User guide:** [GitHub wiki](https://github.com/HipHopGrinch/LocalAgents-Studio/wiki) — install, Ollama, nodes, models, projects, the agent, durable plans / heal / Model Fit, Swarm, and logs. **What's new:** [1.2.x notes](https://github.com/HipHopGrinch/LocalAgents-Studio/wiki/Whats-new).
 
 **Repository:** https://github.com/HipHopGrinch/LocalAgents-Studio
 

@@ -14,6 +14,8 @@ export interface ProjectBrain {
   verifyCommand?: string;
   lastVerifyOk?: boolean;
   lastVerifyNote?: string;
+  /** Last Electron pack result (installer path, or why no .exe was produced). */
+  lastDistNote?: string;
   lastTerminal?: { command: string; output: string; at: number };
   /** Snapshot of plan steps so a new thread still sees the todo. */
   todo: Array<{ id: string; title: string; status: string }>;
@@ -71,7 +73,11 @@ export function parseProjectBrain(raw: string): ProjectBrain | null {
               title: String(t.title),
               status: String(t.status || 'pending')
             }))
-        : []
+        : [],
+      lastDistNote:
+        typeof data.lastDistNote === 'string' && data.lastDistNote.trim()
+          ? data.lastDistNote.slice(0, 800)
+          : undefined
     };
   } catch {
     return null;
@@ -207,6 +213,9 @@ export function formatProjectBrainForPrompt(
     lines.push(
       `Last verify: ${brain.lastVerifyOk ? 'passed' : 'FAILED'} — ${brain.lastVerifyNote.slice(0, 500)}`
     );
+  }
+  if (brain.lastDistNote) {
+    lines.push(`Electron dist: ${brain.lastDistNote.slice(0, 500)}`);
   }
   if (rules?.trim()) {
     lines.push(`## Project rules\n${rules.trim().slice(0, Math.max(500, maxRules))}`);

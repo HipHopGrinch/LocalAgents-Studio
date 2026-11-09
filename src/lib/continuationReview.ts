@@ -1,6 +1,6 @@
 import { EndpointNode, PlanOption } from '../types';
 import { MODEL_CATALOG } from '../config/modelCatalog';
-import { DEFAULT_MODEL_NUM_CTX, resolveModelNumCtx } from './contextSize';
+import { DEFAULT_FRONTIER_NUM_CTX, DEFAULT_MODEL_NUM_CTX, resolveModelNumCtx } from './contextSize';
 import { parsePlanOptions } from './planOptions';
 import { normTag, parseParams } from './recommender';
 import { getEnabledModelsForNode, isFrontierNode, nodeAllowsRole } from './tools';
@@ -134,6 +134,39 @@ export function pickCapableReviewTarget(
     }
   }
   return best;
+}
+
+/**
+ * Final checklist review: an online frontier model when one exists, otherwise the largest local reviewer.
+ */
+export function pickFinalSourceReviewTarget(nodes: EndpointNode[]): ReviewTarget | undefined {
+  const frontiers = nodes.filter(
+    n => n.online && isFrontierNode(n) && getEnabledModelsForNode(n).length > 0
+  );
+  let best: ReviewTarget | undefined;
+  let bestCtx = -1;
+  for (const node of frontiers) {
+    for (const model of getEnabledModelsForNode(node)) {
+      const ctx = resolveModelNumCtx(node, model, DEFAULT_FRONTIER_NUM_CTX);
+      if (ctx > bestCtx) {
+        best = { node, model };
+        bestCtx = ctx;
+      }
+    }
+  }
+  if (best) return best;
+  return pickCapableReviewTarget(nodes, 'reviewer');
+}
+
+export function parseFinalReview(raw: string): { result: 'pass' | 'issues'; notes: string } | null {
+  const block = raw.match(/<final_review\b[^>]*>([\s\S]*?)<\/final_review\s*>/i);
+  const body = block?.[1] || '';
+  if (!body.trim()) return null;
+  const resultRaw = (body.match(/<result>\s*([\s\S]*?)\s*<\/result>/i)?.[1] || '').toLowerCase();
+  const notes = (body.match(/<notes>\s*([\s\S]*?)\s*<\/notes>/i)?.[1] || body).trim();
+  const result =
+    /\b(pass|ok|clean)\b/.test(resultRaw) && !/\b(issue|fail|gap)\b/.test(resultRaw) ? 'pass' : 'issues';
+  return { result, notes: notes.slice(0, 4000) };
 }
 
 /** Largest enabled local model, then the card with the most VRAM. Used when a step is repeating. */

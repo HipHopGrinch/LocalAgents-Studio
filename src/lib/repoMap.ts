@@ -41,6 +41,65 @@ export function extractSymbols(relPath: string, content: string): RepoSymbol[] {
   return out;
 }
 
+const SKIP_SOURCE_FILE = /\.(png|jpe?g|gif|webp|ico|exe|dll|zip|woff2?|ttf|eot|mp[34]|wav|pdf|map|lock)$/i;
+
+/** Every text file under `src` when that folder exists, otherwise the project tree. Root entry files are included with `src`. */
+export async function listSourceFolderFiles(root: string): Promise<string[]> {
+  if (!root || !window.electronAPI?.readDir) return [];
+  const files: string[] = [];
+  const seen = new Set<string>();
+  const push = (abs: string) => {
+    const r = rel(root, abs);
+    if (!r || seen.has(r.toLowerCase()) || SKIP_SOURCE_FILE.test(r)) return;
+    seen.add(r.toLowerCase());
+    files.push(r);
+  };
+  const walk = async (dir: string, depth: number) => {
+    if (depth > 8 || files.length >= 200) return;
+    let entries: { name: string; path: string; isDirectory: boolean }[] = [];
+    try {
+      const res = await window.electronAPI.readDir(dir);
+      if (Array.isArray(res)) entries = res;
+    } catch {
+      return;
+    }
+    for (const ent of entries) {
+      if (files.length >= 200) return;
+      if (ent.isDirectory) {
+        await walk(ent.path, depth + 1);
+        continue;
+      }
+      push(ent.path);
+    }
+  };
+  const sep = root.includes('\\') ? '\\' : '/';
+  const srcDir = `${root.replace(/[\\/]+$/, '')}${sep}src`;
+  let hasSrc = false;
+  try {
+    const probe = await window.electronAPI.readDir(srcDir);
+    hasSrc = Array.isArray(probe);
+  } catch {
+    hasSrc = false;
+  }
+  if (hasSrc) {
+    await walk(srcDir, 0);
+    let rootEntries: { name: string; path: string; isDirectory: boolean }[] = [];
+    try {
+      const res = await window.electronAPI.readDir(root);
+      if (Array.isArray(res)) rootEntries = res;
+    } catch {
+      rootEntries = [];
+    }
+    for (const ent of rootEntries) {
+      if (!ent.isDirectory) push(ent.path);
+    }
+  } else {
+    await walk(root, 0);
+  }
+  files.sort();
+  return files;
+}
+
 export async function buildRepoMap(root: string): Promise<RepoMap> {
   const files: string[] = [];
   const symbols: RepoSymbol[] = [];

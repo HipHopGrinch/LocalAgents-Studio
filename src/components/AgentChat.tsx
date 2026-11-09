@@ -97,7 +97,7 @@ import {
   shouldPreserveContract,
   type ProjectBrain
 } from '../lib/projectBrain';
-import { buildRepoMap, formatRepoMap, type RepoMap } from '../lib/repoMap';
+import { buildRepoMap, formatRepoMap, listSourceFolderFiles, type RepoMap } from '../lib/repoMap';
 import {
   errorFingerprint,
   filesFromErrors,
@@ -106,6 +106,17 @@ import {
   resolveVerifyCommand,
   verifyOutputFailed
 } from '../lib/verifyGate';
+import {
+  ELECTRON_DIST_TIMEOUT_SEC,
+  decideElectronDist,
+  distCommandFailed,
+  electronOutputDirs,
+  endElectronDist,
+  summarizeElectronDist,
+  terminalLooksLikeRunningDist,
+  tryBeginElectronDist,
+  type PackageBuildConfig
+} from '../lib/electronDist';
 import {
   MAX_COMMAND_FIX_ATTEMPTS,
   autoApplyWritableTools,
@@ -259,7 +270,9 @@ import {
   MAX_AUTO_CONTINUATIONS,
   parseNextStep,
   pickCapableReviewTarget,
+  pickFinalSourceReviewTarget,
   pickLargestLocalTarget,
+  parseFinalReview,
   stripNextStepMarkup,
   taskFixesWrittenFiles,
   tasksTooSimilar
@@ -284,7 +297,10 @@ interface AgentChatProps {
   onNodeWorkWidthChange?: (width: number) => void;
   onSelectNodeModel?: (nodeId: string, model: string) => void;
   onApplyFileWrite: (filePath: string, content: string) => Promise<boolean>;
-  onExecuteToolCommand: (command: string) => Promise<string>;
+  onExecuteToolCommand: (
+    command: string,
+    opts?: { timeoutSec?: number }
+  ) => Promise<string>;
   onOpenFileInEditor: (filePath: string) => void;
   onRecordTokens: (localTokens: number, frontierTokens: number) => void;
   /** Count one free-tier assist call against that node's daily cap. */
@@ -441,6 +457,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const projectBrainRef = useRef<ProjectBrain>(emptyProjectBrain());
   const projectRulesRef = useRef('');
   const repoMapRef = useRef<RepoMap | null>(null);
+  const finalReviewPlanIdRef = useRef<string | null>(null);
+  /** Set after finishVerifiedPlan is created — heal completion runs before that const. */
+  const finishVerifiedPlanRef = useRef<(plan: PlannerPlan) => Promise<void>>(async () => {});
   const rulesCapFor = (tier: 'tight' | 'standard' | 'wide') =>
     tier === 'wide' ? 16000 : tier === 'tight' ? 4000 : 6000;
   const [pinnedFiles, setPinnedFiles] = useState<string[]>([]);
@@ -483,9 +502,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   /** Live Node Work column (Swarm + single-node workers). */
   const [nodeWorkSteps, setNodeWorkSteps] = useState<PipelineStep[]>([]);
   const nodeWorkStepsRef = useRef<PipelineStep[]>([]);
-  const syncNodeWork = (next: PipelineStep[]) => {
+  /** False when these cards were mirrored from the other window, so we do not publish an empty list over them. */
+  const nodeWorkOwnedRef = useRef(false);
+  const syncNodeWork = (next: PipelineStep[], owned = true) => {
     nodeWorkStepsRef.current = next;
     setNodeWorkSteps(next);
+    nodeWorkOwnedRef.current = owned;
   };
   const upsertNodeWorkStep = (step: PipelineStep, indexHint?: number) => {
     const prev = nodeWorkStepsRef.current;
@@ -742,6 +764,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     if (peerConductor.executingPlanNotice !== undefined) {
       setExecutingPlanNotice(peerConductor.executingPlanNotice || null);
     }
+    if (Array.isArray(peerConductor.nodeWork) && !isStreaming) {
+      syncNodeWork(peerConductor.nodeWork, false);
+    }
     window.setTimeout(() => {
       applyingPeerConductorRef.current = false;
     }, 200);
@@ -769,6 +794,15 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           targetNodeId,
           targetModel,
           executingPlanNotice,
+          ...(nodeWorkOwnedRef.current
+            ? {
+                nodeWork: nodeWorkSteps.slice(-12).map(step => ({
+                  ...step,
+                  content: (step.content || '').slice(0, 600),
+                  toolCalls: undefined
+                }))
+              }
+            : {}),
           revision: conductorRevisionRef.current
         },
         chatMirror: conversationIdRef.current
@@ -789,7 +823,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     targetModel,
     executingPlanNotice,
     activityStack,
-    messages
+    messages,
+    nodeWorkSteps
   ]);
 
   useEffect(() => {
@@ -909,10 +944,10 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     ? workspaceFiles.slice(0, 80).map(f => (f.isDirectory ? `📁 ${f.name}/` : `📄 ${f.name}`)).join('\n')
     : '(empty workspace or loading)';
 
-  const executeTrackedCommand = async (command: string) => {
+  const executeTrackedCommand = async (command: string, opts?: { timeoutSec?: number }) => {
     beginActivity('tool', 'Terminal', command.slice(0, 90));
     try {
-      const out = await onExecuteToolCommand(command);
+      const out = await onExecuteToolCommand(command, opts);
       commitProjectBrain({
         ...projectBrainRef.current,
         lastTerminal: {
@@ -2843,6 +2878,8 @@ ${instruction}`,
     lockPlanMode?: boolean;
     /** Reviewer Yay/Nay on active Planner step */
     stepVerdictMode?: boolean;
+    /** Checklist is done: review the source folder, do not emit a step verdict. */
+    finalSourceReview?: boolean;
     approvedPlan?: ApprovedPlan | null;
     userMsgExtra?: Partial<ChatMessage>;
     skipUserAppend?: boolean;
@@ -2865,6 +2902,7 @@ ${instruction}`,
       contractMode,
       lockPlanMode,
       stepVerdictMode,
+      finalSourceReview,
       approvedPlan,
       userMsgExtra,
       skipUserAppend,
@@ -3003,7 +3041,9 @@ ${instruction}`,
             : planMode
               ? `${fullPrompt}\n\n[PLANNER DIRECTIVE: Analyze intent, propose a concrete plan, and end with 2–4 options in a <plan_options> block. Do NOT write deliverable files yet.]`
               : reviewMode
-                ? `${fullPrompt}\n\n[REVIEWER DIRECTIVE: Report findings and end with a <review_plan> block (tasks if fixes are needed, summary-only if clean). Do NOT write or edit files.]`
+                ? finalSourceReview
+                  ? `${fullPrompt}\n\n[FINAL SOURCE REVIEW: Compare the source folder to the finished plan. Do NOT write or edit files. End with <final_review><result>pass</result> or <result>issues</result> and <notes>.</final_review>.]`
+                  : `${fullPrompt}\n\n[REVIEWER DIRECTIVE: Report findings and end with a <review_plan> block (tasks if fixes are needed, summary-only if clean). Do NOT write or edit files.]`
                 : contractMode
                   ? `${fullPrompt}\n\n[PLANNER CONTRACT DIRECTIVE: Lock a fix contract for the review tasks. You may write a shared contract file. End with <fix_contract>. Do NOT emit <plan_options>. Do not implement the full fix list — Coder runs next.]`
                   : pinRoute
@@ -4832,7 +4872,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     });
     if (plan.status === 'completed') {
       setPlanPaused(false);
-      restorePlannerControl('Heal: verify passed — plan complete.');
+      await finishVerifiedPlanRef.current(plan);
       return;
     }
     const next = getActiveStep(plan);
@@ -5134,6 +5174,239 @@ ${progressForPrompt() || '(empty)'}`;
     }
   };
 
+  /**
+   * After every checklist step is Yay, send the source tree to review.
+   * Frontier when one is online; otherwise the largest local reviewer.
+   * Electron packaging runs after this returns (finishVerifiedPlan).
+   */
+  const reviewFinishedSource = async (
+    plan: PlannerPlan
+  ): Promise<{ ran: boolean; passed: boolean; notes: string }> => {
+    const skipped = { ran: false, passed: false, notes: '' };
+    if (!plan.steps.length || plan.steps.some(s => s.status !== 'completed')) return skipped;
+    if (finalReviewPlanIdRef.current === plan.id) return skipped;
+    finalReviewPlanIdRef.current = plan.id;
+    if (stopRequestedRef.current) return skipped;
+
+    const target = pickFinalSourceReviewTarget(nodes);
+    if (!target || !workspacePath) {
+      const notes = 'All plan steps complete — no model online for the final source review.';
+      restorePlannerControl(notes);
+      return { ran: false, passed: false, notes };
+    }
+    const frontier = isFrontierNode(target.node);
+    const caps = frontier
+      ? { maxFiles: 80, maxCharsPerFile: 14000, maxTotalChars: 180000 }
+      : { maxFiles: 24, maxCharsPerFile: 8000, maxTotalChars: 48000 };
+    beginActivity('project-review', 'Final source review', `${target.node.name} · ${target.model}`);
+    setExecutingPlanNotice(
+      frontier
+        ? `Checklist done — reviewing the source folder on ${target.node.name} · ${target.model}…`
+        : `Checklist done — reviewing the source folder on ${target.node.name} · ${target.model} (no frontier online)…`
+    );
+    try {
+      const files = await listSourceFolderFiles(workspacePath);
+      const filesBody = await buildTouchedFilesContext(workspacePath, files, caps);
+      const rest = files.slice(caps.maxFiles);
+      const steps = plan.steps.map(s => `- #${s.id} ${s.title}`).join('\n');
+      const prompt = `The planner checklist is finished. Review the source folder against what the plan asked for. Do not edit files.
+
+Plan: ${plan.summary}
+${steps}
+
+${projectContextForPrompt(frontier ? 16000 : 6000)}
+
+Source files (${files.length}):
+${files.join('\n') || '(none found)'}
+
+${filesBody || '(No file bodies could be loaded.)'}
+${rest.length ? `\nNot inlined (${rest.length}):\n${rest.join('\n')}` : ''}
+
+Check that the files match the plan: delivery, wiring, no stubs, no planner prose saved as code, no second copy of the same module.
+End with exactly:
+<final_review>
+<result>pass</result>
+<notes>what matches, or the concrete gaps</notes>
+</final_review>`;
+
+      const msg = await runSingleNodeTurn({
+        userText: 'Final source review',
+        fullPrompt: prompt,
+        agent: reviewerAgent,
+        reviewMode: true,
+        finalSourceReview: true,
+        skipUserAppend: true,
+        notice: `Final source review · ${target.model}`,
+        pinRoute: target,
+        freshContext: true
+      });
+      if (stopRequestedRef.current) {
+        endActivity();
+        restorePlannerControl('Paused during the final source review.');
+        return { ran: false, passed: false, notes: 'Paused during the final source review.' };
+      }
+      const parsed = parseFinalReview(`${msg?.raw || ''}\n${msg?.display || ''}`);
+      const notes = (parsed?.notes || msg?.display || msg?.raw || '').replace(/\s+/g, ' ').trim();
+      const passed = parsed ? parsed.result === 'pass' : notes.length > 0 && !/\b(missing|stub|mismatch|does not match|not implemented)\b/i.test(notes);
+      const todo = projectBrainRef.current.todo.filter(t => t.id !== 'final-source-review');
+      if (!passed && notes) {
+        todo.push({
+          id: 'final-source-review',
+          title: `Final source review: ${notes.slice(0, 240)}`,
+          status: 'debt'
+        });
+      }
+      commitProjectBrain({
+        ...projectBrainRef.current,
+        todo: todo.slice(-40),
+        lastVerifyNote: notes.slice(0, 800) || projectBrainRef.current.lastVerifyNote,
+        lastVerifyOk: passed
+      });
+      endActivity();
+      const notice = passed
+        ? `Final source review passed on ${target.node.name} · ${target.model}.`
+        : `Final source review found gaps on ${target.node.name}. ${notes.slice(0, 280)}`;
+      restorePlannerControl(notice);
+      return { ran: true, passed, notes: notice };
+    } catch (err: any) {
+      endActivity();
+      const notice = `Final source review failed: ${err?.message || err}`;
+      restorePlannerControl(notice);
+      return { ran: true, passed: false, notes: notice };
+    }
+  };
+
+  const listPackagedExes = async (dirs: string[]): Promise<string[]> => {
+    if (!workspacePath || !window.electronAPI?.readDir) return [];
+    const root = workspacePath.replace(/[\\/]+$/, '');
+    const sep = root.includes('\\') ? '\\' : '/';
+    const found: string[] = [];
+    for (const rel of dirs) {
+      if (!rel || rel.includes('..') || /node_modules/i.test(rel)) continue;
+      const abs = `${root}${sep}${rel.replace(/\//g, sep)}`;
+      let res: WorkspaceFile[] | { error: string };
+      try {
+        res = await window.electronAPI.readDir(abs);
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(res)) continue;
+      for (const ent of res) {
+        if (ent.isDirectory || !ent.name || !/\.exe$/i.test(ent.name)) continue;
+        if (/node_modules/i.test(`${ent.path || ''}${ent.name}`)) continue;
+        found.push(`${rel.replace(/\\/g, '/')}/${ent.name}`);
+      }
+    }
+    return found;
+  };
+
+  const readWorkspacePackage = async (): Promise<PackageBuildConfig | null> => {
+    if (!workspacePath || !window.electronAPI?.readFile) return null;
+    const root = workspacePath.replace(/[\\/]+$/, '');
+    const sep = root.includes('\\') ? '\\' : '/';
+    try {
+      const res = await window.electronAPI.readFile(`${root}${sep}package.json`);
+      if (!res?.content) return null;
+      const pkg = JSON.parse(res.content.replace(/^\uFEFF/, '')) as PackageBuildConfig;
+      if (!pkg || typeof pkg !== 'object') return null;
+      return pkg;
+    } catch {
+      return null;
+    }
+  };
+
+  const rememberDistNote = (summary: string) => {
+    const note = summary.replace(/\s+/g, ' ').trim().slice(0, 800);
+    if (!note) return;
+    commitProjectBrain({
+      ...projectBrainRef.current,
+      lastDistNote: note
+    });
+  };
+
+  /**
+   * After every step is Yay (verify already passed), run the workspace dist/pack
+   * script when delivery is Electron or package.json packs with electron-builder.
+   * Does not run Studio's release script, and does not claim an exe on failure.
+   */
+  const packageElectronDist = async (plan: PlannerPlan): Promise<string | null> => {
+    if (!workspacePath || stopRequestedRef.current) return null;
+    if (!plan.steps.length || plan.steps.some(s => s.status !== 'completed')) return null;
+    const delivery = plan.delivery || projectBrainRef.current.delivery || null;
+    const pkg = await readWorkspacePackage();
+    const scripts =
+      pkg?.scripts && typeof pkg.scripts === 'object' && !Array.isArray(pkg.scripts)
+        ? pkg.scripts
+        : null;
+    const decision = decideElectronDist(delivery, scripts);
+    if (!decision.run) {
+      if (delivery !== 'electron') return null;
+      const note =
+        decision.reason === 'unsafe-script-name'
+          ? 'All steps verified, but the dist script name is not safe to run — installer was not built.'
+          : 'All steps verified, but package.json has no dist/pack (electron-builder) script — installer was not built.';
+      rememberDistNote(note);
+      return note;
+    }
+    if (!tryBeginElectronDist(workspacePath)) {
+      return 'Electron dist is already running — did not start another build.';
+    }
+    try {
+      if (window.electronAPI?.getTerminalBuffer) {
+        const snap = await window.electronAPI.getTerminalBuffer({ maxChars: 4000 });
+        if (terminalLooksLikeRunningDist(snap?.content || '', !!snap?.running)) {
+          return 'Electron dist is already running — did not start another build.';
+        }
+      }
+      setExecutingPlanNotice(
+        `All steps verified — packaging the Electron app (\`npm run ${decision.scriptName}\`)…`
+      );
+      const output = await executeTrackedCommand(decision.command, {
+        timeoutSec: ELECTRON_DIST_TIMEOUT_SEC
+      });
+      const failed = distCommandFailed(output);
+      const listed = failed ? [] : await listPackagedExes(electronOutputDirs(pkg));
+      const summary = summarizeElectronDist({
+        ok: !failed,
+        scriptName: decision.scriptName,
+        output: output || '',
+        listedExes: listed
+      });
+      rememberDistNote(summary);
+      return summary;
+    } catch (err: any) {
+      const summary = `Electron dist failed (\`npm run ${decision.scriptName}\`) — no installer was produced. ${String(
+        err?.message || err
+      ).slice(0, 360)}`;
+      rememberDistNote(summary);
+      return summary;
+    } finally {
+      endElectronDist(workspacePath);
+    }
+  };
+
+  /** Final source review, then the Electron installer when verify already passed. */
+  const finishVerifiedPlan = async (plan: PlannerPlan) => {
+    if (!plan.steps.length || plan.steps.some(s => s.status !== 'completed')) {
+      restorePlannerControl(
+        'Plan finished with compiler debt on earlier steps — see the project todo.'
+      );
+      return;
+    }
+    const review = await reviewFinishedSource(plan);
+    if (stopRequestedRef.current) return;
+    const distNote = await packageElectronDist(plan);
+    if (!distNote) return;
+    const prefix =
+      review.ran && review.passed
+        ? 'Source review passed. '
+        : review.notes
+          ? `${review.notes.replace(/\s+/g, ' ').trim().slice(0, 180)} `
+          : '';
+    setExecutingPlanNotice(`${prefix}${distNote}`.replace(/\s+/g, ' ').trim().slice(0, 500));
+  };
+  finishVerifiedPlanRef.current = finishVerifiedPlan;
+
   /** Apply Yay/Nay to durable plan, then next step or rework / escalate. */
   const applyStepVerdictAndContinue = async (
     verdictMsg: ChatMessage | null,
@@ -5178,7 +5451,7 @@ ${progressForPrompt() || '(empty)'}`;
     if (plan.status === 'completed') {
       stepReworkCountRef.current = {};
       setPlanPaused(false);
-      restorePlannerControl('All plan steps complete — ask Planner what to build next.');
+      await finishVerifiedPlan(plan);
       return;
     }
 
@@ -6056,7 +6329,9 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
           )}
           {executingPlanNotice && (
             <div className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-md bg-emerald-600/15 border border-emerald-500/30 text-[10px] text-emerald-200">
-              <span className="font-medium truncate">{executingPlanNotice}</span>
+              <span className="font-medium whitespace-normal break-all line-clamp-4" title={executingPlanNotice}>
+                {executingPlanNotice}
+              </span>
               <button
                 type="button"
                 className="shrink-0 text-zinc-400 hover:text-zinc-200"
@@ -6065,6 +6340,14 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
               >
                 <X className="w-3 h-3" />
               </button>
+            </div>
+          )}
+          {projectBrain.lastDistNote && (
+            <div
+              className="px-2 py-1 rounded-md bg-[#18181d] border border-[#2a2a32] text-[10px] text-zinc-300 break-all line-clamp-4"
+              title={projectBrain.lastDistNote}
+            >
+              {projectBrain.lastDistNote}
             </div>
           )}
         </div>
@@ -6396,6 +6679,12 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         )}
 
       </div>
+
+      {fill && (
+        <div className="shrink-0 h-36 max-h-[34%] min-h-[88px] overflow-hidden border-b border-[#27272a] flex flex-col">
+          <NodeWorkPanel steps={nodeWorkSteps} />
+        </div>
+      )}
 
       {/* Messages Stream */}
       <div className="flex-1 p-3 overflow-y-auto space-y-3.5 select-text">
@@ -6838,7 +7127,6 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       {fill && mobileControlsOpen && (
         <div className="absolute inset-0 z-50 flex flex-col bg-[#121215] min-h-0">
           <div className="flex-1 min-h-0 overflow-hidden flex flex-col">{conductorColumn}</div>
-          <div className="flex-1 min-h-0 overflow-hidden flex flex-col">{nodeWorkColumn}</div>
         </div>
       )}
     </div>

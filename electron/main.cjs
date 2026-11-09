@@ -174,7 +174,7 @@ ipcMain.handle('settings:load', async (e) => {
   }
 });
 
-ipcMain.handle('settings:save', async (_e, settings) => {
+ipcMain.handle('settings:save', async (e, settings) => {
   try {
     await fsp.mkdir(app.getPath('userData'), { recursive: true });
     let existing = null;
@@ -208,6 +208,38 @@ ipcMain.handle('settings:save', async (_e, settings) => {
       ) {
         settings.agents = existing.agents;
       }
+      // Web clients persist a settings snapshot that can still say 0 tokens and
+      // wipe the desktop counters. Never store a lower total from the web console.
+      if (e?.webConsole && existing) {
+        const keepHigher = key => {
+          const prev = Number(existing[key]);
+          const next = Number(settings[key]);
+          if (Number.isFinite(prev) && (!Number.isFinite(next) || next < prev)) {
+            settings[key] = prev;
+          }
+        };
+        keepHigher('localTokensGenerated');
+        keepHigher('frontierTokensUsed');
+        if (existing.workspaceTokenUsage && typeof existing.workspaceTokenUsage === 'object') {
+          const prevUsage = existing.workspaceTokenUsage;
+          const nextUsage =
+            settings.workspaceTokenUsage && typeof settings.workspaceTokenUsage === 'object'
+              ? { ...settings.workspaceTokenUsage }
+              : {};
+          for (const [key, value] of Object.entries(prevUsage)) {
+            const prevLocal = Number(value && value.localTokensGenerated) || 0;
+            const prevFrontier = Number(value && value.frontierTokensUsed) || 0;
+            const nextRow = nextUsage[key] || {};
+            const nextLocal = Number(nextRow.localTokensGenerated) || 0;
+            const nextFrontier = Number(nextRow.frontierTokensUsed) || 0;
+            nextUsage[key] = {
+              localTokensGenerated: Math.max(nextLocal, prevLocal),
+              frontierTokensUsed: Math.max(nextFrontier, prevFrontier)
+            };
+          }
+          settings.workspaceTokenUsage = nextUsage;
+        }
+      }
     }
     const tmp = settingsPath() + '.tmp';
     await fsp.writeFile(tmp, JSON.stringify(settings, null, 2), 'utf-8');
@@ -221,6 +253,31 @@ ipcMain.handle('settings:save', async (_e, settings) => {
 // ==========================================
 // LIVE SESSION (desktop ↔ web console remote control)
 // ==========================================
+
+function finiteTokenCount(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function tokenFieldsFromSettings(settings) {
+  if (!settings || typeof settings !== 'object') return null;
+  const local = finiteTokenCount(Number(settings.localTokensGenerated));
+  const frontier = finiteTokenCount(Number(settings.frontierTokensUsed));
+  const hasUsage =
+    settings.workspaceTokenUsage &&
+    typeof settings.workspaceTokenUsage === 'object' &&
+    !Array.isArray(settings.workspaceTokenUsage);
+  const scope =
+    settings.tokenStatsScope === 'project' || settings.tokenStatsScope === 'global'
+      ? settings.tokenStatsScope
+      : null;
+  if (local == null && frontier == null && !hasUsage && !scope) return null;
+  return {
+    localTokensGenerated: local != null ? local : 0,
+    frontierTokensUsed: frontier != null ? frontier : 0,
+    tokenStatsScope: scope || 'global',
+    workspaceTokenUsage: hasUsage ? settings.workspaceTokenUsage : {}
+  };
+}
 
 /** In-memory mirror of the Studio window so web clients attach to the same session. */
 let liveSession = {
@@ -248,6 +305,37 @@ ipcMain.handle('session:publish', (_e, snapshot = {}) => {
       typeof snapshot.chatsRevision === 'number' ? snapshot.chatsRevision : liveSession.chatsRevision || 0;
     // Monotonic — a stale client must not roll chatsRevision backwards.
     const chatsRevision = Math.max(incomingRev, liveSession.chatsRevision || 0);
+    // Desktop owns token totals. Web publishes omit them; a zero snapshot must not wipe the mirror.
+    const fromWeb = snapshot.source === 'web';
+    const incomingLocal = finiteTokenCount(snapshot.localTokensGenerated);
+    const incomingFrontier = finiteTokenCount(snapshot.frontierTokensUsed);
+    const prevLocal = finiteTokenCount(liveSession.localTokensGenerated);
+    const prevFrontier = finiteTokenCount(liveSession.frontierTokensUsed);
+    const localTokensGenerated = fromWeb
+      ? prevLocal
+      : incomingLocal != null
+        ? incomingLocal
+        : prevLocal;
+    const frontierTokensUsed = fromWeb
+      ? prevFrontier
+      : incomingFrontier != null
+        ? incomingFrontier
+        : prevFrontier;
+    let tokenStatsScope = liveSession.tokenStatsScope;
+    if (
+      !fromWeb &&
+      (snapshot.tokenStatsScope === 'project' || snapshot.tokenStatsScope === 'global')
+    ) {
+      tokenStatsScope = snapshot.tokenStatsScope;
+    }
+    const incomingUsage =
+      !fromWeb &&
+      snapshot.workspaceTokenUsage &&
+      typeof snapshot.workspaceTokenUsage === 'object' &&
+      !Array.isArray(snapshot.workspaceTokenUsage)
+        ? snapshot.workspaceTokenUsage
+        : null;
+    const workspaceTokenUsage = incomingUsage || liveSession.workspaceTokenUsage;
     liveSession = {
       updatedAt: Date.now(),
       workspacePath:
@@ -267,6 +355,12 @@ ipcMain.handle('session:publish', (_e, snapshot = {}) => {
       // Last writer wins for conductor / chat mirror (each publish carries full snapshot).
       conductor: snapshot.conductor !== undefined ? snapshot.conductor : liveSession.conductor,
       chatMirror: snapshot.chatMirror !== undefined ? snapshot.chatMirror : liveSession.chatMirror,
+      ...(localTokensGenerated != null ? { localTokensGenerated } : {}),
+      ...(frontierTokensUsed != null ? { frontierTokensUsed } : {}),
+      ...(tokenStatsScope === 'project' || tokenStatsScope === 'global' ? { tokenStatsScope } : {}),
+      ...(workspaceTokenUsage && typeof workspaceTokenUsage === 'object'
+        ? { workspaceTokenUsage }
+        : {}),
       source: snapshot.source || 'renderer',
       clientId: snapshot.clientId || liveSession.clientId || null
     };
@@ -293,15 +387,23 @@ ipcMain.handle('session:publish', (_e, snapshot = {}) => {
 /** If the Electron window has not published yet, seed from settings.json for web clients. */
 async function ensureLiveSessionSeeded() {
   try {
-    if (liveSession.updatedAt > 0 && Array.isArray(liveSession.nodes) && liveSession.nodes.length > 0) {
-      send('session:changed', { ...liveSession });
-      return;
-    }
     let settings = {};
     try {
       settings = JSON.parse(await fsp.readFile(settingsPath(), 'utf-8'));
     } catch {
       settings = {};
+    }
+    const tokens = tokenFieldsFromSettings(settings);
+    if (liveSession.updatedAt > 0 && Array.isArray(liveSession.nodes) && liveSession.nodes.length > 0) {
+      if (
+        tokens &&
+        liveSession.localTokensGenerated == null &&
+        liveSession.frontierTokensUsed == null
+      ) {
+        liveSession = { ...liveSession, ...tokens, updatedAt: Date.now() };
+      }
+      send('session:changed', { ...liveSession });
+      return;
     }
     const nodes = Array.isArray(settings.nodes) ? settings.nodes : [];
     liveSession = {
@@ -313,6 +415,7 @@ async function ensureLiveSessionSeeded() {
       chatsRevision: liveSession.chatsRevision || 0,
       activeTabPath: liveSession.activeTabPath || null,
       openTabPaths: liveSession.openTabPaths || [],
+      ...(tokens || {}),
       source: 'seed',
       clientId: null
     };
@@ -1180,12 +1283,21 @@ ipcMain.handle('tools:exec', async (_e, root, name, args) => {
       case 'resolve': return { path: resolveScoped(root, args.path) };
       case 'exists': return { exists: fs.existsSync(resolveScoped(root, args.path)) };
       case 'run_command': {
+        const requested = Number(args && args.timeoutSec);
+        const timeoutSec =
+          Number.isFinite(requested) && requested > 0 ? Math.min(requested, 1800) : 120;
+        const timeoutMs = timeoutSec * 1000;
+        // Ordinary commands keep a 45s idle kill. Electron pack downloads can sit
+        // quiet longer than that, so a long timeout also gets a longer idle window.
+        const idleMs = timeoutSec > 180 ? Math.min(timeoutMs, 5 * 60 * 1000) : 45000;
         const res = await runPowerShell(args.command, root, {
-          timeoutMs: (args.timeoutSec || 120) * 1000,
+          timeoutMs,
           echo: true,
-          capture: true
+          capture: true,
+          idleMs
         });
-        const tail = res.output.length > 12000 ? '[...output truncated...]\n' + res.output.slice(-12000) : res.output;
+        const cap = timeoutSec > 180 ? 24000 : 12000;
+        const tail = res.output.length > cap ? '[...output truncated...]\n' + res.output.slice(-cap) : res.output;
         return {
           content: `Exit code: ${res.code}${res.timedOut ? ' (timed out and was killed)' : ''}\n${tail || '(no output)'}`,
           exitCode: res.code
@@ -1578,12 +1690,12 @@ function killAllProcesses() {
   activeProcs.clear();
 }
 
-function runPowerShell(command, cwd, { timeoutMs = 0, echo = true, capture = false } = {}) {
+function runPowerShell(command, cwd, { timeoutMs = 0, echo = true, capture = false, idleMs = 45000 } = {}) {
   return new Promise(resolve => {
     let output = '';
     let timedOut = false;
     let idleTimedOut = false;
-    const idleMs = 45000;
+    const idleLimit = idleMs > 0 ? idleMs : 45000;
     const wrapped =
       `$env:CI='1'; $env:NONINTERACTIVE='1'; $env:TERM='dumb'; ` +
       `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $ProgressPreference = 'SilentlyContinue'; ${command}`;
@@ -1609,7 +1721,7 @@ function runPowerShell(command, cwd, { timeoutMs = 0, echo = true, capture = fal
         idleTimedOut = true;
         timedOut = true;
         killTree(proc);
-      }, idleMs);
+      }, idleLimit);
     };
     bumpIdle();
 
@@ -1629,7 +1741,7 @@ function runPowerShell(command, cwd, { timeoutMs = 0, echo = true, capture = fal
       if (idleTimer) clearTimeout(idleTimer);
       activeProcs.delete(proc);
       if (echo) {
-        if (idleTimedOut) echoTerminal(`\n[idle timeout ${idleMs}ms — no output]\n`);
+        if (idleTimedOut) echoTerminal(`\n[idle timeout ${idleLimit}ms — no output]\n`);
         echoTerminal(`\n[exit ${code}]\n`);
       }
       send('terminal:state', { running: activeProcs.size > 0 });

@@ -2,7 +2,7 @@
  * Run: npx --yes tsx src/lib/plannerRoute.selftest.ts
  */
 import assert from 'node:assert/strict';
-import { pickCapableReviewTarget, reviewModelSizeB } from './continuationReview';
+import { parseFinalReview, pickCapableReviewTarget, pickFinalSourceReviewTarget, reviewModelSizeB } from './continuationReview';
 import { findLeadArchitect } from './swarmContract';
 import { mergeSettings } from '../config/defaults';
 import type { EndpointNode, HardwareProfile } from '../types';
@@ -93,6 +93,17 @@ const reviewerOnly = node({
 });
 assert.equal(pickCapableReviewTarget([plannerOnly, reviewerOnly], 'planner')?.model, 'gemma4:12b');
 assert.equal(pickCapableReviewTarget([plannerOnly, reviewerOnly], 'reviewer')?.model, 'gemma4:e2b');
+
+const finalPick = pickFinalSourceReviewTarget(cluster);
+assert.equal(finalPick?.node.id, 'cloud');
+assert.equal(finalPick?.model, 'gemini-2.5-flash-lite');
+const localOnly = pickFinalSourceReviewTarget([laptop, mid, big]);
+assert.equal(localOnly?.model, 'gemma4:12b');
+assert.equal(parseFinalReview('<final_review><result>pass</result><notes>Matches the plan.</notes></final_review>')?.result, 'pass');
+assert.equal(
+  parseFinalReview('<final_review><result>issues</result><notes>App.tsx is not wired.</notes></final_review>')?.result,
+  'issues'
+);
 
 const fresh = mergeSettings(null);
 assert.equal(fresh.swarmEnabled, true);

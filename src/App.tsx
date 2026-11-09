@@ -37,6 +37,43 @@ import {
 } from './lib/conversations';
 import { isWebConsoleClient } from './lib/hostApi';
 
+/** Token totals mirrored from the desktop live session onto the web console. */
+type SessionTokenMirror = {
+  localTokensGenerated: number;
+  frontierTokensUsed: number;
+  tokenStatsScope?: 'global' | 'project';
+  workspaceTokenUsage?: AppSettings['workspaceTokenUsage'];
+};
+
+function finiteToken(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/** Keep the previous mirror when a snapshot omits totals. Ignore web-originated snapshots. */
+function mergeTokenMirror(
+  prev: SessionTokenMirror | null,
+  session: LiveStudioSession | null | undefined
+): SessionTokenMirror | null {
+  if (!session || session.source === 'web') return prev;
+  const local = finiteToken(session.localTokensGenerated);
+  const frontier = finiteToken(session.frontierTokensUsed);
+  const scope =
+    session.tokenStatsScope === 'project' || session.tokenStatsScope === 'global'
+      ? session.tokenStatsScope
+      : undefined;
+  const hasUsage =
+    !!session.workspaceTokenUsage &&
+    typeof session.workspaceTokenUsage === 'object' &&
+    !Array.isArray(session.workspaceTokenUsage);
+  if (local == null && frontier == null && !scope && !hasUsage) return prev;
+  return {
+    localTokensGenerated: local != null ? local : prev?.localTokensGenerated ?? 0,
+    frontierTokensUsed: frontier != null ? frontier : prev?.frontierTokensUsed ?? 0,
+    tokenStatsScope: scope || prev?.tokenStatsScope,
+    workspaceTokenUsage: hasUsage ? session.workspaceTokenUsage : prev?.workspaceTokenUsage
+  };
+}
+
 function RemoteHostBanner({ remoteLive }: { remoteLive: boolean }) {
   const [wsState, setWsState] = useState(window.__LA_WS_STATE__ || 'connecting');
   useEffect(() => {
@@ -168,6 +205,10 @@ export const App: React.FC = () => {
     mode: 'open' | 'new';
   }>({ open: false, mode: 'open' });
   const [remoteLive, setRemoteLive] = useState(false);
+  /** False until loadSettings finishes so the first publish cannot wipe seeded totals with zeros. */
+  const [settingsReady, setSettingsReady] = useState(false);
+  /** Desktop token totals applied on the web console. Not written back into settings. */
+  const [sessionTokens, setSessionTokens] = useState<SessionTokenMirror | null>(null);
   const [chatsTick, setChatsTick] = useState(0);
   const [peerConductor, setPeerConductor] = useState<LiveConductorState | null>(null);
   const [peerChatMirror, setPeerChatMirror] = useState<{
@@ -335,6 +376,9 @@ export const App: React.FC = () => {
     if (session.chatMirror !== undefined) {
       setPeerChatMirror(session.chatMirror || null);
     }
+    if (isRemoteClient) {
+      setSessionTokens(prev => mergeTokenMirror(prev, session));
+    }
   }, [isRemoteClient]);
 
   const openTabsSnapshotRef = useRef<OpenTab[]>([]);
@@ -381,6 +425,10 @@ export const App: React.FC = () => {
       }
       merged.recentWorkspaces = recent;
       setSettings(merged);
+      setSettingsReady(true);
+      if (isRemoteClient && live) {
+        setSessionTokens(prev => mergeTokenMirror(prev, live));
+      }
       if (merged.explorerWidth) setExplorerWidth(merged.explorerWidth);
       if (merged.chatWidth) setChatWidth(merged.chatWidth);
       if (merged.agentControlWidth) setAgentControlWidth(merged.agentControlWidth);
@@ -485,6 +533,15 @@ export const App: React.FC = () => {
     if (publishTimerRef.current) clearTimeout(publishTimerRef.current);
     publishTimerRef.current = setTimeout(() => {
       if (applyingRemoteRef.current) return;
+      const tokenMirror =
+        !isRemoteClient && settingsReady
+          ? {
+              localTokensGenerated: settings.localTokensGenerated || 0,
+              frontierTokensUsed: settings.frontierTokensUsed || 0,
+              tokenStatsScope: settings.tokenStatsScope === 'project' ? 'project' : 'global',
+              workspaceTokenUsage: settings.workspaceTokenUsage || {}
+            }
+          : {};
       void window.electronAPI.publishLiveSession?.({
         workspacePath,
         activeConversationId: activeConversationId || null,
@@ -496,6 +553,8 @@ export const App: React.FC = () => {
         openTabPaths: openTabs.map(t => t.path),
         conductor: localConductorRef.current,
         chatMirror: localChatMirrorRef.current,
+        // Desktop owns token totals. Web clients omit them so a zero snapshot cannot wipe the mirror.
+        ...tokenMirror,
         source: isRemoteClient ? 'web' : 'desktop',
         clientId: sessionClientIdRef.current
       } as Partial<LiveStudioSession>);
@@ -505,6 +564,11 @@ export const App: React.FC = () => {
     };
   }, [
     isRemoteClient,
+    settingsReady,
+    settings.localTokensGenerated,
+    settings.frontierTokensUsed,
+    settings.tokenStatsScope,
+    settings.workspaceTokenUsage,
     workspacePath,
     activeConversationId,
     selectedAgentId,
@@ -1092,10 +1156,16 @@ export const App: React.FC = () => {
     return true;
   };
 
-  const handleExecuteToolCommand = async (command: string): Promise<string> => {
+  const handleExecuteToolCommand = async (
+    command: string,
+    opts?: { timeoutSec?: number }
+  ): Promise<string> => {
     setIsTerminalOpen(true);
     if (!window.electronAPI || !workspacePath) return '';
-    const res = await window.electronAPI.execTool(workspacePath, 'run_command', { command });
+    const res = await window.electronAPI.execTool(workspacePath, 'run_command', {
+      command,
+      ...(opts?.timeoutSec ? { timeoutSec: opts.timeoutSec } : {})
+    });
     return res.content || res.error || '';
   };
 
@@ -1233,19 +1303,28 @@ export const App: React.FC = () => {
     });
   };
 
-  const tokenStatsScope = settings.tokenStatsScope === 'project' ? 'project' : 'global';
+  const tokenMirror = isRemoteClient ? sessionTokens : null;
+  const tokenStatsScope =
+    tokenMirror?.tokenStatsScope === 'project' || tokenMirror?.tokenStatsScope === 'global'
+      ? tokenMirror.tokenStatsScope
+      : settings.tokenStatsScope === 'project'
+        ? 'project'
+        : 'global';
   const projectTokenKey = normalizeWorkspacePath(workspacePath);
-  const projectTokens = projectTokenKey
-    ? settings.workspaceTokenUsage?.[projectTokenKey]
-    : undefined;
+  const tokenUsage = tokenMirror?.workspaceTokenUsage ?? settings.workspaceTokenUsage;
+  const projectTokens = projectTokenKey ? tokenUsage?.[projectTokenKey] : undefined;
   const displayLocalTokens =
     tokenStatsScope === 'project'
       ? projectTokens?.localTokensGenerated || 0
-      : settings.localTokensGenerated || 0;
+      : tokenMirror
+        ? tokenMirror.localTokensGenerated
+        : settings.localTokensGenerated || 0;
   const displayFrontierTokens =
     tokenStatsScope === 'project'
       ? projectTokens?.frontierTokensUsed || 0
-      : settings.frontierTokensUsed || 0;
+      : tokenMirror
+        ? tokenMirror.frontierTokensUsed
+        : settings.frontierTokensUsed || 0;
 
   const handleTokenStatsScopeChange = (scope: 'global' | 'project') => {
     updateSettings({ tokenStatsScope: scope });
@@ -1345,8 +1424,8 @@ export const App: React.FC = () => {
         isNarrow ? 'select-text' : 'select-none'
       }`}
     >
-      {/* Top Header — hide dense chrome on very small screens */}
-      <div className={isNarrow ? 'shrink-0' : undefined}>
+      {/* Top header stays visible. Web console keeps the same brand, tokens, and endpoints as desktop. */}
+      <div className="shrink-0">
         <Header
           workspacePath={workspacePath}
           recentWorkspaces={settings.recentWorkspaces || []}
@@ -1372,7 +1451,8 @@ export const App: React.FC = () => {
           uiScale={uiScale}
           onUpdateUiScale={handleUpdateUiScale}
           appVersion={appVersion}
-          compact={isNarrow}
+          compact={isNarrow && !isRemoteClient}
+          wrapChrome={isRemoteClient && isNarrow}
         />
       </div>
       <UpdateBanner />

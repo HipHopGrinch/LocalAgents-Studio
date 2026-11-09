@@ -743,6 +743,8 @@ export interface LiveConductorState {
   targetNodeId?: string;
   targetModel?: string;
   executingPlanNotice?: string | null;
+  /** Worker cards for the Node Work column, mirrored to the web console. */
+  nodeWork?: PipelineStep[];
   /** Bumps whenever local conductor UI changes so peers re-apply. */
   revision: number;
 }
@@ -770,6 +772,15 @@ export interface LiveStudioSession {
     conversationId: string;
     messages: ChatMessage[];
   } | null;
+  /**
+   * Desktop-owned token counters mirrored to the web console header.
+   * Web clients display these and must not publish zeros over them.
+   */
+  localTokensGenerated?: number;
+  frontierTokensUsed?: number;
+  tokenStatsScope?: 'global' | 'project';
+  /** Per-workspace counters (same shape as AppSettings.workspaceTokenUsage). */
+  workspaceTokenUsage?: AppSettings['workspaceTokenUsage'];
   source?: string;
   /** Stable per-window id so a client ignores its own echo. */
   clientId?: string | null;

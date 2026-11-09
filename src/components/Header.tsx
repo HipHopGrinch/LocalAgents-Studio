@@ -43,6 +43,8 @@ interface HeaderProps {
   appVersion?: string;
   /** Phone / narrow web console — strip dense cluster chrome. */
   compact?: boolean;
+  /** Put tokens and endpoints on their own row so a narrow web console cannot clip them. */
+  wrapChrome?: boolean;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -67,7 +69,8 @@ export const Header: React.FC<HeaderProps> = ({
   uiScale,
   onUpdateUiScale,
   appVersion,
-  compact = false
+  compact = false,
+  wrapChrome = false
 }) => {
   const [showScalePopover, setShowScalePopover] = useState(false);
   const [projectsOpen, setProjectsOpen] = useState(false);
@@ -103,12 +106,12 @@ export const Header: React.FC<HeaderProps> = ({
 
   return (
     <header
-      className={`min-h-12 h-auto bg-[#121214] border-b border-[#27272a] px-2 sm:px-3 py-1.5 flex flex-nowrap items-center gap-2 sm:gap-3 select-none shrink-0 relative z-40 ${
-        compact ? 'overflow-visible' : ''
-      }`}
+      className={`min-h-12 h-auto bg-[#121214] border-b border-[#27272a] px-2 sm:px-3 py-1.5 flex gap-2 sm:gap-3 select-none shrink-0 relative z-40 max-w-full ${
+        wrapChrome ? 'flex-col items-stretch' : 'flex-wrap items-center'
+      } ${compact ? 'overflow-visible' : ''}`}
     >
       {/* Brand & Workspace — stay on this row; long names wrap inside the button */}
-      <div className="flex flex-nowrap items-center gap-2 sm:gap-3 min-w-0 flex-1">
+      <div className={`flex flex-nowrap items-center gap-2 sm:gap-3 min-w-0 ${wrapChrome ? 'w-full' : 'flex-1'}`}>
         <div className="flex items-center space-x-1.5 text-indigo-400 font-bold tracking-tight text-sm shrink-0">
           <Layers className="w-5 h-5" />
           {compact ? (
@@ -203,7 +206,11 @@ export const Header: React.FC<HeaderProps> = ({
       </div>
 
       {/* Cluster, tokens, and buttons — compact mode keeps only essentials */}
-      <div className="flex flex-nowrap items-center gap-1.5 sm:gap-2 shrink-0 justify-end">
+      <div
+        className={`flex flex-wrap items-center gap-1.5 sm:gap-2 min-w-0 max-w-full ${
+          wrapChrome ? 'w-full justify-start' : 'shrink-0 justify-end'
+        }`}
+      >
         {compact ? (
           <>
             <button

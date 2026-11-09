@@ -143,6 +143,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
   conversations: [],
   activeConversationId: undefined,
   searxngUrl: '',
+  swarmEnabled: true,
+  autoSelectEndpoint: true,
+  autoApplyWrites: true,
+  autoReview: true,
   webConsole: {
     enabled: false,
     port: 3847

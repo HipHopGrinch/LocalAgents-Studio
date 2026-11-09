@@ -16,6 +16,7 @@ import {
   type ConductorFileJob
 } from './tools';
 import type { NodeRole } from '../types';
+import { pickCapableReviewTarget } from './continuationReview';
 
 export type SwarmComplexity = 'high' | 'medium' | 'low';
 export type SwarmPreferredRole = '@coder' | '@docs' | '@reviewer';
@@ -1060,54 +1061,22 @@ function nodeAllowsPreferred(n: EndpointNode, preferred: SwarmPreferredRole): bo
 }
 
 /**
- * Lead Architect (Pass-1): Allowed Roles includes Planner wins (frontier allowed).
- * Otherwise high-VRAM local (≥16GB), else best local, else frontier.
+ * Lead Architect (Pass-1): largest local model that may plan.
+ * Frontier is the fallback only when no local planner-capable node is online.
  */
 export function findLeadArchitect(
   nodes: EndpointNode[]
 ): { node: EndpointNode; model: string; tokPerSec: number; usedFrontierBackup?: boolean } | null {
-  const online = nodes.filter(n => n.online && getEnabledModelsForNode(n).length > 0);
-  const local = online.filter(n => !isFrontierNode(n));
-  const highVram = local.filter(n => (n.hardware?.vramGB || 0) >= 16);
-  const explicitPlanners = online.filter(n => nodeHasExplicitRole(n, 'planner'));
-
-  const scoreNode = (n: EndpointNode) => {
-    const model = pickBestModelForComplexity(n, 'heavy');
-    const speed = nodeTokPerSec(n, model);
-    const vram = n.hardware?.vramGB || 0;
-    const roleBonus = roleMatches(n, '@coder') ? 200 : 0;
-    return { model, speed, score: vram * 50 + speed + roleBonus };
-  };
-
-  const frontierPlanners = online.filter(n => isFrontierNode(n) && (nodeHasExplicitRole(n, 'planner') || !!n.apiKey));
-  const pool =
-    frontierPlanners.length > 0
-      ? frontierPlanners
-      : explicitPlanners.length > 0
-        ? explicitPlanners
-        : highVram.length > 0
-          ? highVram
-          : local.length > 0
-            ? local
-            : online;
-  if (!pool.length) return null;
-
-  let best = pool[0];
-  let bestMeta = scoreNode(best);
-  for (const n of pool) {
-    const meta = scoreNode(n);
-    if (meta.score > bestMeta.score) {
-      best = n;
-      bestMeta = meta;
-    }
-  }
-
+  const picked = pickCapableReviewTarget(nodes, 'planner');
+  if (!picked) return null;
+  const explicitPlanners = nodes.filter(
+    n => n.online && nodeHasExplicitRole(n, 'planner') && !isFrontierNode(n)
+  );
   return {
-    node: best,
-    model: bestMeta.model,
-    tokPerSec: bestMeta.speed,
-    // Intentional Planner tag on frontier is not a "backup" failover
-    usedFrontierBackup: explicitPlanners.length === 0 && isFrontierNode(best)
+    node: picked.node,
+    model: picked.model,
+    tokPerSec: nodeTokPerSec(picked.node, picked.model),
+    usedFrontierBackup: explicitPlanners.length === 0 && isFrontierNode(picked.node)
   };
 }
 

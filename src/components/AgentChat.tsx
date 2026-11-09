@@ -10,6 +10,7 @@ import {
   ChatConversation,
   ExecutionQueue,
   PlannerPlan,
+  AppSettings,
   PlannerResumePhase,
   PlanOption,
   WorkspaceFile,
@@ -307,6 +308,14 @@ interface AgentChatProps {
   searxngUrl?: string;
   /** Local MCP server JSON from Settings. */
   mcpServersJson?: string;
+  /** First-run conductor defaults, then the user's saved toggles. */
+  swarmEnabled?: boolean;
+  autoNodeEnabled?: boolean;
+  autoApplyEnabled?: boolean;
+  autoReviewEnabled?: boolean;
+  onConductorPrefsChange?: (
+    patch: Partial<Pick<AppSettings, 'swarmEnabled' | 'autoSelectEndpoint' | 'autoApplyWrites' | 'autoReview'>>
+  ) => void;
   /** Inner tool-loop budget (settings.maxAgentSteps). */
   maxAgentSteps?: number;
   /** True while a local/frontier agent turn (or stuck ladder) is in flight — blocks update restart. */
@@ -353,6 +362,11 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   onToggleModelThinking,
   searxngUrl = '',
   mcpServersJson = '',
+  swarmEnabled = true,
+  autoNodeEnabled = true,
+  autoApplyEnabled = true,
+  autoReviewEnabled = true,
+  onConductorPrefsChange,
   maxAgentSteps = 12,
   onBusyChange,
   peerConductor = null,
@@ -372,14 +386,14 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   // Routing states
   const [targetNodeId, setTargetNodeId] = useState<string>(currentAgent.endpointId);
   const [targetModel, setTargetModel] = useState<string>(currentAgent.model);
-  const [autoSelectEndpoint, setAutoSelectEndpoint] = useState<boolean>(true);
+  const [autoSelectEndpoint, setAutoSelectEndpoint] = useState<boolean>(autoNodeEnabled);
   const [includeActiveFile, setIncludeActiveFile] = useState(true);
-  const [isPipelineMode, setIsPipelineMode] = useState(false);
-  const [autoApplyWrites, setAutoApplyWrites] = useState<boolean>(currentAgent.autoApproveWrites ?? true);
-  const autoApplyWritesRef = useRef(currentAgent.autoApproveWrites ?? true);
+  const [isPipelineMode, setIsPipelineMode] = useState(swarmEnabled);
+  const [autoApplyWrites, setAutoApplyWrites] = useState<boolean>(autoApplyEnabled);
+  const autoApplyWritesRef = useRef(autoApplyEnabled);
   /** After each coding step: Reviewer runs; ON = auto Send to Planner→Coder / continue, OFF = wait for user */
-  const [autoReview, setAutoReview] = useState(false);
-  const autoReviewRef = useRef(false);
+  const [autoReview, setAutoReview] = useState(autoReviewEnabled);
+  const autoReviewRef = useRef(autoReviewEnabled);
   /** Resume depth when user approval is required after a post-step review */
   const pendingReviewResumeRef = useRef<{ depth: number; previousTask: string } | null>(null);
   /**
@@ -987,17 +1001,30 @@ ${instruction}`,
     };
   }, []);
 
-  // Sync permissions when the persona changes. Do not stamp the persona's
+  // Saved conductor toggles arrive after settings load. The checkbox is the source of truth,
+  // not the persona's autoApproveWrites flag.
+  useEffect(() => {
+    setIsPipelineMode(swarmEnabled);
+  }, [swarmEnabled]);
+  useEffect(() => {
+    setAutoSelectEndpoint(autoNodeEnabled);
+  }, [autoNodeEnabled]);
+  useEffect(() => {
+    autoApplyWritesRef.current = autoApplyEnabled;
+    setAutoApplyWrites(autoApplyEnabled);
+  }, [autoApplyEnabled]);
+  useEffect(() => {
+    autoReviewRef.current = autoReviewEnabled;
+    setAutoReview(autoReviewEnabled);
+  }, [autoReviewEnabled]);
+
+  // Sync the pinned endpoint when the persona changes. Do not stamp the persona's
   // default model onto a node where that model is disabled or not installed.
   useEffect(() => {
     if (currentAgent.endpointId && nodes.some(n => n.id === currentAgent.endpointId)) {
       setTargetNodeId(currentAgent.endpointId);
     }
-    if (currentAgent.autoApproveWrites !== undefined) {
-      autoApplyWritesRef.current = currentAgent.autoApproveWrites;
-      setAutoApplyWrites(currentAgent.autoApproveWrites);
-    }
-  }, [currentAgent.id, currentAgent.endpointId, currentAgent.autoApproveWrites]);
+  }, [currentAgent.id, currentAgent.endpointId, nodes]);
 
   // Selected node with fallback to online node if offline (undefined when cluster is empty)
   const requestedNode = nodes.find(n => n.id === targetNodeId) || nodes[0];
@@ -2776,6 +2803,22 @@ ${instruction}`,
   // ==========================================
 
   const resolveRoute = (userText: string, agent: AgentPersona) => {
+    const fitRole =
+      agent.handle === 'planner' || agent.id === 'planner'
+        ? 'planner'
+        : agent.handle === 'reviewer' || agent.id === 'reviewer'
+          ? 'reviewer'
+          : null;
+    if (autoSelectEndpoint && fitRole) {
+      const picked = pickCapableReviewTarget(nodes, fitRole);
+      if (picked) {
+        return {
+          routedNode: picked.node,
+          routedModel: picked.model,
+          routedIsFrontier: picked.node.type === 'openai' || !!picked.node.apiKey
+        };
+      }
+    }
     const routedNode = autoSelectEndpoint
       ? selectBestEndpointForTask(userText, agent.handle, nodes)
       : selectedNode;
@@ -3445,10 +3488,6 @@ ${instruction}`,
     ephemeralWorkerRef.current = true;
     onSelectAgent(coderAgent.id);
     onConversationPatch?.({ agentId: coderAgent.id });
-    if (coderAgent.autoApproveWrites !== undefined) {
-      autoApplyWritesRef.current = coderAgent.autoApproveWrites;
-      setAutoApplyWrites(coderAgent.autoApproveWrites);
-    }
 
     const coderPrompt = formatReviewPlanForCoder(
       singlePlan,
@@ -4239,10 +4278,6 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
     ephemeralWorkerRef.current = true;
     onSelectAgent(coderAgent.id);
     onConversationPatch?.({ agentId: coderAgent.id });
-    if (coderAgent.autoApproveWrites !== undefined) {
-      autoApplyWritesRef.current = coderAgent.autoApproveWrites;
-      setAutoApplyWrites(coderAgent.autoApproveWrites);
-    }
 
     resetAgentLoopBudget();
     stopRequestedRef.current = false;
@@ -6146,7 +6181,11 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
           </div>
 
           <button
-            onClick={() => setIsPipelineMode(!isPipelineMode)}
+            onClick={() => {
+              const next = !isPipelineMode;
+              setIsPipelineMode(next);
+              onConductorPrefsChange?.({ swarmEnabled: next });
+            }}
             className={`w-full flex items-center justify-center space-x-1.5 px-2 py-1 rounded border transition ${
               isPipelineMode
                 ? 'bg-amber-500/20 border-amber-500/40 text-amber-300 font-semibold'
@@ -6169,7 +6208,10 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
               <input
                 type="checkbox"
                 checked={autoSelectEndpoint}
-                onChange={(e) => setAutoSelectEndpoint(e.target.checked)}
+                onChange={(e) => {
+                  setAutoSelectEndpoint(e.target.checked);
+                  onConductorPrefsChange?.({ autoSelectEndpoint: e.target.checked });
+                }}
                 className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
               />
               <span>Auto-Node</span>
@@ -6181,6 +6223,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                 onChange={(e) => {
                   autoApplyWritesRef.current = e.target.checked;
                   setAutoApplyWrites(e.target.checked);
+                  onConductorPrefsChange?.({ autoApplyWrites: e.target.checked });
                 }}
                 className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
               />
@@ -6193,6 +6236,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                 onChange={(e) => {
                   autoReviewRef.current = e.target.checked;
                   setAutoReview(e.target.checked);
+                  onConductorPrefsChange?.({ autoReview: e.target.checked });
                 }}
                 className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
               />

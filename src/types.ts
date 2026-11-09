@@ -302,6 +302,14 @@ export interface AppSettings {
   uiScale?: number;
   /** SearXNG base URL for the web_search tool. Empty = search unavailable. */
   searxngUrl?: string;
+  /** Conductor Swarm on. Missing on old settings files means on. */
+  swarmEnabled?: boolean;
+  /** Auto-Node routing. Missing on old settings files means on. */
+  autoSelectEndpoint?: boolean;
+  /** Apply file writes without an extra click. Missing on old settings files means on. */
+  autoApplyWrites?: boolean;
+  /** Reviewer continues without waiting. Missing on old settings files means on. */
+  autoReview?: boolean;
   /**
    * Local MCP servers (stdio). JSON array: [{ "name", "command", "args": [] }].
    * Remote URLs are ignored. Empty = no MCP tools.

@@ -73,14 +73,24 @@ Rules:
 - If the latest turn already tried Next, say what is still missing in one sentence. Do not ask the same question again.
 - Never continue with an inspection-only task.`;
 
-/** Parameters the model actually runs. Catalog active size, else catalog size, else the tag. */
-export function reviewModelSizeB(modelName: string): number {
+/**
+ * Parameters the model actually runs.
+ * Ollama `details.parameter_size` wins, then the catalog, then the tag (`12b`, `e4b`).
+ */
+export function reviewModelSizeB(modelName: string, parameterSize?: string): number {
+  const fromDetails = parseParams(parameterSize);
+  if (typeof fromDetails === 'number' && fromDetails > 0) return fromDetails;
   const row = MODEL_CATALOG.find(m => normTag(m.tag) === normTag(modelName));
   if (row) {
     if (typeof row.activeB === 'number' && row.activeB > 0) return row.activeB;
     if (typeof row.paramsB === 'number' && row.paramsB > 0) return row.paramsB;
   }
   return parseParams(modelName) ?? 0;
+}
+
+function sizeOfEnabledModel(node: EndpointNode, model: string): number {
+  const live = node.models?.find(m => m.name === model);
+  return reviewModelSizeB(model, live?.details?.parameter_size);
 }
 
 export interface ReviewTarget {
@@ -110,7 +120,7 @@ export function pickCapableReviewTarget(
   for (const node of pool) {
     const vram = node.hardware?.vramGB || 0;
     for (const model of getEnabledModelsForNode(node)) {
-      const size = reviewModelSizeB(model);
+      const size = sizeOfEnabledModel(node, model);
       const ctx = resolveModelNumCtx(node, model, DEFAULT_MODEL_NUM_CTX);
       const wins =
         size > bestSize ||
@@ -144,7 +154,7 @@ export function pickLargestLocalTarget(
   for (const node of pool) {
     const vram = node.hardware?.vramGB || 0;
     for (const model of getEnabledModelsForNode(node)) {
-      const size = reviewModelSizeB(model);
+      const size = sizeOfEnabledModel(node, model);
       const wins = size > bestSize || (size === bestSize && vram > bestVram);
       if (!wins) continue;
       best = { node, model };

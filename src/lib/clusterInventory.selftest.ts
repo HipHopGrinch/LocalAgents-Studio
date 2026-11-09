@@ -16,8 +16,27 @@ assert.equal(modelFitTier('qwen2.5:7b', 16384), 'tight');
 assert.equal(modelFitTier('qwen2.5:32b', 32768), 'standard');
 assert.equal(modelFitTier('qwen2.5:32b', 65536), 'wide');
 assert.equal(modelFitTier('llama3.1:70b', 131072), 'wide');
-// Frontier names are never "small" by param heuristic
+// Frontier: never tight even if Studio once fell back to 16k
+assert.equal(modelFitTier('gpt-4o', 16384), 'standard');
+assert.equal(modelFitTier('gemini-2.5-flash-lite', 16384), 'standard');
+assert.equal(modelFitTier('gemini-2.0-flash-lite', 262144), 'wide');
 assert.equal(modelFitTier('gpt-4o', 128000), 'wide');
+
+import {
+  DEFAULT_FRONTIER_NUM_CTX,
+  resolveModelNumCtx
+} from './contextSize';
+
+const frontierNode = {
+  type: 'openai' as const,
+  apiKey: 'x',
+  modelPrefs: {}
+};
+assert.equal(
+  resolveModelNumCtx(frontierNode, 'gemini-2.5-flash-lite', 16384),
+  DEFAULT_FRONTIER_NUM_CTX
+);
+assert.equal(DEFAULT_FRONTIER_NUM_CTX, 262144);
 
 const tightCaps = fileContextCapsForTier('tight');
 assert.ok(tightCaps.maxTotalChars < fileContextCapsForTier('standard').maxTotalChars);

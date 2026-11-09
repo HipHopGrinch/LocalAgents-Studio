@@ -259,18 +259,21 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
                 </div>
               </div>
 
-              {/* Max context ceiling — per-model on this node; requests use a smaller dynamic num_ctx */}
-              {!isEmbed && onSetModelNumCtx && currentNode.type !== 'openai' && (() => {
+              {/* Max context ceiling — Ollama KV budget; frontier defaults to 256k (server-managed). */}
+              {!isEmbed && onSetModelNumCtx && (() => {
+                const isFrontier = currentNode.type === 'openai' || !!currentNode.apiKey;
                 const modelNativeMax = resolveModelMaxContext(m.name, m);
                 const storedMax = resolveModelNumCtx(currentNode, m.name, DEFAULT_MODEL_NUM_CTX);
                 const currentMax = snapNumCtxToOption(storedMax, modelNativeMax);
                 const options = ctxSizeOptions(modelNativeMax, currentMax);
                 const fit = estimateContextFit(currentMax);
-                const vramFit = estimateInstalledModelFit(m, currentNode.hardware, currentMax);
-                const spills = fitSpillsToSystemRam(vramFit.kind);
+                const vramFit = isFrontier
+                  ? null
+                  : estimateInstalledModelFit(m, currentNode.hardware, currentMax);
+                const spills = vramFit ? fitSpillsToSystemRam(vramFit.kind) : false;
                 const overMax = modelNativeMax != null && currentMax > modelNativeMax;
                 const spillTitle =
-                  vramFit.kind === 'none'
+                  vramFit?.kind === 'none'
                     ? "Won't fit in VRAM + system RAM at this max context"
                     : 'May spill into system RAM (slower) at this max';
                 return (
@@ -280,28 +283,44 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
                         <Gauge className="w-3.5 h-3.5 shrink-0" />
                         <span>Max context</span>
                         <HelpTip title="Maximum context (num_ctx ceiling)" align="left">
-                          <p>
-                            Ceiling for this model on this node. Each Planner/Coder/Reviewer request uses the
-                            <strong> smallest </strong>
-                            num_ctx that fits that turn&apos;s system prompt, history, tools, and expected
-                            output — never larger than this max.
-                          </p>
-                          <p>
-                            VRAM totals below assume the model is loaded at this <em>maximum</em> (weights +
-                            KV cache). Smaller live windows use less KV in practice. Spill warnings use usable
-                            VRAM after reserved VRAM.
-                          </p>
-                          <p>Rough estimates for English text; code and images differ:</p>
-                          <ul className="list-disc pl-3.5 space-y-0.5">
-                            <li>1 token ≈ 0.75 English words</li>
-                            <li>1 page ≈ 500 words ≈ 667 tokens</li>
-                            <li>1 short website ≈ 2,500 tokens</li>
-                            <li>1 medium source file ≈ 1,500 tokens</li>
-                          </ul>
-                          {!modelNativeMax && (
-                            <p className="text-amber-400/90">
-                              Model max unknown — a huge ceiling wastes VRAM if a request ever needs it.
-                            </p>
+                          {isFrontier ? (
+                            <>
+                              <p>
+                                Frontier APIs (Gemini Flash Lite, Grok, OpenAI, …) manage long context on the
+                                server. Studio defaults them to <strong>256k</strong> so chat compaction and
+                                Model Fit do not treat them like a 16k local model.
+                              </p>
+                              <p>
+                                Raise or lower only if you want Studio to compact earlier; the API still
+                                accepts large prompts within the vendor&apos;s limit.
+                              </p>
+                            </>
+                          ) : (
+                            <>
+                              <p>
+                                Ceiling for this model on this node. Each Planner/Coder/Reviewer request uses the
+                                <strong> smallest </strong>
+                                num_ctx that fits that turn&apos;s system prompt, history, tools, and expected
+                                output — never larger than this max.
+                              </p>
+                              <p>
+                                VRAM totals below assume the model is loaded at this <em>maximum</em> (weights +
+                                KV cache). Smaller live windows use less KV in practice. Spill warnings use usable
+                                VRAM after reserved VRAM.
+                              </p>
+                              <p>Rough estimates for English text; code and images differ:</p>
+                              <ul className="list-disc pl-3.5 space-y-0.5">
+                                <li>1 token ≈ 0.75 English words</li>
+                                <li>1 page ≈ 500 words ≈ 667 tokens</li>
+                                <li>1 short website ≈ 2,500 tokens</li>
+                                <li>1 medium source file ≈ 1,500 tokens</li>
+                              </ul>
+                              {!modelNativeMax && (
+                                <p className="text-amber-400/90">
+                                  Model max unknown — a huge ceiling wastes VRAM if a request ever needs it.
+                                </p>
+                              )}
+                            </>
                           )}
                         </HelpTip>
                         {modelNativeMax != null && (
@@ -332,19 +351,25 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
                     <p className={`text-[10px] font-mono leading-snug ${overMax ? 'text-amber-400' : 'text-zinc-500'}`}>
                       Ceiling · {fit.label}
                       {overMax ? ' · exceeds model max' : ''}
-                      {!modelNativeMax ? ' · model max unknown' : ''}
+                      {isFrontier
+                        ? ' · frontier default 256k (server-managed)'
+                        : !modelNativeMax
+                          ? ' · model max unknown'
+                          : ''}
                     </p>
-                    <p className="text-[10px] font-mono leading-snug text-zinc-400 flex items-center flex-wrap gap-x-1.5 gap-y-0.5">
-                      <span>
-                        Model ~{formatGB(vramFit.weightsGB)} · Max ctx KV ~{formatGB(vramFit.kvGB)} · Total ~
-                        {formatGB(vramFit.totalGB)}
-                      </span>
-                      {spills && (
-                        <span title={spillTitle} className="inline-flex" aria-label={spillTitle}>
-                          <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    {vramFit && (
+                      <p className="text-[10px] font-mono leading-snug text-zinc-400 flex items-center flex-wrap gap-x-1.5 gap-y-0.5">
+                        <span>
+                          Model ~{formatGB(vramFit.weightsGB)} · Max ctx KV ~{formatGB(vramFit.kvGB)} · Total ~
+                          {formatGB(vramFit.totalGB)}
                         </span>
-                      )}
-                    </p>
+                        {spills && (
+                          <span title={spillTitle} className="inline-flex" aria-label={spillTitle}>
+                            <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                          </span>
+                        )}
+                      </p>
+                    )}
                   </div>
                 );
               })()}

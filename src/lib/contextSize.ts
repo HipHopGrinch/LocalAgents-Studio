@@ -18,9 +18,31 @@ export const CTX_MEDIUM_FILE_TOKENS = 1500;
 export const CTX_CHAT_TURN_TOKENS = 400;
 
 /** Common Ollama num_ctx presets shown in Hardware Settings. */
-export const COMMON_CTX_SIZES = [2048, 4096, 8192, 16384, 32768, 65536, 131072] as const;
+export const COMMON_CTX_SIZES = [
+  2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144
+] as const;
 
+/** Local Ollama default ceiling when the user has not set a per-model pref. */
 export const DEFAULT_MODEL_NUM_CTX = 16384;
+
+/**
+ * Frontier / cloud APIs (Gemini Flash Lite, Grok, OpenAI, …) manage long context
+ * server-side. Studio must not shrink them to the local 16k persona default.
+ */
+export const DEFAULT_FRONTIER_NUM_CTX = 262144;
+
+export function isFrontierEndpoint(
+  node?: Pick<{ type?: string; apiKey?: string }, 'type' | 'apiKey'> | null
+): boolean {
+  if (!node) return false;
+  return node.type === 'openai' || !!node.apiKey;
+}
+
+/** Known-wide cloud model names (Gemini Flash*, GPT-4*, Claude*, Grok*). */
+export function isWideFrontierModel(modelName?: string): boolean {
+  if (!modelName) return false;
+  return /gemini|gpt-4|gpt-5|o1|o3|o4|claude|grok|chatgpt/i.test(modelName);
+}
 
 export function formatCtxLabel(tokens: number): string {
   if (tokens >= 1024 && tokens % 1024 === 0) {
@@ -50,7 +72,7 @@ export function estimateContextFit(tokens: number): {
   return { pages, shortSites, codeFiles, chatTurns, label };
 }
 
-/** Known max context for a model name (details → catalog → undefined). */
+/** Known max context for a model name (details → catalog → frontier defaults → undefined). */
 export function resolveModelMaxContext(
   modelName: string,
   model?: Pick<OllamaModel, 'details'> | null
@@ -64,6 +86,9 @@ export function resolveModelMaxContext(
     return lower === tag || lower.startsWith(tag.split(':')[0] + ':') || tag.startsWith(lower.split(':')[0] + ':');
   });
   if (catalog?.contextMax) return catalog.contextMax;
+
+  // Cloud models are not in the Ollama catalog — do not leave them "unknown" at 16k.
+  if (isWideFrontierModel(modelName)) return DEFAULT_FRONTIER_NUM_CTX;
   return undefined;
 }
 
@@ -103,14 +128,23 @@ export function snapNumCtxToOption(value: number, maxCtx?: number): number {
 /**
  * User-configured **maximum** context for this model on this node.
  * Requests use a smaller dynamic num_ctx capped by this value.
+ *
+ * Frontier nodes default to {@link DEFAULT_FRONTIER_NUM_CTX} (256k) when no pref
+ * is set — never the local agent 16k fallback — so Gemini / Grok / GPT are not
+ * compacted or Model-Fit-tightened as if they were small Ollama models.
  */
 export function resolveModelNumCtx(
-  node: Pick<EndpointNode, 'modelPrefs'> | undefined,
+  node: Pick<EndpointNode, 'modelPrefs' | 'type' | 'apiKey'> | undefined,
   model: string,
   fallback: number = DEFAULT_MODEL_NUM_CTX
 ): number {
   const pref = node?.modelPrefs?.[model]?.numCtx;
   if (typeof pref === 'number' && pref > 0) return Math.floor(pref);
+
+  if (isFrontierEndpoint(node) || isWideFrontierModel(model)) {
+    return DEFAULT_FRONTIER_NUM_CTX;
+  }
+
   return fallback > 0 ? Math.floor(fallback) : DEFAULT_MODEL_NUM_CTX;
 }
 

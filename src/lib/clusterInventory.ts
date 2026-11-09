@@ -1,5 +1,10 @@
 import type { EndpointNode, NodeRole } from '../types';
-import { resolveModelMaxNumCtx } from './contextSize';
+import {
+  DEFAULT_FRONTIER_NUM_CTX,
+  isFrontierEndpoint,
+  isWideFrontierModel,
+  resolveModelMaxNumCtx
+} from './contextSize';
 
 export type ModelFitTier = 'tight' | 'standard' | 'wide';
 export type ModelFitRole = NodeRole | 'coder' | 'reviewer' | 'planner' | 'docs' | 'worker';
@@ -22,6 +27,11 @@ function looksSmallModel(modelName?: string): boolean {
 
 /** Classify how dense / checklist-style the worker packet should be. */
 export function modelFitTier(model: string, maxCtx: number): ModelFitTier {
+  // Cloud Gemini / GPT / Claude / Grok: never "tight" — they manage long context themselves.
+  if (isWideFrontierModel(model)) {
+    const ctx = Math.floor(maxCtx || DEFAULT_FRONTIER_NUM_CTX);
+    return ctx >= WIDE_CTX ? 'wide' : 'standard';
+  }
   const small = looksSmallModel(model);
   const ctx = Math.floor(maxCtx || 0);
   if (small || (ctx > 0 && ctx <= TIGHT_CTX)) return 'tight';
@@ -179,7 +189,12 @@ export function resolveModelFit(
   caps: ReturnType<typeof fileContextCapsForTier>;
   packingLine: string | null;
 } {
-  const maxCtx = resolveModelMaxNumCtx(node, model, fallbackNumCtx);
+  const frontier = isFrontierEndpoint(node) || isWideFrontierModel(model);
+  const maxCtx = resolveModelMaxNumCtx(
+    node,
+    model,
+    frontier ? DEFAULT_FRONTIER_NUM_CTX : fallbackNumCtx
+  );
   const tier = modelFitTier(model, maxCtx);
   return {
     maxCtx,

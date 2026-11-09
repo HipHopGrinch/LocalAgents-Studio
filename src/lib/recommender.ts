@@ -119,6 +119,21 @@ export function parseParams(text: string | undefined): number | undefined {
   return m[2] === 'm' ? parseFloat(m[1]) / 1000 : parseFloat(m[1]);
 }
 
+/**
+ * Parameters the model actually runs.
+ * Ollama `details.parameter_size` wins, then catalog active params (`e4b` → 4), then the tag.
+ */
+export function installedModelSizeB(modelName: string, parameterSize?: string): number {
+  const fromDetails = parseParams(parameterSize);
+  if (typeof fromDetails === 'number' && fromDetails > 0) return fromDetails;
+  const row = MODEL_CATALOG.find(m => normTag(m.tag) === normTag(modelName));
+  if (row) {
+    if (typeof row.activeB === 'number' && row.activeB > 0) return row.activeB;
+    if (typeof row.paramsB === 'number' && row.paramsB > 0) return row.paramsB;
+  }
+  return parseParams(modelName) ?? 0;
+}
+
 export function formatGB(gb: number): string {
   return gb >= 10 ? `${gb.toFixed(0)} GB` : `${gb.toFixed(1)} GB`;
 }

@@ -299,14 +299,19 @@ ipcMain.handle('session:get', () => ({ ...liveSession }));
 
 ipcMain.handle('session:publish', (_e, snapshot = {}) => {
   try {
-    // Remotes may omit nodes (desktop owns cluster status); never wipe with a non-array.
-    const nodes = Array.isArray(snapshot.nodes) ? snapshot.nodes : liveSession.nodes;
+    // Remotes may omit nodes (desktop owns cluster status). A web payload that still
+    // includes an older node list must not re-enable models the desktop just disabled.
+    const fromWeb = snapshot.source === 'web';
+    const nodes = fromWeb
+      ? liveSession.nodes
+      : Array.isArray(snapshot.nodes)
+        ? snapshot.nodes
+        : liveSession.nodes;
     const incomingRev =
       typeof snapshot.chatsRevision === 'number' ? snapshot.chatsRevision : liveSession.chatsRevision || 0;
     // Monotonic — a stale client must not roll chatsRevision backwards.
     const chatsRevision = Math.max(incomingRev, liveSession.chatsRevision || 0);
     // Desktop owns token totals. Web publishes omit them; a zero snapshot must not wipe the mirror.
-    const fromWeb = snapshot.source === 'web';
     const incomingLocal = finiteTokenCount(snapshot.localTokensGenerated);
     const incomingFrontier = finiteTokenCount(snapshot.frontierTokensUsed);
     const prevLocal = finiteTokenCount(liveSession.localTokensGenerated);

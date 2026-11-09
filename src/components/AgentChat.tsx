@@ -42,6 +42,8 @@ import {
   buildDevHostPromptSection,
   getEnabledModelsForNode,
   getPreferredModelForNode,
+  pickBestModelForComplexity,
+  rankModelsForWeight,
   selectBestEndpointForTask,
   findFastestConductor,
   isFrontierNode,
@@ -269,6 +271,7 @@ import {
   filterInspectionContinue,
   MAX_AUTO_CONTINUATIONS,
   parseNextStep,
+  liveRoutePin,
   pickCapableReviewTarget,
   pickFinalSourceReviewTarget,
   pickLargestLocalTarget,
@@ -403,6 +406,14 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const [targetNodeId, setTargetNodeId] = useState<string>(currentAgent.endpointId);
   const [targetModel, setTargetModel] = useState<string>(currentAgent.model);
   const [autoSelectEndpoint, setAutoSelectEndpoint] = useState<boolean>(autoNodeEnabled);
+  const nodesRef = useRef(nodes);
+  nodesRef.current = nodes;
+  const targetNodeIdRef = useRef(targetNodeId);
+  targetNodeIdRef.current = targetNodeId;
+  const targetModelRef = useRef(targetModel);
+  targetModelRef.current = targetModel;
+  const autoSelectRef = useRef(autoSelectEndpoint);
+  autoSelectRef.current = autoSelectEndpoint;
   const [includeActiveFile, setIncludeActiveFile] = useState(true);
   const [isPipelineMode, setIsPipelineMode] = useState(swarmEnabled);
   const [autoApplyWrites, setAutoApplyWrites] = useState<boolean>(autoApplyEnabled);
@@ -972,6 +983,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     getRepoMap: () => repoMapRef.current,
     mcpServersJson
   };
+  const toolDepsRef = useRef(toolDeps);
+  toolDepsRef.current = toolDeps;
 
   const inlineEditHandlerRef = useRef<(detail: { path?: string; selection?: string; instruction?: string }) => void>(
     () => {}
@@ -1053,13 +1066,13 @@ ${instruction}`,
     setAutoReview(autoReviewEnabled);
   }, [autoReviewEnabled]);
 
-  // Sync the pinned endpoint when the persona changes. Do not stamp the persona's
-  // default model onto a node where that model is disabled or not installed.
+  // Sync the pinned endpoint when the persona changes. Node polls must not snap
+  // the dropdown back onto a model the user just disabled.
   useEffect(() => {
-    if (currentAgent.endpointId && nodes.some(n => n.id === currentAgent.endpointId)) {
-      setTargetNodeId(currentAgent.endpointId);
-    }
-  }, [currentAgent.id, currentAgent.endpointId, nodes]);
+    const id = currentAgent.endpointId;
+    if (!id) return;
+    if (nodesRef.current.some(n => n.id === id)) setTargetNodeId(id);
+  }, [currentAgent.id, currentAgent.endpointId]);
 
   // Selected node with fallback to online node if offline (undefined when cluster is empty)
   const requestedNode = nodes.find(n => n.id === targetNodeId) || nodes[0];
@@ -1084,15 +1097,34 @@ ${instruction}`,
         ? ['grok-2-1212', 'grok-beta', 'gpt-4o', 'claude-3-5-sonnet']
         : [];
 
+  // Drop a disabled model or an offline node on the next render. A newly enabled
+  // larger model becomes the target when the previous one is no longer usable.
   useEffect(() => {
-    if (effectiveModels.length === 0) return;
-    const preferred = getPreferredModelForNode(selectedNode, targetModel);
-    if (!effectiveModels.includes(targetModel)) {
-      setTargetModel(preferred);
-    } else if (selectedNode?.activeModel && effectiveModels.includes(selectedNode.activeModel) && targetModel !== selectedNode.activeModel) {
-      setTargetModel(selectedNode.activeModel);
+    const live = nodes;
+    const current = live.find(n => n.id === targetNodeId);
+    const enabledHere = getEnabledModelsForNode(current);
+    const usable = !!current?.online && enabledHere.length > 0;
+    if (!usable) {
+      const locals = live.filter(
+        n => n.online && !isFrontierNode(n) && getEnabledModelsForNode(n).length > 0
+      );
+      const next =
+        rankModelsForWeight(locals, 'heavy') ||
+        rankModelsForWeight(
+          live.filter(n => n.online && getEnabledModelsForNode(n).length > 0),
+          'heavy'
+        );
+      if (next && (next.node.id !== targetNodeId || next.model !== targetModel)) {
+        setTargetNodeId(next.node.id);
+        setTargetModel(next.model);
+      }
+      return;
     }
-  }, [selectedNode?.id, selectedNode?.activeModel, effectiveModels.join(',')]);
+    if (!enabledHere.includes(targetModel)) {
+      const nextModel = pickBestModelForComplexity(current, 'heavy') || enabledHere[0];
+      if (nextModel && nextModel !== targetModel) setTargetModel(nextModel);
+    }
+  }, [nodes, targetNodeId, targetModel]);
 
   useEffect(() => {
     messagesRef.current = messages;
@@ -1106,7 +1138,9 @@ ${instruction}`,
   // request use a model that is actually enabled on the selected node.
   const activeTargetModel = effectiveModels.includes(targetModel)
     ? targetModel
-    : (getPreferredModelForNode(selectedNode, currentAgent.model) || effectiveModels[0] || '');
+    : (selectedNode
+        ? pickBestModelForComplexity(selectedNode, 'heavy') || effectiveModels[0]
+        : effectiveModels[0]) || '';
   const activeTargetMaxCtx = activeTargetModel
     ? resolveModelNumCtx(selectedNode, activeTargetModel, currentAgent.numCtx)
     : 0;
@@ -1319,7 +1353,7 @@ ${instruction}`,
 
   /** One short frontier reply when the local window cannot hold the job. Null when no free-tier quota is left. */
   const requestFreeTierBrief = async (purpose: string, payload: string): Promise<string | null> => {
-    const assist = pickFreeTierAssist(nodes, freeTierUsageFor);
+    const assist = pickFreeTierAssist(nodesRef.current, freeTierUsageFor);
     if (!assist) return null;
     return requestAssistBrief(assist, purpose, payload, true);
   };
@@ -1410,7 +1444,7 @@ ${instruction}`,
   // UNIFIED TOOL EXECUTION & AGENTIC LOOP
   // ==========================================
   const runSingleTool = async (tool: ToolCall): Promise<ToolCall> => {
-    const updated = await executeTool(tool, toolDeps);
+    const updated = await executeTool(tool, toolDepsRef.current);
     updateProgress(log => noteSavedFiles(log, [updated]));
     let hostMsg: ChatMessage | undefined;
     setMessages(prev =>
@@ -1592,7 +1626,7 @@ ${instruction}`,
             : approvedPlanRef.current,
         progressLog: progressForPrompt(),
         projectContext: projectContextForPrompt(),
-        nodes,
+        nodes: nodesRef.current,
         inferenceNodeId: routeNode.id,
         inferenceModel: routeModel
       });
@@ -1717,13 +1751,13 @@ ${instruction}`,
           ['read_file', 'list_dir', 'search', 'read_terminal'].includes(t.name)
         );
       }
-      const readPass = await runReadOnlyTools(tools, toolDeps);
+      const readPass = await runReadOnlyTools(tools, toolDepsRef.current);
       tools = readPass.tools;
 
       if (!readOnlyContinue && autoApplyWritesRef.current) {
-        tools = await autoApplyWritableTools(tools, toolDeps);
-        tools = await runAuxTools(tools, toolDeps);
-        const cmdPass = await runCommandTools(tools, toolDeps);
+        tools = await autoApplyWritableTools(tools, toolDepsRef.current);
+        tools = await runAuxTools(tools, toolDepsRef.current);
+        const cmdPass = await runCommandTools(tools, toolDepsRef.current);
         tools = cmdPass.tools;
         updateProgress(log => noteSavedFiles(log, tools));
       }
@@ -1817,7 +1851,7 @@ ${instruction}`,
     };
 
     const agentMsgId = `pipeline-${Date.now()}`;
-    const architect = findLeadArchitect(nodes);
+    let architect = findLeadArchitect(nodesRef.current);
 
     const patchPipelineMsg = (
       patch: Partial<ChatMessage> | ((m: ChatMessage) => ChatMessage)
@@ -1886,9 +1920,39 @@ ${instruction}`,
       expectedFilePath: string;
       stepLabel?: string;
       retriedFrom?: string;
+      retargeted?: boolean;
     }) => {
       const { idx, assignment, userPrompt, expectedFilePath } = opts;
-      const { node, model, skippedReason } = assignment;
+      let { node, model, skippedReason } = assignment;
+      if (!opts.retargeted) {
+        const liveNode = nodesRef.current.find(n => n.id === node.id);
+        const stillLive = !!liveNode?.online && getEnabledModelsForNode(liveNode).includes(model);
+        if (!stillLive) {
+          const next = assignSwarmTasksToCluster([assignment.task], nodesRef.current)[0];
+          const nextOk =
+            !!next &&
+            next.node.online &&
+            getEnabledModelsForNode(next.node).includes(next.model);
+          if (nextOk && (next.node.id !== node.id || next.model !== model)) {
+            await runWorkerTurn({ ...opts, assignment: next, retargeted: true });
+            return;
+          }
+          patchPipelineMsg(m => {
+            if (!m.pipelineSteps) return m;
+            const updatedSteps = [...m.pipelineSteps];
+            if (updatedSteps[idx]) {
+              updatedSteps[idx] = {
+                ...updatedSteps[idx],
+                status: 'failed',
+                content: `Skipped: ${node.name} is offline or ${model} is disabled`
+              };
+            }
+            return { ...m, pipelineSteps: updatedSteps };
+          });
+          return;
+        }
+        node = liveNode!;
+      }
       if (skippedReason && !node.online) {
         patchPipelineMsg(m => {
           if (!m.pipelineSteps) return m;
@@ -1915,7 +1979,7 @@ ${instruction}`,
         stepVerdictMode: false,
         progressLog: progressForPrompt(),
         projectContext: projectContextForPrompt(rulesCapFor(workerFit.tier)),
-        nodes,
+        nodes: nodesRef.current,
         inferenceNodeId: node.id,
         inferenceModel: model
       });
@@ -2032,16 +2096,16 @@ ${instruction}`,
           return t;
         });
 
-        const readPass = await runReadOnlyTools(tools, toolDeps);
+        const readPass = await runReadOnlyTools(tools, toolDepsRef.current);
         tools = readPass.tools;
 
         // Node results are the files. Always save them, including when this turn
         // started under the planner (Auto-apply still off in that closure).
-        tools = await autoApplyWritableTools(tools, toolDeps);
+        tools = await autoApplyWritableTools(tools, toolDepsRef.current);
         updateProgress(log => noteSavedFiles(log, tools));
         if (autoApplyWritesRef.current) {
-          tools = await runAuxTools(tools, toolDeps);
-          const cmdPass = await runCommandTools(tools, toolDeps);
+          tools = await runAuxTools(tools, toolDepsRef.current);
+          const cmdPass = await runCommandTools(tools, toolDepsRef.current);
           tools = cmdPass.tools;
         }
 
@@ -2132,20 +2196,22 @@ ${instruction}`,
         const networkish =
           /timeout|abort|network|fetch|ECONN|ENOTFOUND|ECONNRESET|CUDA|out of memory|oom/i.test(errText);
         const fallback = networkish && !opts.retriedFrom
-          ? nodes.find(
-              n =>
-                n.id !== node.id &&
-                n.online &&
-                !isFrontierNode(n) &&
-                getEnabledModelsForNode(n).length > 0
+          ? rankModelsForWeight(
+              nodesRef.current.filter(
+                n =>
+                  n.id !== node.id &&
+                  n.online &&
+                  !isFrontierNode(n) &&
+                  getEnabledModelsForNode(n).length > 0
+              ),
+              'heavy'
             )
           : undefined;
         if (fallback) {
-          const fallbackModel =
-            getPreferredModelForNode(fallback) || getEnabledModelsForNode(fallback)[0];
+          const fallbackModel = fallback.model;
           window.electronAPI?.writeLog?.(
             'warn',
-            `swarm: ${node.name} failed (${errText.slice(0, 120)}); rerouting ${expectedFilePath} to ${fallback.name}`
+            `swarm: ${node.name} failed (${errText.slice(0, 120)}); rerouting ${expectedFilePath} to ${fallback.node.name}`
           );
           patchPipelineMsg(m => {
             if (!m.pipelineSteps) return m;
@@ -2153,8 +2219,8 @@ ${instruction}`,
             if (updatedSteps[idx]) {
               updatedSteps[idx] = {
                 ...updatedSteps[idx],
-                nodeId: fallback.id,
-                nodeName: fallback.name,
+                nodeId: fallback.node.id,
+                nodeName: fallback.node.name,
                 modelName: fallbackModel,
                 status: 'running',
                 content: `Rerouted from ${node.name}: ${errText.slice(0, 160)}`
@@ -2164,7 +2230,7 @@ ${instruction}`,
           });
           await runWorkerTurn({
             ...opts,
-            assignment: { ...assignment, node: fallback, model: fallbackModel },
+            assignment: { ...assignment, node: fallback.node, model: fallbackModel },
             retriedFrom: node.id
           });
           return;
@@ -2189,8 +2255,8 @@ ${instruction}`,
       role: 'assistant',
       raw: '',
       display: architect
-        ? `⚡ Pass 1 — Lead Architect (${architect.node.name} • ${architect.model} @ ~${architect.tokPerSec} tok/s${
-            architect.usedFrontierBackup ? ' · frontier backup' : ' · local'
+        ? `⚡ Pass 1 — Lead Architect (${architect.node.name} • ${architect.model}, largest model for this contract${
+            architect.usedFrontierBackup ? ' · frontier backup' : ''
           }) is locking the shared TypeScript contract...`
         : '⚠️ No endpoints configured. Open Hardware Settings and add an Ollama node first.',
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
@@ -2257,6 +2323,14 @@ ${instruction}`,
       }
 
       // ── Pass 1: Generate Shared Contract & Manifest ──
+      architect = findLeadArchitect(nodesRef.current);
+      if (!architect?.node?.online || !getEnabledModelsForNode(architect.node).includes(architect.model)) {
+        patchPipelineMsg({
+          display:
+            '⚠️ No online cluster nodes with enabled models. Open Hardware Settings, enable models on a local Ollama node (frontier APIs are backup only).'
+        });
+        return;
+      }
       beginActivity('pass1', 'Pass 1 — Lead Architect', architect.node.name);
       const swarmTaskText = lockedPlan
         ? `${userText}\n\n${formatApprovedPlanForSwarm(lockedPlan)}`
@@ -2264,7 +2338,7 @@ ${instruction}`,
       let manifest: SwarmManifest = fallbackSwarmManifest(swarmTaskText);
       try {
         const snippets = await loadExistingSnippets();
-        const swarmDevHost = buildDevHostPromptSection(nodes, architect.node.id);
+        const swarmDevHost = buildDevHostPromptSection(nodesRef.current, architect.node.id);
         const lockedContractRel = projectBrainRef.current.contractFile;
         const existingContractBody = lockedContractRel
           ? await readWorkspaceRel(lockedContractRel)
@@ -2507,7 +2581,7 @@ ${instruction}`,
       const assignments: SwarmAssignment[] = [];
       const assignmentWaveIndex: number[] = [];
       taskWaves.forEach((wave, wi) => {
-        const waveAssign = assignSwarmTasksToCluster(wave, nodes);
+        const waveAssign = assignSwarmTasksToCluster(wave, nodesRef.current);
         for (const a of waveAssign) {
           assignments.push(a);
           assignmentWaveIndex.push(wi);
@@ -2671,7 +2745,7 @@ ${instruction}`,
                 currentFileContent: current,
                 userPrompt: workerOverall,
                 stack: manifest.stack,
-                devHostSection: buildDevHostPromptSection(nodes, assignment.node.id)
+                devHostSection: buildDevHostPromptSection(nodesRef.current, assignment.node.id)
               })}${workerLog ? `\n\nWork log (do not redo Done steps or re-ask Already asked):\n${workerLog}` : ''}`;
               await runWorkerTurn({
                 idx: stepIdx,
@@ -2786,7 +2860,7 @@ ${instruction}`,
                     contractCode: manifest.contractCode,
                     currentFileContent: current,
                     tscErrors: errors,
-                    devHostSection: buildDevHostPromptSection(nodes, assignment.node.id)
+                    devHostSection: buildDevHostPromptSection(nodesRef.current, assignment.node.id)
                   });
                   await runWorkerTurn({
                     idx,
@@ -2838,14 +2912,17 @@ ${instruction}`,
   // ==========================================
 
   const resolveRoute = (userText: string, agent: AgentPersona) => {
+    const live = nodesRef.current;
     const fitRole =
       agent.handle === 'planner' || agent.id === 'planner'
         ? 'planner'
         : agent.handle === 'reviewer' || agent.id === 'reviewer'
           ? 'reviewer'
-          : null;
-    if (autoSelectEndpoint && fitRole) {
-      const picked = pickCapableReviewTarget(nodes, fitRole);
+          : agent.handle === 'docs' || agent.id === 'docs'
+            ? 'docs'
+            : null;
+    if (autoSelectRef.current && (fitRole === 'planner' || fitRole === 'reviewer')) {
+      const picked = pickCapableReviewTarget(live, fitRole);
       if (picked) {
         return {
           routedNode: picked.node,
@@ -2854,14 +2931,37 @@ ${instruction}`,
         };
       }
     }
-    const routedNode = autoSelectEndpoint
-      ? selectBestEndpointForTask(userText, agent.handle, nodes)
-      : selectedNode;
+    const requested = live.find(n => n.id === targetNodeIdRef.current);
+    const requestedOk = !!requested?.online && getEnabledModelsForNode(requested).length > 0;
+    let routedNode = autoSelectRef.current
+      ? selectBestEndpointForTask(userText, agent.handle, live)
+      : requestedOk
+        ? requested
+        : undefined;
+    if (!routedNode || !routedNode.online || getEnabledModelsForNode(routedNode).length === 0) {
+      const locals = live.filter(
+        n => n.online && !isFrontierNode(n) && getEnabledModelsForNode(n).length > 0
+      );
+      routedNode =
+        rankModelsForWeight(locals, fitRole === 'docs' ? 'medium' : 'heavy')?.node ||
+        live.find(n => n.online && getEnabledModelsForNode(n).length > 0);
+    }
     if (!routedNode) return null;
-    const routedModel = autoSelectEndpoint
-      ? getPreferredModelForNode(routedNode, activeTargetModel) || activeTargetModel
-      : activeTargetModel;
-    return { routedNode, routedModel, routedIsFrontier: routedNode.type === 'openai' || !!routedNode.apiKey };
+    const enabled = getEnabledModelsForNode(routedNode);
+    if (!enabled.length) return null;
+    const weight = fitRole === 'docs' ? 'medium' : 'heavy';
+    const manual = targetModelRef.current;
+    const routedModel = autoSelectRef.current
+      ? pickBestModelForComplexity(routedNode, weight) || enabled[0]
+      : enabled.includes(manual)
+        ? manual
+        : pickBestModelForComplexity(routedNode, weight) || enabled[0];
+    if (!routedModel || !enabled.includes(routedModel)) return null;
+    return {
+      routedNode,
+      routedModel,
+      routedIsFrontier: routedNode.type === 'openai' || !!routedNode.apiKey
+    };
   };
 
   /** Single-node chat turn with optional plan/review/contract mode or locked approved plan. */
@@ -2913,11 +3013,20 @@ ${instruction}`,
     const readOnlyMode = !!planMode || !!reviewMode || !!lockPlanMode || !!stepVerdictMode;
     const useFreshContext = !!(freshContext || ephemeralWorkerRef.current);
 
-    const route = pinRoute
+    const pinRole =
+      agent.handle === 'planner' || agent.id === 'planner'
+        ? 'planner'
+        : agent.handle === 'reviewer' || agent.id === 'reviewer'
+          ? 'reviewer'
+          : agent.handle === 'docs' || agent.id === 'docs'
+            ? 'docs'
+            : 'coder';
+    const livePin = pinRoute ? liveRoutePin(nodesRef.current, pinRoute, pinRole) : undefined;
+    const route = livePin
       ? {
-          routedNode: pinRoute.node,
-          routedModel: pinRoute.model,
-          routedIsFrontier: pinRoute.node.type === 'openai' || !!pinRoute.node.apiKey
+          routedNode: livePin.node,
+          routedModel: livePin.model,
+          routedIsFrontier: livePin.node.type === 'openai' || !!livePin.node.apiKey
         }
       : resolveRoute(userText, agent);
     if (!route) {
@@ -3021,7 +3130,7 @@ ${instruction}`,
         approvedPlan: readOnlyMode || contractMode || lockPlanMode ? null : approvedPlan,
         progressLog: progressForPrompt(),
         projectContext: projectContextForPrompt(rulesCapFor(turnFit.tier)),
-        nodes,
+        nodes: nodesRef.current,
         inferenceNodeId: routedNode.id,
         inferenceModel: routedModel
       });
@@ -3195,13 +3304,13 @@ ${instruction}`,
         );
       }
 
-      const readPass = await runReadOnlyTools(tools, toolDeps);
+      const readPass = await runReadOnlyTools(tools, toolDepsRef.current);
       tools = readPass.tools;
 
       if (!readOnlyMode && autoApplyWritesRef.current) {
-        tools = await autoApplyWritableTools(tools, toolDeps);
-        tools = await runAuxTools(tools, toolDeps);
-        const cmdPass = await runCommandTools(tools, toolDeps);
+        tools = await autoApplyWritableTools(tools, toolDepsRef.current);
+        tools = await runAuxTools(tools, toolDepsRef.current);
+        const cmdPass = await runCommandTools(tools, toolDepsRef.current);
         tools = cmdPass.tools;
         updateProgress(log => noteSavedFiles(log, tools));
       }
@@ -3596,7 +3705,7 @@ ${instruction}`,
     }
 
     const recent = messagesRef.current;
-    const target = pickCapableReviewTarget(nodes);
+    const target = pickCapableReviewTarget(nodesRef.current);
     if (!target) return;
     const { node, model } = target;
     const touchedPaths = collectWrittenPaths(recent);
@@ -3710,7 +3819,7 @@ ${instruction}`,
         ['read_file', 'list_dir', 'search'].includes(t.name)
       );
       if (firstReads.length && !stopRequestedRef.current) {
-        const ran = await runReadOnlyTools(firstReads, toolDeps);
+        const ran = await runReadOnlyTools(firstReads, toolDepsRef.current);
         readTools = ran.tools;
         setMessages(prev =>
           prev.map(m => (m.id === agentMsgId ? { ...m, toolCalls: ran.tools } : m))
@@ -3772,7 +3881,7 @@ ${instruction}`,
         stuckRef.current = { key, stage };
         const stuckPayload = `${progressForPrompt()}\n\nStuck step:\n${loopTask}`;
         if (step === 'big') {
-          const big = pickLargestLocalTarget(nodes);
+          const big = pickLargestLocalTarget(nodesRef.current);
           if (big) {
             stuckRef.current.stage = 'big';
             handoff = true;
@@ -3798,7 +3907,7 @@ ${instruction}`,
             window.electronAPI?.writeLog?.('warn', `free-tier stuck: ${err?.message || err}`);
           }
           if (brief) {
-            const big = pickLargestLocalTarget(nodes);
+            const big = pickLargestLocalTarget(nodesRef.current);
             display = `Free-tier solution:\n\n${brief}`;
             options = [{ id: 'copy-solution', title: 'Copy solution', description: brief, action: 'copy' }];
             if (big) {
@@ -3814,8 +3923,8 @@ ${instruction}`,
         }
         if (step === 'paid') {
           stuckRef.current.stage = 'paid';
-          const paid = pickPaidFrontier(nodes);
-          const big = pickLargestLocalTarget(nodes);
+          const paid = pickPaidFrontier(nodesRef.current);
+          const big = pickLargestLocalTarget(nodesRef.current);
           handoff = false;
           runTask = '';
           nextTask = '';
@@ -4025,7 +4134,7 @@ ${instruction}`,
       );
     if (depth === 0 && !didWork) return;
 
-    const target = pickCapableReviewTarget(nodes);
+    const target = pickCapableReviewTarget(nodesRef.current);
     if (!target) {
       if (autoReviewRef.current) await decideNextStepAndAdvance(depth, previousTask);
       return;
@@ -4430,7 +4539,7 @@ ${progressForPrompt() || '(empty)'}`;
     }
     setPlanResumePhase('review');
 
-    const target = pickCapableReviewTarget(nodes);
+    const target = pickCapableReviewTarget(nodesRef.current);
     if (!target) {
       setExecutingPlanNotice('No reviewer-capable node online for step verdict.');
       return;
@@ -5092,7 +5201,7 @@ ${progressForPrompt() || '(empty)'}`;
         window.electronAPI?.writeLog?.('warn', `heal frontier: ${err?.message || err}`);
       }
 
-      const big = pickLargestLocalTarget(nodes);
+      const big = pickLargestLocalTarget(nodesRef.current);
       if (brief && big) {
         await runHealCoder(
           `### Frontier heal brief\nApply this solution. Do not repeat the failed approach.\n\n${brief}`,
@@ -5188,7 +5297,7 @@ ${progressForPrompt() || '(empty)'}`;
     finalReviewPlanIdRef.current = plan.id;
     if (stopRequestedRef.current) return skipped;
 
-    const target = pickFinalSourceReviewTarget(nodes);
+    const target = pickFinalSourceReviewTarget(nodesRef.current);
     if (!target || !workspacePath) {
       const notes = 'All plan steps complete — no model online for the final source review.';
       restorePlannerControl(notes);
@@ -5626,7 +5735,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
   const retryStuckLocally = async (task: string) => {
     const cleaned = stripKeepFixingPrefix(task).trim();
     if (!cleaned) return;
-    const big = pickLargestLocalTarget(nodes);
+    const big = pickLargestLocalTarget(nodesRef.current);
     if (!big) {
       setExecutingPlanNotice('No local model online to retry.');
       return;
@@ -5649,7 +5758,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
   };
 
   const confirmPaidAssist = async (task: string) => {
-    const paid = pickPaidFrontier(nodes);
+    const paid = pickPaidFrontier(nodesRef.current);
     if (!paid || !task.trim()) return;
     setIsStreaming(true);
     setExecutingPlanNotice(`Asking ${paid.node.name} · ${paid.model}…`);
@@ -5687,7 +5796,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         planOptions: [{ id: 'copy-paid', title: 'Copy solution', description: brief, action: 'copy' }]
       }
     ]);
-    const big = pickLargestLocalTarget(nodes);
+    const big = pickLargestLocalTarget(nodesRef.current);
     if (!big) {
       setIsStreaming(false);
       setExecutingPlanNotice('Paid solution is in the chat. No local model is online to apply it.');
@@ -6045,9 +6154,9 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       setIsStreaming(true);
       let tools = lastCoderMsg.toolCalls || [];
       if (autoApplyWritesRef.current) {
-        tools = await autoApplyWritableTools(tools, toolDeps);
-        tools = await runAuxTools(tools, toolDeps);
-        const cmdPass = await runCommandTools(tools, toolDeps);
+        tools = await autoApplyWritableTools(tools, toolDepsRef.current);
+        tools = await runAuxTools(tools, toolDepsRef.current);
+        const cmdPass = await runCommandTools(tools, toolDepsRef.current);
         tools = cmdPass.tools;
         updateProgress(log => noteSavedFiles(log, tools));
       }
@@ -6138,7 +6247,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         updated.push(tool);
         continue;
       }
-      updated.push(await executeTool(tool, toolDeps));
+      updated.push(await executeTool(tool, toolDepsRef.current));
     }
 
     updateProgress(log => noteSavedFiles(log, updated));
@@ -6151,7 +6260,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
     }
   };
 
-  const conductorInfo = findLeadArchitect(nodes) || findFastestConductor(nodes);
+  const conductorInfo = findLeadArchitect(nodesRef.current) || findFastestConductor(nodesRef.current);
   const latestAssistant = [...messages].reverse().find(m => m.role === 'assistant');
   const peerStreaming = !!(peerConductor?.isStreaming && !isStreaming);
   const localActivityLabel = activityLabelOf(activityStack);
@@ -6382,7 +6491,11 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                   setTargetNodeId(newNodeId);
                   setAutoSelectEndpoint(false);
                   const nextNode = nodes.find(n => n.id === newNodeId);
-                  if (nextNode) setTargetModel(getPreferredModelForNode(nextNode));
+                  if (nextNode) {
+                    setTargetModel(
+                      pickBestModelForComplexity(nextNode, 'heavy') || getPreferredModelForNode(nextNode)
+                    );
+                  }
                 }}
                 disabled={nodes.length === 0}
                 className="bg-[#1c1c24] border border-[#2a2a36] text-zinc-200 rounded px-2 py-1 outline-none text-[11px] truncate disabled:opacity-50"
@@ -6714,7 +6827,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                 <span>
                   <b>Lead Architect:</b>{' '}
                   {conductorInfo
-                    ? <>{conductorInfo.node.name} (<code className="text-emerald-300">{conductorInfo.model}</code> @ ~{conductorInfo.tokPerSec} tok/s{conductorInfo.usedFrontierBackup ? ' · frontier backup' : ' · local-first'}) locks the shared contract, then workers fan out by live tok/s</>
+                    ? <>{conductorInfo.node.name} (<code className="text-emerald-300">{conductorInfo.model}</code>{conductorInfo.usedFrontierBackup ? ' · frontier backup' : ''}) takes the complex work on the largest enabled model; light files can use a smaller one</>
                     : <span className="text-zinc-500">unavailable until a node is online</span>}
                 </span>
               </div>

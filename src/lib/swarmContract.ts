@@ -8,11 +8,11 @@ import {
 } from './deliveryIntent';
 import {
   getEnabledModelsForNode,
-  getPreferredModelForNode,
   isFrontierNode,
   nodeAllowsRole,
   nodeHasExplicitRole,
   pickBestModelForComplexity,
+  rankModelsForWeight,
   type ConductorFileJob
 } from './tools';
 import type { NodeRole } from '../types';
@@ -1045,15 +1045,6 @@ function preferredToNodeRole(preferred: SwarmPreferredRole): NodeRole {
   return 'coder';
 }
 
-function roleMatches(n: EndpointNode, preferred: SwarmPreferredRole): boolean {
-  // Explicit allow-list only (Auto does not get a role bonus).
-  // @coder must NOT treat Planner-only nodes as coders (that stole jobs from Ubuntu/Laptop).
-  if (preferred === '@coder') return nodeHasExplicitRole(n, 'coder');
-  if (preferred === '@docs') return nodeHasExplicitRole(n, 'docs');
-  if (preferred === '@reviewer') return nodeHasExplicitRole(n, 'reviewer');
-  return false;
-}
-
 /** Hard eligibility: Auto or allow-list includes the swarm preferred role. */
 function nodeAllowsPreferred(n: EndpointNode, preferred: SwarmPreferredRole): boolean {
   // Planner/Reviewer/Docs-only nodes must not receive @coder file jobs.
@@ -1081,8 +1072,10 @@ export function findLeadArchitect(
 }
 
 /**
- * Assign Pass-2 tasks across online GPUs using live tok/s + complexity + role bonus.
- * Local-first: frontier only when no local workers exist.
+ * Assign Pass-2 tasks across online GPUs.
+ * High and medium files use the largest enabled local model allowed for the role.
+ * Low / one-file tasks may use a smaller faster model. Speed only breaks equal-size ties.
+ * Frontier is the pool only when no local worker is online.
  */
 export function assignSwarmTasksToCluster(
   tasks: SwarmTask[],
@@ -1114,8 +1107,6 @@ export function assignSwarmTasksToCluster(
     });
   }
 
-  const nodeLoad = new Map<string, number>(activeNodes.map(n => [n.id, 0]));
-
   return sortedTasks.map(task => {
     const eligible = activeNodes.filter(n => nodeAllowsPreferred(n, task.preferredRole));
     // Never fall back to Planner/Reviewer-only GPUs for @coder work.
@@ -1123,42 +1114,19 @@ export function assignSwarmTasksToCluster(
       eligible.length > 0
         ? eligible
         : activeNodes.filter(n => nodeAllowsRole(n, preferredToNodeRole(task.preferredRole)));
+    const weight = toConductorComplexity(task.complexity);
     if (!candidates.length) {
       return {
         task,
         node: activeNodes[0],
-        model: pickBestModelForComplexity(
-          activeNodes[0],
-          toConductorComplexity(task.complexity)
-        ),
+        model: pickBestModelForComplexity(activeNodes[0], weight),
         usedFrontierBackup,
         skippedReason: `No node allows role ${task.preferredRole} — check Allowed Roles`
       };
     }
-    let bestNode = candidates[0];
-    let bestScore = Infinity;
-
-    for (const node of candidates) {
-      const model = pickBestModelForComplexity(node, toConductorComplexity(task.complexity));
-      const speed = nodeTokPerSec(node, model);
-      const currentLoad = nodeLoad.get(node.id) ?? 0;
-      const estimatedTokens = COMPLEXITY_WEIGHT[task.complexity] * 400;
-      const roleBonus = roleMatches(node, task.preferredRole) ? 0.75 : 1.0;
-      const estimatedTimeCost = ((currentLoad + estimatedTokens) / speed) * roleBonus;
-      if (estimatedTimeCost < bestScore) {
-        bestScore = estimatedTimeCost;
-        bestNode = node;
-      }
-    }
-
-    const model = pickBestModelForComplexity(
-      bestNode,
-      toConductorComplexity(task.complexity)
-    );
-    nodeLoad.set(
-      bestNode.id,
-      (nodeLoad.get(bestNode.id) ?? 0) + COMPLEXITY_WEIGHT[task.complexity] * 400
-    );
+    const picked = rankModelsForWeight(candidates, weight);
+    const bestNode = picked?.node || candidates[0];
+    const model = picked?.model || pickBestModelForComplexity(bestNode, weight);
 
     return {
       task,

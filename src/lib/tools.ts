@@ -9,6 +9,7 @@ import {
 } from './planOptions';
 import { DELIVERY_POLICY, TOOLCHAIN_PLAYBOOK } from './deliveryIntent';
 import { formatClusterInventory } from './clusterInventory';
+import { installedModelSizeB } from './recommender';
 
 const NODE_ROLES: NodeRole[] = ['coder', 'reviewer', 'docs', 'planner'];
 
@@ -893,12 +894,6 @@ export function anchorWritePath(tool: ToolCall, expectedFilePath?: string): Tool
   return tool;
 }
 
-function byCapacity(a: EndpointNode, b: EndpointNode): number {
-  const score = (n: EndpointNode) =>
-    (n.hardware?.vramGB || 0) * 10 + (n.hardware?.gpuBandwidthGBs || 0);
-  return score(b) - score(a);
-}
-
 type RoleBearing = { id?: string; name?: string; roles?: NodeRole[] };
 
 export const ALL_NODE_ROLES: NodeRole[] = [...NODE_ROLES];
@@ -1128,39 +1123,9 @@ You are currently inferring on **${inferName}**, which is not the Dev node. Keep
 }
 
 /**
- * Soft Auto routing: name/id heuristics.
- * Restricted nodes only match listed roles; Auto nodes use heuristics.
- */
-function nodeHasRole(n: EndpointNode, role: string): boolean {
-  if (!isRoleAuto(n)) return nodeHasExplicitRole(n, role);
-  const id = (n.id || '').toLowerCase();
-  const name = (n.name || '').toLowerCase();
-  if (role === 'reviewer') return id.includes('laptop') || name.includes('laptop') || name.includes('review');
-  if (role === 'docs') return id.includes('linux') || id.includes('server') || name.includes('docs') || name.includes('server');
-  if (role === 'coder' || role === 'planner') {
-    return id.includes('main') || id.includes('rig') || name.includes('main');
-  }
-  return false;
-}
-
-/**
- * Prefer nodes that explicitly allow this role (frontier allowed, no local-first).
- * Otherwise soft-match Auto nodes on the local-first pool.
- */
-function pickEndpointForRole(
-  role: string,
-  onlineUsable: EndpointNode[],
-  localFirstPool: EndpointNode[]
-): EndpointNode | undefined {
-  const tagged = onlineUsable.filter(n => nodeHasExplicitRole(n, role)).sort(byCapacity);
-  if (tagged[0]) return tagged[0];
-  const soft = localFirstPool.filter(n => nodeHasRole(n, role)).sort(byCapacity);
-  return soft[0];
-}
-
-/**
- * Selects the best online hardware endpoint based on the task type and agent persona,
- * while strictly using only endpoints that have at least one enabled model.
+ * Selects the online node whose enabled models best fit the persona.
+ * Heavy work follows parameter count. Frontier is only used when no local node allows the role.
+ * Offline nodes and nodes with every model disabled are not returned.
  */
 export function selectBestEndpointForTask(
   taskText: string,
@@ -1170,30 +1135,24 @@ export function selectBestEndpointForTask(
   if (!nodes.length) return undefined;
   const onlineUsable = nodes.filter(n => n.online && getEnabledModelsForNode(n).length > 0);
   const onlineLocal = onlineUsable.filter(n => !isFrontierNode(n));
-  // Local-first; frontier only when no local workers are available (soft / Auto path)
   const pool = onlineLocal.length > 0 ? onlineLocal : onlineUsable;
-  if (pool.length === 0) {
-    return nodes.find(n => n.online) || nodes[0];
-  }
+  if (pool.length === 0) return undefined;
 
   const lower = taskText.toLowerCase();
-  const byRole = (role: string) => pickEndpointForRole(role, onlineUsable, pool);
 
-  /** Persona-locked: never fall through to a node that does not allow this role. */
+  /** Largest enabled model among nodes that allow this role. Local pool first. */
   const pickForPersona = (role: NodeRole): EndpointNode | undefined => {
-    const hit = byRole(role);
-    if (hit) return hit;
-    const allowed = pool.filter(n => nodeAllowsRole(n, role)).sort(byCapacity);
-    return allowed[0];
+    const allowed = onlineUsable.filter(n => nodeAllowsRole(n, role));
+    const local = allowed.filter(n => !isFrontierNode(n));
+    const rolePool = local.length > 0 ? local : allowed;
+    return rankModelsForWeight(rolePool, 'heavy')?.node;
   };
 
-  // Explicit agent persona routing — hard stop on Allowed Roles (no coder fallthrough)
   if (agentHandle === 'planner') return pickForPersona('planner');
   if (agentHandle === 'reviewer') return pickForPersona('reviewer');
   if (agentHandle === 'docs') return pickForPersona('docs');
   if (agentHandle === 'coder') return pickForPersona('coder');
 
-  // Task content routing when in auto-endpoint mode
   if (/\b(test|unit test|readme|document|docstring|comment)\b/.test(lower)) {
     const hit = pickForPersona('docs');
     if (hit) return hit;
@@ -1203,34 +1162,7 @@ export function selectBestEndpointForTask(
     if (hit) return hit;
   }
 
-  const coderHit = pickForPersona('coder');
-  if (coderHit) return coderHit;
-
-  // Fallback to node with highest capacity among Auto / unrestricted
-  return [...pool].sort(byCapacity)[0];
-}
-
-function isTinyModelName(name: string): boolean {
-  return /:?(0\.5|1(\.5)?|1b|0\.5b)b?\b/i.test(name) || /tiny|mini:|smollm/i.test(name);
-}
-
-function modelParamBillions(model: string): number {
-  const m = model.toLowerCase();
-  const match = m.match(/(\d+(?:\.\d+)?)\s*b\b/);
-  if (match) return parseFloat(match[1]);
-  if (/gemini|gpt-4|claude|grok/i.test(m)) return 70; // treat frontier as high-capacity
-  return 7;
-}
-
-function conductorQualityBonus(model: string): number {
-  const m = model.toLowerCase();
-  let bonus = 0;
-  if (/coder|instruct|code/.test(m)) bonus += 40;
-  if (/7b|8b|9b|14b|32b|70b/.test(m)) bonus += 25;
-  if (/3b|4b/.test(m)) bonus += 5;
-  if (isTinyModelName(m)) bonus -= 50;
-  if (/gemini|gpt-4|claude|grok/i.test(m)) bonus += 35;
-  return bonus;
+  return pickForPersona('coder') || rankModelsForWeight(pool, 'heavy')?.node;
 }
 
 function modelSpeed(n: EndpointNode, model: string): { speed: number; provisional: boolean } {
@@ -1244,88 +1176,80 @@ function modelSpeed(n: EndpointNode, model: string): { speed: number; provisiona
   return { speed: Math.round((n.hardware?.gpuBandwidthGBs || 300) / 6), provisional: true };
 }
 
-/** Score how well a model fits a file job complexity (higher = better). */
-function scoreModelForComplexity(
-  model: string,
-  complexity: ConductorFileJob['complexity']
-): number {
-  const size = modelParamBillions(model);
-  const quality = conductorQualityBonus(model);
-  if (complexity === 'heavy') return quality * 10 + size * 6;
-  if (complexity === 'medium') return quality * 6 + size * 3 + 15;
-  // light: prefer snappy smaller/local-friendly models
-  return quality * 2 + Math.max(0, 35 - size) + (/coder|instruct/i.test(model) ? 8 : 0);
+export function endpointModelSizeB(node: EndpointNode | undefined, model: string): number {
+  const live = node?.models?.find(m => m.name === model);
+  return installedModelSizeB(model, live?.details?.parameter_size);
 }
 
-/** Best enabled model on a node for this job type (respects activeModel as a soft preference). */
+export interface RankedModelChoice {
+  node: EndpointNode;
+  model: string;
+  size: number;
+  speed: number;
+}
+
+/**
+ * Pick one enabled model on an online node.
+ * Heavy and medium: largest parameter count. Light: fastest model that is smaller than the largest,
+ * so a one-file task can stay on e4b/e2b. Tokens/sec only breaks an equal-size tie.
+ */
+export function rankModelsForWeight(
+  nodes: EndpointNode[],
+  weight: ConductorFileJob['complexity']
+): RankedModelChoice | undefined {
+  const options: RankedModelChoice[] = [];
+  for (const node of nodes) {
+    if (!node.online) continue;
+    for (const model of getEnabledModelsForNode(node)) {
+      options.push({
+        node,
+        model,
+        size: endpointModelSizeB(node, model),
+        speed: modelSpeed(node, model).speed
+      });
+    }
+  }
+  if (!options.length) return undefined;
+  if (weight === 'light') {
+    const maxSize = Math.max(...options.map(o => o.size));
+    const smaller = options.filter(o => o.size < maxSize - 0.05);
+    const pool = smaller.length > 0 ? smaller : options;
+    pool.sort((a, b) => b.speed - a.speed || a.size - b.size);
+    return pool[0];
+  }
+  options.sort((a, b) => b.size - a.size || b.speed - a.speed);
+  return options[0];
+}
+
+/** Best enabled model on a node. Heavy/medium follow size; light may use a smaller faster model. */
 export function pickBestModelForComplexity(
   node: EndpointNode,
   complexity: ConductorFileJob['complexity']
 ): string {
-  const enabled = getEnabledModelsForNode(node);
-  if (!enabled.length) return getPreferredModelForNode(node);
-
-  let best = enabled[0];
-  let bestScore = -Infinity;
-  for (const m of enabled) {
-    const { speed, provisional } = modelSpeed(node, m);
-    const activeBonus = node.activeModel === m ? 40 : 0;
-    const score =
-      scoreModelForComplexity(m, complexity) * 100 +
-      speed +
-      (provisional ? 0 : 60) +
-      activeBonus;
-    if (score > bestScore) {
-      bestScore = score;
-      best = m;
-    }
-  }
-  return best;
+  const picked = rankModelsForWeight([{ ...node, online: true }], complexity);
+  if (picked?.model) return picked.model;
+  return getPreferredModelForNode(node);
 }
 
 /**
- * Finds the best Conductor (planner) model.
- * Explicit allowed role = Planner wins (frontier allowed). Otherwise local-first Auto.
+ * Conductor / planner model. Largest enabled local model that may plan.
+ * Speed is only a tie break. Frontier is the fallback when no local planner is online.
  */
 export function findFastestConductor(
   nodes: EndpointNode[]
 ): { node: EndpointNode; model: string; tokPerSec: number; usedFrontierBackup?: boolean } | null {
-  const onlineUsable = nodes.filter(n => n.online && getEnabledModelsForNode(n).length > 0);
-  const onlineLocal = onlineUsable.filter(n => !isFrontierNode(n));
-  const explicitPlanners = onlineUsable.filter(n => nodeHasExplicitRole(n, 'planner'));
-  const usedExplicitPlanner = explicitPlanners.length > 0;
-  const usedFrontierBackup = !usedExplicitPlanner && onlineLocal.length === 0 && onlineUsable.length > 0;
-  const pool = usedExplicitPlanner
-    ? explicitPlanners
-    : onlineLocal.length > 0
-      ? onlineLocal
-      : onlineUsable;
-  if (pool.length === 0) return null;
-
-  let bestNode = pool[0];
-  let bestModel = getPreferredModelForNode(bestNode);
-  let bestScore = -Infinity;
-  let bestSpeed = 0;
-
-  for (const n of pool) {
-    const enabled = getEnabledModelsForNode(n);
-    for (const m of enabled) {
-      const { speed, provisional } = modelSpeed(n, m);
-      // Live benchmarks beat provisional seeds; quality bonus biases planning models
-      const score = conductorQualityBonus(m) * 1000 + speed + (provisional ? 0 : 500);
-      if (score > bestScore) {
-        bestScore = score;
-        bestSpeed = speed;
-        bestNode = n;
-        bestModel = m;
-      }
-    }
-  }
-
+  const allowed = nodes.filter(
+    n => n.online && getEnabledModelsForNode(n).length > 0 && nodeAllowsRole(n, 'planner')
+  );
+  const local = allowed.filter(n => !isFrontierNode(n));
+  const usedFrontierBackup = local.length === 0 && allowed.length > 0;
+  const pool = local.length > 0 ? local : allowed;
+  const picked = rankModelsForWeight(pool, 'heavy');
+  if (!picked) return null;
   return {
-    node: bestNode,
-    model: bestModel,
-    tokPerSec: bestSpeed || 100,
+    node: picked.node,
+    model: picked.model,
+    tokPerSec: picked.speed || 100,
     usedFrontierBackup
   };
 }
@@ -1482,9 +1406,8 @@ export type ClusterAssignment = {
 
 /**
  * Assigns file jobs across enabled online workers.
- * Local-first: uses only local Ollama nodes when any are online; frontier APIs are a backup
- * when no local GPUs are available. Picks the best enabled model per job complexity and
- * spreads load across nodes for parallelism.
+ * Heavy and medium files go to the largest enabled local model. Light files may use a
+ * smaller, faster model. Frontier is only the pool when no local node is online.
  */
 export function assignJobsToCluster(
   jobs: ConductorFileJob[],
@@ -1517,46 +1440,13 @@ export function assignJobsToCluster(
     });
   }
 
-  const loadCount = new Map<string, number>();
-  for (const n of pool) loadCount.set(n.id, 0);
-
   return sortedJobs.map(job => {
-    let bestNode = pool[0];
-    let bestScore = -Infinity;
-
-    for (const n of pool) {
-      const model = pickBestModelForComplexity(n, job.complexity);
-      const { speed, provisional } = modelSpeed(n, model);
-      const load = loadCount.get(n.id) || 0;
-      const capacity =
-        (n.hardware?.vramGB || 8) * 12 + (n.hardware?.gpuBandwidthGBs || 300) / 8;
-      // Soft role preference for coding-heavy nodes on heavy jobs
-      const roleBonus =
-        job.complexity === 'heavy' && nodeHasRole(n, 'coder')
-          ? 120
-          : job.complexity === 'light' && (nodeHasRole(n, 'reviewer') || nodeHasRole(n, 'docs'))
-            ? 60
-            : 0;
-      const score =
-        scoreModelForComplexity(model, job.complexity) * 1000 +
-        speed * 2 +
-        (provisional ? 0 : 250) +
-        capacity +
-        roleBonus -
-        load * 900; // spread parallel work across GPUs
-
-      if (score > bestScore) {
-        bestScore = score;
-        bestNode = n;
-      }
-    }
-
-    const model = pickBestModelForComplexity(bestNode, job.complexity);
-    loadCount.set(bestNode.id, (loadCount.get(bestNode.id) || 0) + 1);
-
+    const picked = rankModelsForWeight(pool, job.complexity);
+    const targetNode = picked?.node || pool[0];
+    const model = picked?.model || pickBestModelForComplexity(targetNode, job.complexity);
     return {
       job,
-      node: bestNode,
+      node: targetNode,
       model,
       skippedReason: usedFrontierBackup
         ? 'Frontier backup — no local Ollama nodes online'

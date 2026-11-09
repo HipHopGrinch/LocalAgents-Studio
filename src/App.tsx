@@ -74,6 +74,51 @@ function mergeTokenMirror(
   };
 }
 
+/**
+ * Web and seed snapshots must not put a disabled model back into service.
+ * Desktop keeps its own disabledModels / activeModel and only borrows live status.
+ */
+function applySnapshotNodes(
+  prev: EndpointNode[],
+  incoming: LiveSessionNode[],
+  keepLocalEnablement: boolean
+): EndpointNode[] {
+  const incomingById = new Map(incoming.map(n => [n.id, n]));
+  if (keepLocalEnablement && prev.length > 0) {
+    return prev.map(existing => {
+      const n = incomingById.get(existing.id);
+      if (!n) return existing;
+      const hasLiveModels = Array.isArray(n.models) && n.models.length > 0;
+      return {
+        ...existing,
+        online: typeof n.online === 'boolean' ? n.online : existing.online,
+        latency: n.latency != null ? n.latency : existing.latency,
+        models: hasLiveModels ? n.models! : existing.models,
+        loaded: n.loaded?.length ? n.loaded : existing.loaded,
+        error: n.error ?? existing.error,
+        disabledModels: existing.disabledModels,
+        activeModel: existing.activeModel
+      };
+    });
+  }
+  const prevById = new Map(prev.map(n => [n.id, n]));
+  return incoming.map(n => {
+    const existing = prevById.get(n.id);
+    const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, ...cfg } = n;
+    const hasLiveModels = Array.isArray(n.models) && n.models.length > 0;
+    return {
+      ...cfg,
+      online: typeof n.online === 'boolean' ? n.online : existing?.online ?? false,
+      latency: n.latency != null ? n.latency : existing?.latency ?? null,
+      models: hasLiveModels ? n.models! : existing?.models ?? [],
+      loaded: n.loaded?.length ? n.loaded : existing?.loaded ?? [],
+      error: n.error ?? existing?.error,
+      disabledModels: cfg.disabledModels,
+      activeModel: cfg.activeModel
+    } as EndpointNode;
+  });
+}
+
 function RemoteHostBanner({ remoteLive }: { remoteLive: boolean }) {
   const [wsState, setWsState] = useState(window.__LA_WS_STATE__ || 'connecting');
   useEffect(() => {
@@ -279,31 +324,22 @@ export const App: React.FC = () => {
       applyingRemoteRef.current = false;
     }, 350);
 
-    // Cluster status: desktop is authoritative; remotes always take node mirrors from peers that sent them.
+    // Desktop enablement wins over a web console mirror. Seed may refresh status only.
     if (Array.isArray(session.nodes) && session.nodes.length > 0) {
-      if (isRemoteClient || session.source === 'desktop' || session.source === 'seed') {
+      const trustIncomingConfig = isRemoteClient || session.source === 'desktop';
+      if (!isRemoteClient && session.source === 'web') {
+        // Ignore. A web publish can carry the previous desktop node list and would
+        // turn a model back on or mark an offline node online.
+      } else if (trustIncomingConfig) {
         const configs: NodeConfig[] = session.nodes.map(n => {
           const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, ...cfg } = n as LiveSessionNode &
             EndpointNode;
           return cfg;
         });
         setSettings(prev => ({ ...prev, nodes: configs }));
-        setNodes(prev => {
-          const byId = new Map(prev.map(n => [n.id, n]));
-          return session.nodes.map(n => {
-            const existing = byId.get(n.id);
-            const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, ...cfg } = n;
-            const hasLiveModels = Array.isArray(n.models) && n.models.length > 0;
-            return {
-              ...cfg,
-              online: typeof n.online === 'boolean' ? n.online : existing?.online ?? false,
-              latency: n.latency != null ? n.latency : existing?.latency ?? null,
-              models: hasLiveModels ? n.models! : existing?.models ?? [],
-              loaded: n.loaded?.length ? n.loaded : existing?.loaded ?? [],
-              error: n.error ?? existing?.error
-            } as EndpointNode;
-          });
-        });
+        setNodes(prev => applySnapshotNodes(prev, session.nodes, false));
+      } else if (session.source === 'seed') {
+        setNodes(prev => applySnapshotNodes(prev, session.nodes, !isRemoteClient));
       }
     }
 
@@ -411,9 +447,11 @@ export const App: React.FC = () => {
         live = null;
       }
 
-      // Prefer the live desktop session cluster when the disk snapshot is empty (remote attach).
+      // Remote clients follow the desktop cluster. The desktop keeps saved enablement
+      // unless another desktop window published a newer node list.
       if (live && Array.isArray(live.nodes) && live.nodes.length > 0) {
-        if (!merged.nodes.length || (live.updatedAt && live.nodes.length >= merged.nodes.length)) {
+        const trustLiveConfig = isRemoteClient || live.source === 'desktop';
+        if (trustLiveConfig && (!merged.nodes.length || (live.updatedAt && live.nodes.length >= merged.nodes.length))) {
           merged.nodes = live.nodes;
         }
       }
@@ -447,19 +485,15 @@ export const App: React.FC = () => {
       document.documentElement.style.setProperty('--app-scale', String(initialScale));
 
       if (live && Array.isArray(live.nodes) && live.nodes.length > 0 && live.nodes.some(n => n.online != null)) {
-        setNodes(
-          live.nodes.map(n => {
-            const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, ...cfg } = n;
-            return {
-              ...cfg,
-              online: !!n.online,
-              latency: n.latency ?? null,
-              models: n.models || [],
-              loaded: n.loaded || [],
-              error: n.error
-            } as EndpointNode;
-          })
-        );
+        const keepSavedEnablement = !isRemoteClient && live.source !== 'desktop';
+        const base = merged.nodes.map(n => ({
+          ...n,
+          online: false,
+          latency: null,
+          models: [] as EndpointNode['models'],
+          loaded: [] as EndpointNode['loaded']
+        }));
+        setNodes(applySnapshotNodes(base, live.nodes, keepSavedEnablement));
       } else {
         setNodes(
           merged.nodes.map(n => ({
@@ -764,8 +798,14 @@ export const App: React.FC = () => {
               latency: res.latency,
               models,
               loaded: res.loaded || [],
-              error: res.error
-              // disabledModels / activeModel / benchmarks / modelMeta / modelPrefs retained via ...n
+              error: res.error,
+              // A status poll reports installed tags. It must not clear a disable the user just saved.
+              disabledModels: n.disabledModels,
+              activeModel: n.activeModel,
+              modelPrefs: n.modelPrefs,
+              benchmarks: n.benchmarks,
+              modelMeta: n.modelMeta,
+              roles: n.roles
             };
           }
           return n;

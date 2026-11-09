@@ -2,10 +2,11 @@
  * Run: npx --yes tsx src/lib/plannerRoute.selftest.ts
  */
 import assert from 'node:assert/strict';
-import { parseFinalReview, pickCapableReviewTarget, pickFinalSourceReviewTarget, reviewModelSizeB } from './continuationReview';
-import { findLeadArchitect } from './swarmContract';
+import { liveRoutePin, parseFinalReview, pickCapableReviewTarget, pickFinalSourceReviewTarget, reviewModelSizeB } from './continuationReview';
+import { assignSwarmTasksToCluster, findLeadArchitect, type SwarmTask } from './swarmContract';
+import { findFastestConductor, pickBestModelForComplexity, selectBestEndpointForTask } from './tools';
 import { mergeSettings } from '../config/defaults';
-import type { EndpointNode, HardwareProfile } from '../types';
+import type { BenchmarkResult, EndpointNode, HardwareProfile } from '../types';
 
 const hw = (vramGB: number): HardwareProfile => ({
   cpu: 'cpu',
@@ -114,5 +115,118 @@ const kept = mergeSettings({ swarmEnabled: false, autoReview: false });
 assert.equal(kept.swarmEnabled, false);
 assert.equal(kept.autoReview, false);
 assert.equal(kept.autoApplyWrites, true);
+
+function bench(model: string, nodeId: string, evalTokPerSec: number): BenchmarkResult {
+  return {
+    model,
+    nodeId,
+    evalTokens: 64,
+    evalTokPerSec,
+    promptTokens: 16,
+    promptTokPerSec: evalTokPerSec,
+    loadMs: 10,
+    totalMs: 100
+  };
+}
+
+function swarmFile(filePath: string, complexity: SwarmTask['complexity']): SwarmTask {
+  return {
+    filePath,
+    complexity,
+    preferredRole: '@coder',
+    requiredExports: [],
+    requiredImports: [],
+    instructions: filePath
+  };
+}
+
+// 5070 12B is the slowest card. Routing must still give it planner, reviewer, and heavy work.
+const slow12 = node({
+  id: 'rig',
+  name: '5070',
+  hardware: { ...hw(16), gpuBandwidthGBs: 40 },
+  benchmarks: { 'gemma4:12b': bench('gemma4:12b', 'rig', 12) },
+  models: [{ name: 'gemma4:12b', size: 1, details: { parameter_size: '12B', family: 'gemma' } }]
+});
+const fast4 = node({
+  id: '1080',
+  name: '1080ti',
+  hardware: { ...hw(11), gpuBandwidthGBs: 480 },
+  benchmarks: { 'gemma4:e4b': bench('gemma4:e4b', '1080', 90) },
+  models: [{ name: 'gemma4:e4b', size: 1, details: { parameter_size: '4B', family: 'gemma' } }]
+});
+const fastest2 = node({
+  id: 'laptop',
+  name: 'laptop 3060',
+  hardware: { ...hw(6), gpuBandwidthGBs: 900 },
+  benchmarks: { 'gemma4:e2b': bench('gemma4:e2b', 'laptop', 140) },
+  models: [{ name: 'gemma4:e2b', size: 1, details: { parameter_size: '2B', family: 'gemma' } }]
+});
+const speedTrap = [fastest2, fast4, slow12];
+
+assert.equal(pickCapableReviewTarget(speedTrap, 'planner')?.model, 'gemma4:12b');
+assert.equal(pickCapableReviewTarget(speedTrap, 'reviewer')?.node.id, 'rig');
+assert.equal(findLeadArchitect(speedTrap)?.model, 'gemma4:12b');
+assert.equal(findFastestConductor(speedTrap)?.model, 'gemma4:12b');
+assert.equal(selectBestEndpointForTask('implement the game loop', 'coder', speedTrap)?.id, 'rig');
+
+const heavyAssign = assignSwarmTasksToCluster([swarmFile('src/game.ts', 'high')], speedTrap);
+assert.equal(heavyAssign[0]?.model, 'gemma4:12b');
+assert.equal(heavyAssign[0]?.node.id, 'rig');
+const mediumAssign = assignSwarmTasksToCluster([swarmFile('src/state.ts', 'medium')], speedTrap);
+assert.equal(mediumAssign[0]?.model, 'gemma4:12b');
+const lightAssign = assignSwarmTasksToCluster([swarmFile('src/theme.css', 'low')], speedTrap);
+assert.equal(lightAssign[0]?.model, 'gemma4:e2b');
+assert.equal(lightAssign[0]?.node.id, 'laptop');
+
+const sameCard = node({
+  id: 'both',
+  name: '5070',
+  benchmarks: {
+    'gemma4:12b': bench('gemma4:12b', 'both', 12),
+    'gemma4:e2b': bench('gemma4:e2b', 'both', 200)
+  },
+  models: [
+    { name: 'gemma4:12b', size: 1, details: { parameter_size: '12B' } },
+    { name: 'gemma4:e2b', size: 1, details: { parameter_size: '2B' } }
+  ]
+});
+assert.equal(pickBestModelForComplexity(sameCard, 'heavy'), 'gemma4:12b');
+assert.equal(pickBestModelForComplexity(sameCard, 'medium'), 'gemma4:12b');
+assert.equal(pickBestModelForComplexity(sameCard, 'light'), 'gemma4:e2b');
+
+const disabled12 = { ...slow12, disabledModels: ['gemma4:12b'], activeModel: undefined };
+const disabledCluster = [disabled12, fast4, fastest2];
+assert.equal(pickCapableReviewTarget(disabledCluster, 'reviewer')?.model, 'gemma4:e4b');
+assert.equal(pickCapableReviewTarget(disabledCluster, 'planner')?.node.id, '1080');
+assert.equal(findFastestConductor(disabledCluster)?.model, 'gemma4:e4b');
+assert.equal(
+  assignSwarmTasksToCluster([swarmFile('src/game.ts', 'high')], disabledCluster)[0]?.model,
+  'gemma4:e4b'
+);
+assert.equal(
+  liveRoutePin(disabledCluster, { node: slow12, model: 'gemma4:12b' }, 'coder')?.model,
+  'gemma4:e4b'
+);
+// Enabling the 12B again makes it eligible for the next heavy / planner route.
+assert.equal(
+  liveRoutePin(speedTrap, { node: fastest2, model: 'gemma4:e2b' }, 'reviewer')?.model,
+  'gemma4:12b'
+);
+assert.equal(
+  liveRoutePin(cluster, { node: frontier, model: 'gemini-2.5-flash-lite' }, 'reviewer')?.model,
+  'gemini-2.5-flash-lite'
+);
+
+const offline12 = { ...slow12, online: false };
+const offlineCluster = [offline12, fast4, fastest2];
+assert.equal(pickCapableReviewTarget(offlineCluster, 'planner')?.model, 'gemma4:e4b');
+assert.equal(selectBestEndpointForTask('heal the compile errors', 'coder', offlineCluster)?.id, '1080');
+assert.equal(
+  assignSwarmTasksToCluster([swarmFile('src/game.ts', 'high')], offlineCluster)[0]?.node.id,
+  '1080'
+);
+// The 12B card coming back online is eligible without a restart.
+assert.equal(pickCapableReviewTarget(speedTrap, 'reviewer')?.node.id, 'rig');
 
 console.log('plannerRoute.selftest ok');

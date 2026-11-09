@@ -1,8 +1,7 @@
 import { EndpointNode, PlanOption } from '../types';
-import { MODEL_CATALOG } from '../config/modelCatalog';
 import { DEFAULT_FRONTIER_NUM_CTX, DEFAULT_MODEL_NUM_CTX, resolveModelNumCtx } from './contextSize';
 import { parsePlanOptions } from './planOptions';
-import { normTag, parseParams } from './recommender';
+import { installedModelSizeB } from './recommender';
 import { getEnabledModelsForNode, isFrontierNode, nodeAllowsRole } from './tools';
 import { isDurableStep, isInspectionOnly } from './workLog';
 import type { NodeRole } from '../types';
@@ -78,14 +77,7 @@ Rules:
  * Ollama `details.parameter_size` wins, then the catalog, then the tag (`12b`, `e4b`).
  */
 export function reviewModelSizeB(modelName: string, parameterSize?: string): number {
-  const fromDetails = parseParams(parameterSize);
-  if (typeof fromDetails === 'number' && fromDetails > 0) return fromDetails;
-  const row = MODEL_CATALOG.find(m => normTag(m.tag) === normTag(modelName));
-  if (row) {
-    if (typeof row.activeB === 'number' && row.activeB > 0) return row.activeB;
-    if (typeof row.paramsB === 'number' && row.paramsB > 0) return row.paramsB;
-  }
-  return parseParams(modelName) ?? 0;
+  return installedModelSizeB(modelName, parameterSize);
 }
 
 function sizeOfEnabledModel(node: EndpointNode, model: string): number {
@@ -196,6 +188,34 @@ export function pickLargestLocalTarget(
     }
   }
   return best;
+}
+
+/**
+ * A pinned worker is kept only while that node is online and that model is still enabled.
+ * A larger enabled local model replaces a local pin. An offline node or a disabled model is dropped.
+ * A live frontier pin (final source review) is not swapped for a local model.
+ */
+export function liveRoutePin(
+  nodes: EndpointNode[],
+  pin: { node: EndpointNode; model: string },
+  role: NodeRole = 'coder'
+): ReviewTarget | undefined {
+  const best =
+    role === 'coder'
+      ? pickLargestLocalTarget(nodes, 'coder') || pickCapableReviewTarget(nodes, 'coder')
+      : pickCapableReviewTarget(nodes, role);
+  const live = nodes.find(n => n.id === pin.node.id);
+  const pinOk = !!live?.online && getEnabledModelsForNode(live).includes(pin.model);
+  if (!pinOk || !live) return best;
+  if (isFrontierNode(live)) return { node: live, model: pin.model };
+  if (
+    best &&
+    !isFrontierNode(best.node) &&
+    sizeOfEnabledModel(best.node, best.model) > sizeOfEnabledModel(live, pin.model)
+  ) {
+    return best;
+  }
+  return { node: live, model: pin.model };
 }
 
 const FILE_NAME = /[A-Za-z0-9_.-]+\.(?:py|ts|tsx|js|jsx|json|md|html|css|go|rs)/g;

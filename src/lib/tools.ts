@@ -22,7 +22,8 @@ const ALL_TOOLS: ToolName[] = [
   'run_command',
   'read_terminal',
   'web_search',
-  'generate_image'
+  'generate_image',
+  'mcp_call'
 ];
 const TOOL_ALT = ALL_TOOLS.join('|');
 
@@ -185,6 +186,8 @@ export function parseResponse(
     } else if (f.name === 'generate_image') {
       body = unfence(f.body ?? '').trim();
       if (!args.prompt && body) args.prompt = body;
+    } else if (f.name === 'mcp_call') {
+      body = (f.body ?? '').trim();
     } else if (f.name === 'read_terminal') {
       const raw = (f.body ?? '').trim();
       if (!args.lines && /^\d+$/.test(raw)) args.lines = raw;
@@ -601,6 +604,10 @@ When a command fails (non-zero exit), diagnose from the output, fix with <edit_f
 ### 7. Generate an image into the workspace (the app picks an image-capable GPU automatically):
 <generate_image path="assets/product.png" prompt="studio photo of a red sneaker on white"/>
 
+### 8. Local MCP (stdio servers configured in Settings — no remote URLs):
+<mcp_call server="name"/>
+<mcp_call server="name" tool="tool_name">{"arg":"value"}</mcp_call>
+
 ### Mandatory Rules:
 - MANDATORY: When the user asks you to build, create, or write code (e.g. "build a webpage", "create a python script"), you MUST invoke <write_file path="...">. DO NOT respond only with conversational text and raw markdown code blocks. The user expects the file to be created on their computer.
 - After writing code that should be verified, run a relevant command (<run_command>) and fix failures from the terminal output before stopping.
@@ -761,6 +768,8 @@ export function describeTool(call: ToolCall): string {
       return `Search web: ${call.args.query || call.body || ''}`;
     case 'generate_image':
       return `Image ${call.args.path || 'asset'}: ${call.args.prompt || call.body || ''}`;
+    case 'mcp_call':
+      return `MCP ${call.args.server || 'local'}${call.args.tool ? ` · ${call.args.tool}` : ' · tools/list'}`;
   }
 }
 

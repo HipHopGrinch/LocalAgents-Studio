@@ -46,6 +46,11 @@ export function rulesCandidatePaths(root: string): string[] {
   ];
 }
 
+export function rulesDir(root: string): string {
+  const sep = root.includes('\\') ? '\\' : '/';
+  return `${root.replace(/[\\/]+$/, '')}${sep}.localagents${sep}rules`;
+}
+
 export function parseProjectBrain(raw: string): ProjectBrain | null {
   try {
     const data = JSON.parse(raw) as Partial<ProjectBrain>;
@@ -169,7 +174,11 @@ export function preferredExistingPath(owned: string[], candidate: string): strin
   return null;
 }
 
-export function formatProjectBrainForPrompt(brain: ProjectBrain, rules?: string): string {
+export function formatProjectBrainForPrompt(
+  brain: ProjectBrain,
+  rules?: string,
+  maxRules = 6000
+): string {
   const lines: string[] = ['## Project brain (durable — survives new chats)'];
   if (brain.brief) lines.push(`Original brief: ${brain.brief}`);
   if (brain.delivery) lines.push(`Locked delivery: ${brain.delivery}`);
@@ -200,7 +209,7 @@ export function formatProjectBrainForPrompt(brain: ProjectBrain, rules?: string)
     );
   }
   if (rules?.trim()) {
-    lines.push(`## Project rules\n${rules.trim().slice(0, 4000)}`);
+    lines.push(`## Project rules\n${rules.trim().slice(0, Math.max(500, maxRules))}`);
   }
   if (lines.length === 1) return '';
   return lines.join('\n');

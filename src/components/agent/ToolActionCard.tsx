@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { CheckCircle2, Eye, FileEdit, Terminal } from 'lucide-react';
 import { ToolCall } from '../../types';
-import { applyEdits } from '../../lib/tools';
+import { applyEdits, parseEditBlocks } from '../../lib/tools';
 
 export interface ToolActionCardProps {
   tool: ToolCall;
@@ -27,6 +27,7 @@ export const ToolActionCard: React.FC<ToolActionCardProps> = ({
 }) => {
   const [applied, setApplied] = useState(tool.status === 'done');
   const [loading, setLoading] = useState(false);
+  const [kept, setKept] = useState<boolean[]>([]);
 
   useEffect(() => {
     if (tool.status === 'done') setApplied(true);
@@ -112,30 +113,53 @@ export const ToolActionCard: React.FC<ToolActionCardProps> = ({
   if (tool.name === 'edit_file') {
     const filePath = tool.args?.path || 'file';
     const body = tool.body || '';
+    const blocks = parseEditBlocks(body);
+    const keptSafe = blocks.map((_, i) => kept[i] !== false);
+
+    const hunkBody = (list: { search: string; replace: string }[]) =>
+      list
+        .map(b => `<<<<<<< SEARCH\n${b.search}\n=======\n${b.replace}\n>>>>>>> REPLACE`)
+        .join('\n\n');
+
+    const applyBody = async (nextBody: string) => {
+      const patched = { ...tool, body: nextBody, status: 'pending' as const };
+      if (onRunSingleTool) {
+        const res = await onRunSingleTool(patched);
+        if (res.status === 'done') {
+          tool.status = 'done';
+          setApplied(true);
+          return true;
+        }
+        onDiffFailed?.();
+        return false;
+      }
+      if (!window.electronAPI) return false;
+      const absPath = filePath.includes(':') ? filePath : `${workspacePath}\\${filePath.replace(/^[\\/]+/, '')}`;
+      const readRes = await window.electronAPI.readFile(absPath);
+      if (readRes.content === undefined) return false;
+      const editRes = applyEdits(readRes.content, nextBody);
+      if (editRes.content === undefined) {
+        alert(`Could not apply diff: ${editRes.error}`);
+        onDiffFailed?.();
+        return false;
+      }
+      await onApplyFileWrite(filePath, editRes.content);
+      tool.status = 'done';
+      setApplied(true);
+      return true;
+    };
 
     const handleApplyEdit = async () => {
+      const chosen = blocks.filter((_, i) => keptSafe[i]);
+      const rejected = blocks.filter((_, i) => !keptSafe[i]);
+      if (!chosen.length && !rejected.length) return;
       setLoading(true);
-      if (onRunSingleTool) {
-        const res = await onRunSingleTool(tool);
-        if (res.status === 'done') {
-          setApplied(true);
-        } else {
-          onDiffFailed?.();
+      if (applied || tool.status === 'done') {
+        if (rejected.length) {
+          await applyBody(hunkBody(rejected.map(b => ({ search: b.replace, replace: b.search }))));
         }
-      } else if (window.electronAPI) {
-        const absPath = filePath.includes(':') ? filePath : `${workspacePath}\\${filePath.replace(/^[\\/]+/, '')}`;
-        const readRes = await window.electronAPI.readFile(absPath);
-        if (readRes.content !== undefined) {
-          const editRes = applyEdits(readRes.content, body);
-          if (editRes.content !== undefined) {
-            await onApplyFileWrite(filePath, editRes.content);
-            tool.status = 'done';
-            setApplied(true);
-          } else {
-            alert(`Could not apply diff: ${editRes.error}`);
-            onDiffFailed?.();
-          }
-        }
+      } else if (chosen.length) {
+        await applyBody(hunkBody(chosen));
       }
       setLoading(false);
     };
@@ -152,7 +176,34 @@ export const ToolActionCard: React.FC<ToolActionCardProps> = ({
           </span>
         </div>
 
-        {!applied && body ? (
+        {blocks.length > 0 ? (
+          <div className="space-y-1 max-h-40 overflow-y-auto">
+            {blocks.map((b, i) => (
+              <label
+                key={i}
+                className="flex gap-2 items-start bg-[#0e0e11] rounded px-2 py-1 text-[10px]"
+              >
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={keptSafe[i]}
+                  onChange={() =>
+                    setKept(prev => {
+                      const next = blocks.map((_, j) => (prev[j] !== false));
+                      next[i] = !next[i];
+                      return next;
+                    })
+                  }
+                />
+                <span className="whitespace-pre-wrap text-zinc-400">
+                  <span className="text-emerald-400/90">{keptSafe[i] ? 'Accept' : 'Reject'}</span>
+                  {' '}hunk {i + 1}: {b.replace.slice(0, 140) || b.search.slice(0, 140)}
+                  {(b.replace.length > 140 || b.search.length > 140) ? '…' : ''}
+                </span>
+              </label>
+            ))}
+          </div>
+        ) : !applied && body ? (
           <div className="bg-[#0e0e11] p-2 rounded max-h-24 overflow-y-auto text-[10px] text-zinc-300 whitespace-pre">
             {body.slice(0, 200)}
             {body.length > 200 ? '…' : ''}
@@ -163,7 +214,7 @@ export const ToolActionCard: React.FC<ToolActionCardProps> = ({
           {!hideApply && (
             <button
               onClick={handleApplyEdit}
-              disabled={applied || loading}
+              disabled={loading || (blocks.length > 0 && keptSafe.every(k => !k) && tool.status !== 'done' && !applied)}
               className={`flex items-center space-x-1 px-2.5 py-1 rounded text-[11px] font-sans font-medium transition ${
                 applied
                   ? 'bg-emerald-600/30 text-emerald-300 border border-emerald-500/40'
@@ -173,10 +224,10 @@ export const ToolActionCard: React.FC<ToolActionCardProps> = ({
               {applied ? (
                 <>
                   <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-                  <span>Diff Applied</span>
+                  <span>{keptSafe.every(Boolean) ? 'Diff Applied' : 'Drop rejected hunks'}</span>
                 </>
               ) : (
-                <span>Apply Diff to File</span>
+                <span>Apply accepted hunks</span>
               )}
             </button>
           )}

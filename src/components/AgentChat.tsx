@@ -92,9 +92,11 @@ import {
   projectBrainPath,
   rememberOwnedFile,
   rulesCandidatePaths,
+  rulesDir,
   shouldPreserveContract,
   type ProjectBrain
 } from '../lib/projectBrain';
+import { buildRepoMap, formatRepoMap, type RepoMap } from '../lib/repoMap';
 import {
   errorFingerprint,
   filesFromErrors,
@@ -231,6 +233,7 @@ import {
   formatStepForCoders,
   formatStepForReviewer,
   getActiveStep,
+  continuePastFailedStep,
   insertFixStepsAfter,
   isPlanActive,
   markAllStepTasks,
@@ -302,6 +305,8 @@ interface AgentChatProps {
   /** Persist think on/off for a model on a node */
   onToggleModelThinking?: (nodeId: string, modelName: string, enabled: boolean) => void;
   searxngUrl?: string;
+  /** Local MCP server JSON from Settings. */
+  mcpServersJson?: string;
   /** Inner tool-loop budget (settings.maxAgentSteps). */
   maxAgentSteps?: number;
   /** True while a local/frontier agent turn (or stuck ladder) is in flight — blocks update restart. */
@@ -347,6 +352,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   onDeleteConversation,
   onToggleModelThinking,
   searxngUrl = '',
+  mcpServersJson = '',
   maxAgentSteps = 12,
   onBusyChange,
   peerConductor = null,
@@ -420,6 +426,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const [projectBrain, setProjectBrain] = useState<ProjectBrain>(emptyProjectBrain());
   const projectBrainRef = useRef<ProjectBrain>(emptyProjectBrain());
   const projectRulesRef = useRef('');
+  const repoMapRef = useRef<RepoMap | null>(null);
+  const rulesCapFor = (tier: 'tight' | 'standard' | 'wide') =>
+    tier === 'wide' ? 16000 : tier === 'tight' ? 4000 : 6000;
   const [pinnedFiles, setPinnedFiles] = useState<string[]>([]);
   const commitProjectBrain = (next: ProjectBrain) => {
     const stamped = { ...next, updatedAt: Date.now() };
@@ -428,8 +437,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     if (!workspacePath || !window.electronAPI?.writeFile) return;
     void window.electronAPI.writeFile(projectBrainPath(workspacePath), JSON.stringify(stamped, null, 2));
   };
-  const projectContextForPrompt = () =>
-    formatProjectBrainForPrompt(projectBrainRef.current, projectRulesRef.current);
+  const projectContextForPrompt = (maxRules = 6000) =>
+    formatProjectBrainForPrompt(projectBrainRef.current, projectRulesRef.current, maxRules);
   const noteOwnedPath = (rel: string | undefined) => {
     if (!rel) return;
     const next = rememberOwnedFile(projectBrainRef.current, rel);
@@ -844,9 +853,26 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           /* optional */
         }
       }
+      try {
+        const dirEntries = await window.electronAPI.readDir(rulesDir(workspacePath));
+        if (Array.isArray(dirEntries)) {
+          const files = dirEntries
+            .filter(e => !e.isDirectory && /\.(md|txt)$/i.test(e.name))
+            .sort((a, b) => a.name.localeCompare(b.name));
+          for (const ent of files) {
+            const res = await window.electronAPI.readFile(ent.path);
+            if (res.content?.trim()) ruleChunks.push(`# ${ent.name}\n${res.content.trim()}`);
+          }
+        }
+      } catch {
+        /* optional rules directory */
+      }
       if (cancel) return;
-      projectRulesRef.current = ruleChunks.join('\n\n').slice(0, 6000);
+      projectRulesRef.current = ruleChunks.join('\n\n').slice(0, 24000);
       projectBrainRef.current = brain;
+      void buildRepoMap(workspacePath).then(map => {
+        if (!cancel) repoMapRef.current = map;
+      });
       setProjectBrain(brain);
     })();
     return () => {
@@ -893,8 +919,73 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     onExecuteToolCommand: executeTrackedCommand,
     nodes,
     searxngUrl,
-    getOwnedFiles: () => projectBrainRef.current.ownedFiles
+    getOwnedFiles: () => projectBrainRef.current.ownedFiles,
+    getRepoMap: () => repoMapRef.current,
+    mcpServersJson
   };
+
+  const inlineEditHandlerRef = useRef<(detail: { path?: string; selection?: string; instruction?: string }) => void>(
+    () => {}
+  );
+  inlineEditHandlerRef.current = detail => {
+    const relPath = (detail.path || '').replace(/\\/g, '/');
+    const selection = (detail.selection || '').slice(0, 4000);
+    const instruction = (detail.instruction || '').trim();
+    if (!relPath || !selection || !instruction) return;
+    const root = (workspacePath || '').replace(/\\/g, '/').replace(/\/$/, '');
+    const short = relPath.toLowerCase().startsWith(root.toLowerCase())
+      ? relPath.slice(root.length).replace(/^\//, '')
+      : relPath;
+    void runSingleNodeTurn({
+      userText: `Inline edit ${short}`,
+      fullPrompt: `Edit ONLY the selection below in \`${short}\`. One <edit_file path="${short}"> SEARCH/REPLACE. Do not rewrite the rest of the file.
+
+SELECTION:
+${selection}
+
+INSTRUCTION:
+${instruction}`,
+      attachedImages: [],
+      agent: coderAgent,
+      freshContext: true,
+      skipUserAppend: false,
+      notice: `Inline edit · ${short}`
+    });
+  };
+  const draftCommitHandlerRef = useRef<(detail: { diff?: string }) => void>(() => {});
+  draftCommitHandlerRef.current = detail => {
+    const diff = (detail.diff || '').slice(0, 6000);
+    if (!diff.trim()) return;
+    void (async () => {
+      const msg = await runSingleNodeTurn({
+        userText: 'Draft a commit subject',
+        fullPrompt: `Write ONE git commit subject line, max 72 characters, for this diff. Reply with the subject only. Do not call tools.\n\n${diff}`,
+        attachedImages: [],
+        agent: coderAgent,
+        freshContext: true,
+        skipUserAppend: true,
+        notice: 'Drafting commit message…'
+      });
+      const line =
+        (msg?.raw || msg?.display || '')
+          .split('\n')
+          .map(s => s.replace(/^[#*\-\s]+/, '').trim())
+          .find(s => s && !s.startsWith('<') && !s.startsWith('```')) || '';
+      window.dispatchEvent(new CustomEvent('la-commit-message', { detail: { message: line.slice(0, 120) } }));
+    })();
+  };
+  useEffect(() => {
+    const onInline = (ev: Event) =>
+      inlineEditHandlerRef.current((ev as CustomEvent).detail || {});
+    const onDraft = (ev: Event) =>
+      draftCommitHandlerRef.current((ev as CustomEvent).detail || {});
+    window.addEventListener('la-inline-edit', onInline);
+    window.addEventListener('la-draft-commit', onDraft);
+    return () => {
+      window.removeEventListener('la-inline-edit', onInline);
+      window.removeEventListener('la-draft-commit', onDraft);
+    };
+  }, []);
 
   // Sync permissions when the persona changes. Do not stamp the persona's
   // default model onto a node where that model is disabled or not installed.
@@ -1752,6 +1843,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         return;
       }
 
+      const workerFit = resolveModelFit(node, model, 'coder', coderAgent.numCtx);
+      const workerMap = formatRepoMap(repoMapRef.current, workerFit.tier, userPrompt);
       const workerSystemPrompt = buildSystemPrompt(coderAgent, workspacePath, workspaceOverview, {
         planMode: false,
         reviewMode: false,
@@ -1759,13 +1852,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         lockPlanMode: false,
         stepVerdictMode: false,
         progressLog: progressForPrompt(),
-        projectContext: projectContextForPrompt(),
+        projectContext: projectContextForPrompt(rulesCapFor(workerFit.tier)),
         nodes,
         inferenceNodeId: node.id,
         inferenceModel: model
       });
-      const workerFit = resolveModelFit(node, model, 'coder', coderAgent.numCtx);
-      const fittedWorkerPrompt = `${workerFit.section}\n\n${userPrompt}${
+      const fittedWorkerPrompt = `${workerFit.section}\n\n${workerMap ? `${workerMap}\n\n` : ''}${userPrompt}${
         workerFit.packingLine ? `\n\n${workerFit.packingLine}` : ''
       }`;
       const workerMsgs = [
@@ -2832,6 +2924,13 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     try {
       const routedMaxCtx = modelMaxCtx(routedNode, routedModel);
       if (!useFreshContext) fitContext(routedMaxCtx);
+      const fitRole = stepVerdictMode || reviewMode
+        ? 'reviewer'
+        : planMode || lockPlanMode || contractMode
+          ? 'planner'
+          : 'coder';
+      const turnFit = resolveModelFit(routedNode, routedModel, fitRole, agent.numCtx);
+      const turnMap = formatRepoMap(repoMapRef.current, turnFit.tier, fullPrompt);
       const systemPrompt = buildSystemPrompt(agent, workspacePath, workspaceOverview, {
         planMode: !!planMode,
         reviewMode: !!reviewMode,
@@ -2840,23 +2939,18 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         stepVerdictMode: !!stepVerdictMode,
         approvedPlan: readOnlyMode || contractMode || lockPlanMode ? null : approvedPlan,
         progressLog: progressForPrompt(),
-        projectContext: projectContextForPrompt(),
+        projectContext: projectContextForPrompt(rulesCapFor(turnFit.tier)),
         nodes,
         inferenceNodeId: routedNode.id,
         inferenceModel: routedModel
       });
-      const fitRole = stepVerdictMode || reviewMode
-        ? 'reviewer'
-        : planMode || lockPlanMode || contractMode
-          ? 'planner'
-          : 'coder';
-      const turnFit = resolveModelFit(routedNode, routedModel, fitRole, agent.numCtx);
       const withModelFit = (body: string) => {
         const packing =
           !planMode && !lockPlanMode && !contractMode && turnFit.packingLine
             ? `\n\n${turnFit.packingLine}`
             : '';
-        return `${turnFit.section}\n\n${body}${packing}`;
+        const map = turnMap ? `${turnMap}\n\n` : '';
+        return `${turnFit.section}\n\n${map}${body}${packing}`;
       };
       const actionableUserPrompt = withModelFit(
         lockPlanMode
@@ -4716,6 +4810,35 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
   };
 
   /**
+   * Heal budget spent: record compiler debt and keep going on the next pending step.
+   * Does not set blockedReason. User Stop is the halt.
+   */
+  const deferFailedStepAndContinue = async (stepId: string, note: string) => {
+    let plan = plannerPlanRef.current;
+    if (!plan) return;
+    plan = continuePastFailedStep(plan, stepId, note);
+    commitPlannerPlan(plan);
+    const debtTitle = note.replace(/\s+/g, ' ').slice(0, 280);
+    const todo = [
+      ...projectBrainRef.current.todo.filter(t => t.id !== `debt-${stepId}`),
+      { id: `debt-${stepId}`, title: debtTitle, status: 'debt' }
+    ].slice(-40);
+    commitProjectBrain({ ...projectBrainRef.current, todo, updatedAt: Date.now() });
+    setPlanPaused(false);
+    const next = getActiveStep(plan);
+    if (plan.status === 'completed' || !next) {
+      restorePlannerControl(
+        'Plan finished. Steps left with compiler debt are marked failed — see project todo.'
+      );
+      return;
+    }
+    setExecutingPlanNotice(
+      `Step #${stepId} kept as debt — continuing step #${next.id}: ${next.title}`
+    );
+    await dispatchActiveStep();
+  };
+
+  /**
    * Compiler-driven heal when blocked / escalation would no-op.
    * Does not append steps or bump escalationCount. Max MAX_HEAL_ATTEMPTS per plan.
    */
@@ -4738,10 +4861,10 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
 
     const attempts = plan.healAttempts || 0;
     if (attempts >= MAX_HEAL_ATTEMPTS) {
-      const reason = `Heal failed after ${attempts} attempts on step #${stuck.id}. Fix the listed compile errors locally, then press Heal again or start a new plan.`;
-      commitPlannerPlan({ ...plan, blockedReason: reason, updatedAt: Date.now() });
-      setPlanPaused(true);
-      restorePlannerControl(reason);
+      await deferFailedStepAndContinue(
+        String(stuck.id),
+        `Heal budget used (${attempts}) on step #${stuck.id}. ${(stuck.reviewNote || plan.blockedReason || '').slice(0, 500)}`
+      );
       return;
     }
 
@@ -4942,27 +5065,37 @@ ${progressForPrompt() || '(empty)'}`;
       errors = parseCompilerErrors(verify.output);
       fingerprint = verify.fingerprint || errorFingerprint(errors);
       const snippet = (verify.output || '').slice(-700);
-      const reason = `Heal failed on step #${stuck.id} (attempt ${attempts + 1}/${MAX_HEAL_ATTEMPTS}). Remaining errors:\n${snippet}`;
-      commitPlannerPlan({
-        ...(plannerPlanRef.current || plan),
-        blockedReason: reason,
-        lastErrorFingerprint: fingerprint,
-        resumePhase: 'coder',
-        updatedAt: Date.now()
-      });
-      setPlanPaused(true);
+      const used = (plannerPlanRef.current?.healAttempts || attempts + 1);
       endActivity();
-      restorePlannerControl(reason);
+      if (used >= MAX_HEAL_ATTEMPTS) {
+        await deferFailedStepAndContinue(
+          String(stuck.id),
+          `Heal failed on step #${stuck.id} after ${used} attempts.\n${snippet}`
+        );
+        return;
+      }
+      setExecutingPlanNotice(
+        `Heal attempt ${used}/${MAX_HEAL_ATTEMPTS} left errors on step #${stuck.id} — retrying the next attempt…`
+      );
+      await healBlockedPlan();
     } catch (err: any) {
-      const reason = `Heal failed: ${err?.message || err}`;
-      commitPlannerPlan({
-        ...(plannerPlanRef.current || plan),
-        blockedReason: reason,
-        updatedAt: Date.now()
-      });
-      setPlanPaused(true);
       endActivity();
-      restorePlannerControl(reason);
+      const msg = String(err?.message || err);
+      if (/no workspace|workspace (path|required)|no local model|no model online/i.test(msg)) {
+        const reason = `Heal paused: ${msg}`;
+        commitPlannerPlan({
+          ...(plannerPlanRef.current || plan),
+          blockedReason: reason,
+          updatedAt: Date.now()
+        });
+        setPlanPaused(true);
+        restorePlannerControl(reason);
+        return;
+      }
+      await deferFailedStepAndContinue(
+        String(stuck.id),
+        `Heal error on step #${stuck.id}: ${msg.slice(0, 500)}`
+      );
     }
   };
 

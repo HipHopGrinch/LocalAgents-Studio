@@ -302,6 +302,11 @@ export interface AppSettings {
   uiScale?: number;
   /** SearXNG base URL for the web_search tool. Empty = search unavailable. */
   searxngUrl?: string;
+  /**
+   * Local MCP servers (stdio). JSON array: [{ "name", "command", "args": [] }].
+   * Remote URLs are ignored. Empty = no MCP tools.
+   */
+  mcpServersJson?: string;
   /** Recently opened project folders, newest first */
   recentWorkspaces?: string[];
   /** Persisted chat threads (scoped by workspacePath at runtime) */
@@ -352,7 +357,8 @@ export type ToolName =
   | 'run_command'
   | 'read_terminal'
   | 'web_search'
-  | 'generate_image';
+  | 'generate_image'
+  | 'mcp_call';
 
 export type ToolStatus = 'pending' | 'awaiting_approval' | 'running' | 'done' | 'rejected' | 'error';
 
@@ -641,6 +647,13 @@ export interface ElectronAPI {
     error?: string;
   }>;
   webSearch: (baseUrl: string, query: string) => Promise<{ content?: string; error?: string }>;
+  mcpCall: (spec: {
+    serversJson?: string;
+    server?: string;
+    method?: 'tools/list' | 'tools/call';
+    tool?: string;
+    arguments?: Record<string, unknown>;
+  }) => Promise<{ content?: string; error?: string }>;
   generateImage: (
     url: string,
     model: string,

@@ -54,6 +54,8 @@ interface HardwareSettingsModalProps {
   onUpdateUiScale: (scale: number) => void;
   searxngUrl: string;
   onUpdateSearxngUrl: (url: string) => void;
+  mcpServersJson?: string;
+  onUpdateMcpServersJson?: (json: string) => void;
   /** Keep App settings.webConsole in sync after enable/port/password changes (display only). */
   onWebConsoleChange?: (webConsole: { enabled: boolean; port: number }) => void;
 }
@@ -77,6 +79,8 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   onUpdateUiScale,
   searxngUrl,
   onUpdateSearxngUrl,
+  mcpServersJson = '',
+  onUpdateMcpServersJson,
   onWebConsoleChange
 }) => {
   const [activeTab, setActiveTab] = useState<'nodes' | 'hub' | 'appearance' | 'stats' | 'remote'>('nodes');
@@ -871,6 +875,19 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                 placeholder="http://127.0.0.1:8080"
                 onChange={e => onUpdateSearxngUrl(e.target.value.trim())}
                 className="min-w-0 flex-1 select-text bg-[#18181d] border border-[#2c2c38] text-zinc-200 rounded px-2 py-1 text-[11px] font-mono"
+              />
+            </div>
+            <div className="px-3 py-2 border-b border-[#27272a] flex items-start gap-2">
+              <label className="text-[10px] uppercase tracking-wide text-zinc-500 shrink-0 pt-1" htmlFor="mcp-json">
+                Local MCP
+              </label>
+              <textarea
+                id="mcp-json"
+                value={mcpServersJson}
+                placeholder={'[{"name":"local","command":"npx","args":["-y","@modelcontextprotocol/server-everything"]}]'}
+                onChange={e => onUpdateMcpServersJson?.(e.target.value)}
+                rows={2}
+                className="min-w-0 flex-1 select-text bg-[#18181d] border border-[#2c2c38] text-zinc-200 rounded px-2 py-1 text-[10px] font-mono"
               />
             </div>
             <div className="flex-1 flex overflow-hidden min-h-0">

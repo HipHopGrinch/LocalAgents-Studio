@@ -15,6 +15,7 @@ const {
   sanitizePackageJsonObject,
   isPackageJsonPath
 } = require('./npmDeps.cjs');
+const { mcpStdio, parseMcpServers } = require('./mcpClient.cjs');
 
 // Per-user settings live under AppData — NEVER inside the install dir or portable EXE.
 // Must be set before app.ready().
@@ -1210,6 +1211,20 @@ ipcMain.handle('tools:exec', async (_e, root, name, args) => {
   } catch (err) {
     return { error: err.message };
   }
+});
+
+ipcMain.handle('mcp:call', async (_e, spec) => {
+  const servers = parseMcpServers(spec?.serversJson || '');
+  const server = servers.find(s => s.name === spec?.server) || servers[0];
+  if (!server) return { error: 'No local MCP server configured. Add one in Settings (JSON, command + args, no URLs).' };
+  const method = spec?.method === 'tools/list' ? 'tools/list' : 'tools/call';
+  const params = method === 'tools/list'
+    ? {}
+    : { name: String(spec?.tool || ''), arguments: spec?.arguments || {} };
+  const res = await mcpStdio(server.command, server.args, method, params);
+  if (res.error) return { error: res.error };
+  const text = typeof res.result === 'string' ? res.result : JSON.stringify(res.result, null, 2);
+  return { content: text.slice(0, 12000) };
 });
 
 ipcMain.handle('web:search', async (_e, baseUrl, query) => {

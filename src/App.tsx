@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { Header } from './components/Header';
 import { FileTree } from './components/FileTree';
 import { EditorView } from './components/EditorView';
+import { GitPanel } from './components/GitPanel';
 import { TerminalPanel } from './components/TerminalPanel';
 import { AgentChat } from './components/AgentChat';
 import { HardwareSettingsModal } from './components/HardwareSettingsModal';
@@ -1306,6 +1307,7 @@ export const App: React.FC = () => {
     onDeleteConversation: handleDeleteConversation,
     onToggleModelThinking: handleToggleModelThinking,
     searxngUrl: settings.searxngUrl || '',
+    mcpServersJson: settings.mcpServersJson || '',
     onBusyChange: handleAgentBusyChange,
     peerConductor,
     peerChatMirror,
@@ -1402,6 +1404,7 @@ export const App: React.FC = () => {
             )}
             {mobilePane === 'code' && (
               <div className="h-full flex flex-col overflow-hidden">
+                <GitPanel workspacePath={workspacePath} />
                 <EditorView
                   tabs={openTabs}
                   activeTabPath={activeTabPath}
@@ -1457,6 +1460,7 @@ export const App: React.FC = () => {
           />
 
           <div className="flex-1 flex flex-col overflow-hidden min-w-[260px]">
+            <GitPanel workspacePath={workspacePath} />
             <EditorView
               tabs={openTabs}
               activeTabPath={activeTabPath}
@@ -1506,6 +1510,8 @@ export const App: React.FC = () => {
         onUpdateUiScale={handleUpdateUiScale}
         searxngUrl={settings.searxngUrl || ''}
         onUpdateSearxngUrl={url => updateSettings({ searxngUrl: url })}
+        mcpServersJson={settings.mcpServersJson || ''}
+        onUpdateMcpServersJson={json => updateSettings({ mcpServersJson: json })}
         onWebConsoleChange={web =>
           setSettings(prev => ({
             ...prev,

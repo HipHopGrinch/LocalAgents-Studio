@@ -1,5 +1,5 @@
-import React, { useEffect } from 'react';
-import Editor from '@monaco-editor/react';
+import React, { useEffect, useRef, useState } from 'react';
+import Editor, { OnMount } from '@monaco-editor/react';
 import { OpenTab } from '../types';
 import { X, Save, FileCode } from 'lucide-react';
 
@@ -21,6 +21,30 @@ export const EditorView: React.FC<EditorViewProps> = ({
   onSaveTab
 }) => {
   const activeTab = tabs.find(t => t.path === activeTabPath);
+  const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
+  const [selection, setSelection] = useState('');
+  const [instruction, setInstruction] = useState('');
+
+  const onMount: OnMount = ed => {
+    editorRef.current = ed;
+    ed.onDidChangeCursorSelection(() => {
+      const model = ed.getModel();
+      const range = ed.getSelection();
+      const text = model && range ? model.getValueInRange(range) : '';
+      setSelection(text.slice(0, 4000));
+    });
+  };
+
+  const submitInline = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeTab || !selection.trim() || !instruction.trim()) return;
+    window.dispatchEvent(
+      new CustomEvent('la-inline-edit', {
+        detail: { path: activeTab.path, selection, instruction: instruction.trim() }
+      })
+    );
+    setInstruction('');
+  };
 
   // Global Ctrl+S handler
   useEffect(() => {
@@ -96,6 +120,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
             language={activeTab.language}
             theme="vs-dark"
             value={activeTab.content}
+            onMount={onMount}
             onChange={(value) => onContentChange(activeTab.path, value || '')}
             options={{
               fontSize: 13,
@@ -120,6 +145,30 @@ export const EditorView: React.FC<EditorViewProps> = ({
           </div>
         )}
       </div>
+
+      {activeTab && selection.trim() && (
+        <form
+          onSubmit={submitInline}
+          className="shrink-0 flex items-center gap-2 px-2 py-1.5 border-t border-[#27272a] bg-[#141418]"
+        >
+          <span className="text-[10px] text-zinc-500 shrink-0">
+            {selection.trim().split('\n').length} lines
+          </span>
+          <input
+            value={instruction}
+            onChange={e => setInstruction(e.target.value)}
+            placeholder="Edit this selection…"
+            className="flex-1 min-w-0 bg-[#18181d] border border-[#2c2c38] text-zinc-200 rounded px-2 py-1 text-[11px]"
+          />
+          <button
+            type="submit"
+            disabled={!instruction.trim()}
+            className="px-2 py-1 rounded text-[11px] bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-40"
+          >
+            Inline edit
+          </button>
+        </form>
+      )}
     </div>
   );
 };

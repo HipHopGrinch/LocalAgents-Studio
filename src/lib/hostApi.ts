@@ -309,6 +309,7 @@ export function createWebHostApi(token: string): Promise<ElectronAPI> {
       installWorkspaceDeps: (root, opts) => invoke('workspace:installDeps', [root, opts]),
       hasPackageJson: root => invoke('workspace:hasPackageJson', [root]),
       webSearch: (baseUrl, query) => invoke('web:search', [baseUrl, query]),
+      mcpCall: spec => invoke('mcp:call', [spec]),
       generateImage: (url, model, prompt) => invoke('image:generate', [url, model, prompt]),
 
       executeCommand: (command, cwd) => invoke('terminal:execute', [command, cwd]),

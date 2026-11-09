@@ -3,6 +3,7 @@ import { applyEdits, formatToolResult, READ_ONLY_TOOLS } from './tools';
 import { shouldRejectPlannerWrite } from './swarmContract';
 import { shadowOwnedPath } from './projectBrain';
 import { pickImageTarget, placeholderSvg } from './imageRouting';
+import { symbolHitsForQuery, type RepoMap } from './repoMap';
 
 /** Fallback when settings.maxAgentSteps is missing. */
 export const MAX_TOOL_CONTINUATIONS = 12;
@@ -23,7 +24,7 @@ export function toolContinuationLimit(maxAgentSteps?: number): number {
 }
 
 const DESTRUCTIVE_CMD =
-  /\brm\s+-rf\b|\bformat\s+[a-z]:|\bdiskpart\b|\bdel\s+\/s\b|\bremove-item\b[^\n]*-recurse[^\n]*-force|\bmkfs\b|\bshutdown\s+\/s\b/i;
+  /\brm\s+-rf\b|\bformat\s+[a-z]:|\bdiskpart\b|\bdel\s+\/s\b|\bremove-item\b[^\n]*-recurse[^\n]*-force|\bmkfs\b|\bshutdown\s+\/s\b|\bgit\s+push\b[^\n]*--force|\bgit\s+push\b[^\n]*\s-f\b/i;
 
 export function isDestructiveCommand(cmd: string): boolean {
   return DESTRUCTIVE_CMD.test(cmd);
@@ -48,6 +49,10 @@ export interface ToolExecutorDeps {
   searxngUrl?: string;
   /** Live owned-file list so writes cannot invent a parallel module. */
   getOwnedFiles?: () => string[];
+  /** Cheap repo map so search can lead with symbol hits. */
+  getRepoMap?: () => RepoMap | null;
+  /** Local MCP servers JSON from settings. Empty = MCP calls fail closed. */
+  mcpServersJson?: string;
 }
 
 /** Execute one tool without mutating the input; returns a new ToolCall. */
@@ -175,6 +180,37 @@ export async function executeTool(tool: ToolCall, deps: ToolExecutorDeps): Promi
       if (res.error) {
         return { ...next, status: 'error', result: res.error };
       }
+      const raw = res.content || '(empty)';
+      if (tool.name === 'search') {
+        const q = tool.args?.query || tool.body || '';
+        const prefix = symbolHitsForQuery(deps.getRepoMap?.() || null, q);
+        return { ...next, status: 'done', result: `${prefix}${raw}` };
+      }
+      return { ...next, status: 'done', result: raw };
+    }
+
+    if (tool.name === 'mcp_call') {
+      if (!window.electronAPI?.mcpCall) {
+        return { ...next, status: 'error', result: 'MCP API unavailable' };
+      }
+      let args: Record<string, unknown> = {};
+      const rawBody = (tool.body || '').trim();
+      if (rawBody) {
+        try {
+          const parsed = JSON.parse(rawBody);
+          if (parsed && typeof parsed === 'object') args = parsed as Record<string, unknown>;
+        } catch {
+          args = { input: rawBody };
+        }
+      }
+      const res = await window.electronAPI.mcpCall({
+        serversJson: deps.mcpServersJson || '',
+        server: tool.args?.server,
+        method: tool.args?.tool ? 'tools/call' : 'tools/list',
+        tool: tool.args?.tool,
+        arguments: args
+      });
+      if (res.error) return { ...next, status: 'error', result: res.error };
       return { ...next, status: 'done', result: res.content || '(empty)' };
     }
 

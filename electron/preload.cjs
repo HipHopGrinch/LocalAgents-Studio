@@ -63,6 +63,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   installWorkspaceDeps: (root, opts) => ipcRenderer.invoke('workspace:installDeps', root, opts),
   hasPackageJson: root => ipcRenderer.invoke('workspace:hasPackageJson', root),
   webSearch: (baseUrl, query) => ipcRenderer.invoke('web:search', baseUrl, query),
+  mcpCall: spec => ipcRenderer.invoke('mcp:call', spec),
   generateImage: (url, model, prompt) => ipcRenderer.invoke('image:generate', url, model, prompt),
 
   // Terminal

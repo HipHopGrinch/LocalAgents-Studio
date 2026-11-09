@@ -113,6 +113,49 @@ export function activateNextStep(plan: PlannerPlan): PlannerPlan {
   });
 }
 
+/**
+ * Heal budget spent: keep the step failed with the compiler note, clear the
+ * plan-stopping block, and activate the next pending step so later work still runs.
+ */
+export function continuePastFailedStep(
+  plan: PlannerPlan,
+  stepId: string,
+  note: string
+): PlannerPlan {
+  const steps = plan.steps.map(s =>
+    String(s.id) === String(stepId)
+      ? {
+          ...s,
+          status: 'failed' as PlannerStepStatus,
+          reviewNote: note.slice(0, 1200)
+        }
+      : s
+  );
+  const next = steps.find(
+    s => String(s.id) !== String(stepId) && (s.status === 'pending' || s.status === 'in_progress')
+  );
+  if (!next) {
+    return touch(plan, {
+      steps,
+      status: 'completed',
+      activeStepId: null,
+      blockedReason: undefined,
+      healAttempts: 0,
+      resumePhase: 'coder'
+    });
+  }
+  return touch(plan, {
+    steps: steps.map(s =>
+      s.id === next.id ? { ...s, status: 'in_progress' as PlannerStepStatus } : s
+    ),
+    status: 'active',
+    activeStepId: next.id,
+    blockedReason: undefined,
+    healAttempts: 0,
+    resumePhase: 'coder'
+  });
+}
+
 export function markStepInProgress(plan: PlannerPlan, stepId: string): PlannerPlan {
   return touch(plan, {
     status: 'active',

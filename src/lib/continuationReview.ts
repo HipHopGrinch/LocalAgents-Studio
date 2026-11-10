@@ -156,8 +156,12 @@ export function parseFinalReview(raw: string): { result: 'pass' | 'issues'; note
   if (!body.trim()) return null;
   const resultRaw = (body.match(/<result>\s*([\s\S]*?)\s*<\/result>/i)?.[1] || '').toLowerCase();
   const notes = (body.match(/<notes>\s*([\s\S]*?)\s*<\/notes>/i)?.[1] || body).trim();
+  const blob = `${resultRaw}\n${notes}`.toLowerCase();
   const result =
-    /\b(pass|ok|clean)\b/.test(resultRaw) && !/\b(issue|fail|gap)\b/.test(resultRaw) ? 'pass' : 'issues';
+    /\b(pass|ok|clean)\b/.test(resultRaw) &&
+    !/\b(issue|fail|gap|blank|white page|unstyled|not wired)\b/.test(blob)
+      ? 'pass'
+      : 'issues';
   return { result, notes: notes.slice(0, 4000) };
 }
 

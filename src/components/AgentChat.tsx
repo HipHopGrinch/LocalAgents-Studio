@@ -153,11 +153,15 @@ import {
   resolveModelNumCtx,
   type DynamicCtxRole
 } from '../lib/contextSize';
+import {
+  contextWasExhausted,
+  fitPromptToContext,
+  shrinkUserPacket
+} from '../lib/contextMonitor';
+import { webEntryVerifyErrors } from '../lib/webEntryGate';
 import { resolveModelFit } from '../lib/clusterInventory';
 import {
   ASSIST_MAX_PREDICT,
-  contextOverflow,
-  estimateTokens,
   FREE_TIER_ASSIST_SYSTEM,
   bumpFreeTierUsage,
   isRateLimitError,
@@ -1986,9 +1990,19 @@ ${instruction}`,
       const fittedWorkerPrompt = `${workerFit.section}\n\n${workerMap ? `${workerMap}\n\n` : ''}${userPrompt}${
         workerFit.packingLine ? `\n\n${workerFit.packingLine}` : ''
       }`;
+      const workerFitPrompt = fitPromptToContext({
+        system: workerSystemPrompt,
+        userContent: fittedWorkerPrompt,
+        history: [],
+        maxCtx: modelMaxCtx(node, model),
+        frontier: isFrontierNode(node)
+      });
+      if (workerFitPrompt.note) {
+        setExecutingPlanNotice(workerFitPrompt.note);
+      }
       const workerMsgs = [
         { role: 'system', content: workerSystemPrompt },
-        { role: 'user', content: fittedWorkerPrompt }
+        { role: 'user', content: workerFitPrompt.userContent }
       ];
       const body = withThink(
         {
@@ -2054,7 +2068,35 @@ ${instruction}`,
           node.apiKey
         );
         activeAbortsRef.current.push(handle.abort);
-        const res = await handle.done;
+        let res = await handle.done;
+        if (
+          !isFrontierNode(node) &&
+          workerFitPrompt.shrinks < 2 &&
+          contextWasExhausted(res.stats, modelMaxCtx(node, model))
+        ) {
+          const smaller = shrinkUserPacket(workerFitPrompt.userContent, 2);
+          const retryBody = withThink(
+            {
+              model,
+              messages: [
+                { role: 'system', content: workerSystemPrompt },
+                { role: 'user', content: smaller }
+              ],
+              options: {
+                temperature: coderAgent.temperature,
+                num_ctx: chatNumCtx(node, model, workerMsgs, { role: 'coder', createIntent: true })
+              }
+            },
+            node,
+            model
+          );
+          const retry = streamChat(node.url, retryBody, () => {}, node.type, node.apiKey);
+          activeAbortsRef.current.push(retry.abort);
+          res = await retry.done;
+          setExecutingPlanNotice(
+            `Context monitor: ${model} filled its window. Resent \`${expectedFilePath}\` with a smaller packet.`
+          );
+        }
         recordTok(node, res.stats);
         const finished = await finishTruncatedWrites(
           node,
@@ -3151,7 +3193,7 @@ ${instruction}`,
               ? `${fullPrompt}\n\n[PLANNER DIRECTIVE: Analyze intent, propose a concrete plan, and end with 2–4 options in a <plan_options> block. Do NOT write deliverable files yet.]`
               : reviewMode
                 ? finalSourceReview
-                  ? `${fullPrompt}\n\n[FINAL SOURCE REVIEW: Compare the source folder to the finished plan. Do NOT write or edit files. End with <final_review><result>pass</result> or <result>issues</result> and <notes>.</final_review>.]`
+                  ? `${fullPrompt}\n\n[FINAL SOURCE REVIEW: Compare the source folder to the finished plan. A compile that succeeds is not a pass. Use issues when index.html would open as a blank white page, when Tailwind classes are not in the CSS, or when the app is unwired. Do NOT write or edit files. End with <final_review><result>pass</result> or <result>issues</result> and <notes>.</final_review>.]`
                   : `${fullPrompt}\n\n[REVIEWER DIRECTIVE: Report findings and end with a <review_plan> block (tasks if fixes are needed, summary-only if clean). Do NOT write or edit files.]`
                 : contractMode
                   ? `${fullPrompt}\n\n[PLANNER CONTRACT DIRECTIVE: Lock a fix contract for the review tasks. You may write a shared contract file. End with <fix_contract>. Do NOT emit <plan_options>. Do not implement the full fix list — Coder runs next.]`
@@ -3163,28 +3205,28 @@ ${instruction}`,
 
       // Cleared worker context: do not send the Planner brainstorm / prior turns.
       const history = useFreshContext ? [] : historyForModel(messagesRef.current, stripThinking);
-      const draftTokens = estimateTokens(
-        [systemPrompt, ...history.map(m => m.content), actionableUserPrompt].join('\n')
-      );
-      let userContent = actionableUserPrompt;
-      let historySent = history;
-      if (!useFreshContext && !routedIsFrontier && contextOverflow(draftTokens, routedMaxCtx)) {
-        try {
-          const brief = await requestFreeTierBrief(
-            `The local model max context is ${routedMaxCtx} tokens and this job does not fit. Brief the coder.`,
-            [systemPrompt, ...history.map(m => `${m.role}: ${m.content}`), actionableUserPrompt].join('\n\n')
-          );
-          if (brief) {
-            userContent = `${actionableUserPrompt}\n\n[FREE-TIER BRIEF — the rest of the context did not fit this model. Trust this brief.]\n${brief}`;
-            historySent = history.slice(-2);
-            setExecutingPlanNotice(`Context did not fit ${routedModel}. Using a short free-tier brief.`);
-          }
-        } catch (err: any) {
-          window.electronAPI?.writeLog?.('warn', `free-tier assist: ${err?.message || err}`);
-        }
+      const fittedPrompt = fitPromptToContext({
+        system: systemPrompt,
+        userContent: actionableUserPrompt,
+        history: history.map(m => ({ role: m.role, content: m.content })),
+        maxCtx: routedMaxCtx,
+        frontier: routedIsFrontier
+      });
+      let userContent = fittedPrompt.userContent;
+      let historySent = fittedPrompt.history;
+      if (fittedPrompt.note) {
+        setExecutingPlanNotice(fittedPrompt.note);
+        window.electronAPI?.writeLog?.('info', fittedPrompt.note);
       }
       if (stopRequestedRef.current) return undefined;
 
+      const turnRole = roleForDynamicCtx(
+        stepVerdictMode || reviewMode
+          ? 'reviewer'
+          : planMode || lockPlanMode || contractMode
+            ? 'planner'
+            : agent.handle
+      );
       const conversationPayload = [
         { role: 'system', content: systemPrompt },
         ...historySent,
@@ -3194,14 +3236,6 @@ ${instruction}`,
           ...(ollamaImages.length ? { images: ollamaImages } : {})
         }
       ];
-
-      const turnRole = roleForDynamicCtx(
-        stepVerdictMode || reviewMode
-          ? 'reviewer'
-          : planMode || lockPlanMode || contractMode
-            ? 'planner'
-            : agent.handle
-      );
       const body = withThink(
         {
           model: routedModel,
@@ -3285,7 +3319,46 @@ ${instruction}`,
       );
 
       activeAbortsRef.current = [handle.abort];
-      const result = await handle.done;
+      let result = await handle.done;
+      if (
+        !routedIsFrontier &&
+        fittedPrompt.shrinks < 2 &&
+        contextWasExhausted(result.stats, routedMaxCtx)
+      ) {
+        const note = `Context monitor: ${routedModel} filled ${routedMaxCtx} tokens. Resubmitting a smaller packet.`;
+        setExecutingPlanNotice(note);
+        window.electronAPI?.writeLog?.('info', note);
+        userContent = shrinkUserPacket(userContent, 2);
+        historySent = [];
+        const retryPayload = [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userContent }
+        ];
+        const retryBody = withThink(
+          {
+            model: routedModel,
+            messages: retryPayload,
+            options: {
+              temperature: agent.temperature,
+              num_ctx: chatNumCtx(routedNode, routedModel, retryPayload, {
+                role: turnRole,
+                createIntent: !readOnlyMode
+              })
+            }
+          },
+          routedNode,
+          routedModel
+        );
+        const retry = streamChat(
+          routedNode.url,
+          retryBody,
+          () => {},
+          routedNode.type,
+          routedNode.apiKey
+        );
+        activeAbortsRef.current = [retry.abort];
+        result = await retry.done;
+      }
       const finished = readOnlyMode
         ? result.content
         : await finishTruncatedWrites(
@@ -4875,6 +4948,38 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     await dispatchActiveStep();
   };
 
+  /** Blank index.html or unwired Tailwind is a failed web build even when tsc exits 0. */
+  const readWebEntryBlocker = async (): Promise<string> => {
+    const delivery = projectBrainRef.current.delivery || plannerPlanRef.current?.delivery;
+    if (delivery && delivery !== 'web') return '';
+    if (!workspacePath || !window.electronAPI?.readFile) return '';
+    const root = workspacePath.replace(/[\\/]+$/, '');
+    const sep = root.includes('\\') ? '\\' : '/';
+    const read = async (rel: string) => {
+      try {
+        const res = await window.electronAPI.readFile(`${root}${sep}${rel.replace(/\//g, sep)}`);
+        return res?.content || '';
+      } catch {
+        return '';
+      }
+    };
+    const indexHtml = await read('index.html');
+    if (!indexHtml) return '';
+    const css = `${await read('src/index.css')}\n${await read('index.css')}`;
+    let sourceSample = '';
+    const files = await listSourceFolderFiles(workspacePath);
+    for (const rel of files.filter(f => /\.(tsx|jsx)$/i.test(f)).slice(0, 8)) {
+      sourceSample += `\n${await read(rel)}`;
+      if (sourceSample.length > 80000) break;
+    }
+    return webEntryVerifyErrors({
+      delivery: delivery || 'web',
+      indexHtml,
+      css,
+      sourceSample
+    });
+  };
+
   /** Always run the stack verify command — never fake a mid-plan green. */
   const runProjectVerify = async (): Promise<{
     ok: boolean;
@@ -4925,14 +5030,16 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       }
 
       const out = await executeTrackedCommand(cmd);
-      const failed = verifyOutputFailed(out);
-      const errors = parseCompilerErrors(out);
+      const visual = verifyOutputFailed(out) ? '' : await readWebEntryBlocker();
+      const combined = visual ? `${out || ''}\n${visual}` : out || '';
+      const failed = verifyOutputFailed(combined);
+      const errors = parseCompilerErrors(combined);
       const fingerprint = errorFingerprint(errors);
       commitProjectBrain({
         ...projectBrainRef.current,
         verifyCommand: cmd,
         lastVerifyOk: !failed,
-        lastVerifyNote: (out || '').slice(-800)
+        lastVerifyNote: combined.slice(-800)
       });
       if (plannerPlanRef.current) {
         commitPlannerPlan({
@@ -4943,7 +5050,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
           updatedAt: Date.now()
         });
       }
-      return { ok: !failed, output: out || '', fingerprint };
+      return { ok: !failed, output: combined, fingerprint };
     } catch (err: any) {
       const msg = err?.message || String(err);
       commitProjectBrain({
@@ -5158,9 +5265,18 @@ ${progressForPrompt() || '(empty)'}`;
       const skipLocal = !!prevFp && prevFp === fingerprint && attempts >= 1;
 
       if (!skipLocal) {
+        const blankPage = /TS9001|TS9002/.test(verify.output || '');
+        const frontierFix = blankPage ? pickFinalSourceReviewTarget(nodesRef.current) : undefined;
+        const frontierPin =
+          frontierFix && isFrontierNode(frontierFix.node) ? frontierFix : undefined;
         await runHealCoder(
-          '',
-          `Heal: local Coder on ${errorFiles.length || allowedFiles.length || '?'} error file(s)…`
+          blankPage
+            ? 'The project compiles, but the page is still a blank or unstyled document. Fix index.html so the file itself has a background and a visible title, and wire Tailwind (@tailwind base; @tailwind components; @tailwind utilities, plus postcss.config.js and tailwind.config.js) or replace className utilities with real CSS in src/index.css.'
+            : '',
+          frontierPin
+            ? `Heal: frontier coder fixing the blank page on ${frontierPin.node.name} · ${frontierPin.model}…`
+            : `Heal: local Coder on ${errorFiles.length || allowedFiles.length || '?'} error file(s)…`,
+          frontierPin
         );
         if (stopRequestedRef.current) {
           setPlanPaused(true);
@@ -5332,11 +5448,8 @@ ${filesBody || '(No file bodies could be loaded.)'}
 ${rest.length ? `\nNot inlined (${rest.length}):\n${rest.join('\n')}` : ''}
 
 Check that the files match the plan: delivery, wiring, no stubs, no planner prose saved as code, no second copy of the same module.
-End with exactly:
-<final_review>
-<result>pass</result>
-<notes>what matches, or the concrete gaps</notes>
-</final_review>`;
+A successful tsc or vite build is not enough. If index.html has no visible content, or components use Tailwind classes that are not in the stylesheet, the result is issues.
+End with <final_review><result>pass</result> or <result>issues</result> and <notes>. Use pass only when opening the page would show the product.</final_review>`;
 
       const msg = await runSingleNodeTurn({
         userText: 'Final source review',

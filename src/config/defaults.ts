@@ -34,8 +34,20 @@ export const RAM_PRESETS: { name: string; bandwidth: number }[] = [
 ];
 
 export function guessGpuBandwidth(gpuName: string): number | undefined {
-  const n = gpuName.toLowerCase();
-  const hit = GPU_PRESETS.find(p => n.includes(p.name.toLowerCase().replace(/ \(.*\)$/, '')));
+  const n = gpuName
+    .toLowerCase()
+    .replace(/^nvidia\s+/i, '')
+    .replace(/^geforce\s+/i, '')
+    .replace(/^amd\s+/i, '')
+    .trim();
+  const hit = GPU_PRESETS.find(p => {
+    const base = p.name
+      .toLowerCase()
+      .replace(/\s*\(.*\)$/, '')
+      .replace(/\s+\d+gb$/i, '')
+      .trim();
+    return n.includes(base) || base.includes(n);
+  });
   return hit?.bandwidth;
 }
 

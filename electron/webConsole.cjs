@@ -35,6 +35,8 @@ let server = null;
 let wss = null;
 /** @type {Map<string, { expires: number }>} */
 const sessions = new Map();
+/** @type {Map<string, { count: number; lockedUntil: number }>} */
+const loginAttempts = new Map();
 /** @type {Set<import('ws').WebSocket>} */
 const clients = new Set();
 
@@ -205,8 +207,9 @@ async function serveStatic(req, res) {
   }
 
   const safe = path.normalize(urlPath).replace(/^(\.\.[/\\])+/, '');
-  let filePath = path.join(distDir, safe);
-  if (!filePath.startsWith(distDir)) {
+  const distRoot = path.resolve(distDir);
+  let filePath = path.resolve(path.join(distRoot, safe));
+  if (filePath !== distRoot && !filePath.startsWith(distRoot + path.sep)) {
     res.writeHead(403);
     return res.end('Forbidden');
   }
@@ -250,9 +253,23 @@ async function handleApi(req, res) {
       if (!config.enabled || !server) {
         return sendJson(res, 503, { error: 'Web console is not running' });
       }
+      const ip = String(req.socket?.remoteAddress || 'unknown');
+      const now = Date.now();
+      let attempt = loginAttempts.get(ip) || { count: 0, lockedUntil: 0 };
+      if (attempt.lockedUntil > now) {
+        const waitSec = Math.ceil((attempt.lockedUntil - now) / 1000);
+        return sendJson(res, 429, { error: `Too many attempts. Retry in ${waitSec}s` });
+      }
       if (!verifyPassword(password, config.passwordHash, config.passwordSalt)) {
+        attempt.count += 1;
+        if (attempt.count >= 5) {
+          const lockMs = Math.min(60_000 * 2 ** Math.min(attempt.count - 5, 4), 15 * 60_000);
+          attempt.lockedUntil = now + lockMs;
+        }
+        loginAttempts.set(ip, attempt);
         return sendJson(res, 401, { error: 'Invalid password' });
       }
+      loginAttempts.delete(ip);
       const token = issueSession();
       return sendJson(res, 200, { token, urls: listeningUrls() });
     } catch (err) {
@@ -504,8 +521,8 @@ async function applyConfig(next = {}) {
 
 function setPassword(password) {
   const pwd = String(password || '');
-  if (pwd.length < 4) {
-    return { error: 'Password must be at least 4 characters' };
+  if (pwd.length < 8) {
+    return { error: 'Password must be at least 8 characters' };
   }
   const rec = createPasswordRecord(pwd);
   config.passwordHash = rec.passwordHash;

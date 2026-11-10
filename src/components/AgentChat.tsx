@@ -2453,10 +2453,11 @@ ${instruction}`,
       }
       const writeOk = await onApplyFileWrite(manifest.contractFile, manifest.contractCode);
       noteOwnedPath(manifest.contractFile);
+      // Do not lock until typecheck passes (or the stack has no checker).
       commitProjectBrain({
         ...projectBrainRef.current,
         contractFile: manifest.contractFile,
-        contractLocked: true,
+        contractLocked: false,
         stack: (manifest.stack as DeliveryStack) || projectBrainRef.current.stack,
         verifyCommand:
           manifest.verifyCommand ||
@@ -2473,12 +2474,14 @@ ${instruction}`,
         return;
       }
 
+      let contractVerified = true;
       if (
         manifest.stack === 'typescript' &&
         isTypeScriptContractPath(manifest.contractFile) &&
         window.electronAPI?.typecheckWorkspace &&
         workspacePath
       ) {
+        contractVerified = false;
         // Ensure project typescript exists before contract tsc (packaged Studio cannot rely on npx).
         try {
           const pkgProbe = await window.electronAPI.execTool(workspacePath, 'exists', {
@@ -2604,15 +2607,25 @@ ${instruction}`,
               ).slice(0, 1500)}\n\`\`\``
             });
           } else {
+            contractVerified = true;
             patchPipelineMsg({
               display: `✅ Contract \`${manifest.contractFile}\` typechecks. Fan-out Pass 2…`
             });
           }
         } else {
+          contractVerified = true;
           patchPipelineMsg({
             display: `✅ Contract \`${manifest.contractFile}\` locked & typechecked. Fan-out Pass 2…`
           });
         }
+      }
+
+      if (contractVerified) {
+        commitProjectBrain({
+          ...projectBrainRef.current,
+          contractFile: manifest.contractFile,
+          contractLocked: true
+        });
       }
 
       endActivity(); // Pass 1 done
@@ -6418,7 +6431,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  });
+  }, []);
 
   const [controlColWidth, setControlColWidth] = useState(controlWidth);
   const controlColWidthRef = useRef(controlWidth);

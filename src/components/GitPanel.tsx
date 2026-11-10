@@ -35,9 +35,8 @@ export const GitPanel: React.FC<GitPanelProps> = ({ workspacePath }) => {
     setBusy(command);
     setNote('');
     try {
-      await window.electronAPI.executeCommand(command, workspacePath);
-      const buf = await window.electronAPI.getTerminalBuffer?.({ maxChars: 8000 });
-      return buf?.content || '';
+      const res = await window.electronAPI.executeCommand(command, workspacePath);
+      return typeof res?.output === 'string' ? res.output : '';
     } catch (err: any) {
       setNote(err?.message || String(err));
       return '';
@@ -69,12 +68,13 @@ export const GitPanel: React.FC<GitPanelProps> = ({ workspacePath }) => {
   };
 
   const commit = async () => {
-    const subject = message.replace(/[\r\n"]/g, ' ').trim();
+    // Single-quote for PowerShell so $(...) / $vars / backticks are not expanded.
+    const subject = message.replace(/[\r\n]/g, ' ').replace(/'/g, "''").trim();
     if (!subject) {
       setNote('Commit message is empty.');
       return;
     }
-    const out = await run(`git commit -m "${subject}"`);
+    const out = await run(`git commit -m '${subject}'`);
     setNote(out.slice(-500) || 'Commit finished. Check the terminal if git printed nothing.');
     await refresh();
   };

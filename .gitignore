@@ -25,7 +25,13 @@ Thumbs.db
 out/
 .localagents/
 release/
+release-*/
 *.asar
+*.zip
+
+# Accidental path-mangled artifacts (e.g. unescaped C:\Users\...)
+C*Users*
+C*
 
 # electron-builder scratch
 dist_electron/

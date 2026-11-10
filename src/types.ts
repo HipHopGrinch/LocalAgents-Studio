@@ -631,7 +631,7 @@ export interface ElectronAPI {
   }>;
   hasPackageJson: (root: string) => Promise<{ exists: boolean }>;
 
-  executeCommand: (command: string, cwd?: string) => Promise<{ code?: number }>;
+  executeCommand: (command: string, cwd?: string) => Promise<{ code?: number; output?: string }>;
   killCommand: () => Promise<{ success: boolean }>;
   getTerminalBuffer: (opts?: { maxChars?: number }) => Promise<{ content: string; running: boolean; chars: number }>;
   clearTerminalBuffer: () => Promise<{ success: boolean }>;

@@ -76,5 +76,8 @@ assert.ok(wideRules.includes('never add a second Board component'));
 assert.equal(isDestructiveCommand('git push --force origin main'), true);
 assert.equal(isDestructiveCommand('git push origin main'), false);
 assert.equal(isDestructiveCommand('git commit -m "ok"'), false);
+assert.equal(isDestructiveCommand('Remove-Item -Force -Recurse ./tmp'), true);
+assert.equal(isDestructiveCommand('git reset --hard'), true);
+assert.equal(isDestructiveCommand('del /q /s junk'), true);
 
 console.log('cursorClass.selftest ok');

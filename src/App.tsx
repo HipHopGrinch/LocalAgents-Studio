@@ -157,20 +157,25 @@ function RemoteHostBanner({ remoteLive }: { remoteLive: boolean }) {
   );
 }
 
-/** Keep agent writes inside the open folder, even when a model emits an absolute path. */
-function clampWritePath(root: string, filePath: string): string {
+/**
+ * Keep agent writes inside the open folder.
+ * Absolute paths outside the workspace are rejected (null) — never basename-clobbered into root.
+ */
+function clampWritePath(root: string, filePath: string): string | null {
   let p = (filePath || '').trim().replace(/^["']|["']$/g, '');
   if (!p) return 'file';
   const rootNorm = root.replace(/[\\/]+$/, '').replace(/\\/g, '/');
   let norm = p.replace(/\\/g, '/');
   const rootLower = rootNorm.toLowerCase();
   const lower = norm.toLowerCase();
-  if (lower.startsWith(rootLower + '/')) norm = norm.slice(rootNorm.length + 1);
-  else if (/^[a-zA-Z]:\//.test(norm) || norm.startsWith('//') || norm.startsWith('/')) {
-    norm = norm.split('/').filter(Boolean).pop() || 'file';
+  if (lower === rootLower) return 'file';
+  if (lower.startsWith(rootLower + '/')) {
+    norm = norm.slice(rootNorm.length + 1);
+  } else if (/^[a-zA-Z]:\//.test(norm) || norm.startsWith('//') || norm.startsWith('/')) {
+    return null;
   }
   const parts = norm.split('/').filter(part => part && part !== '.' && part !== '..');
-  return parts.join('/') || 'file';
+  return parts.length ? parts.join('/') : null;
 }
 
 export const App: React.FC = () => {
@@ -322,7 +327,7 @@ export const App: React.FC = () => {
     applyingRemoteRef.current = true;
     window.setTimeout(() => {
       applyingRemoteRef.current = false;
-    }, 350);
+    }, 1200);
 
     // Desktop enablement wins over a web console mirror. Seed may refresh status only.
     if (Array.isArray(session.nodes) && session.nodes.length > 0) {
@@ -332,11 +337,21 @@ export const App: React.FC = () => {
         // turn a model back on or mark an offline node online.
       } else if (trustIncomingConfig) {
         const configs: NodeConfig[] = session.nodes.map(n => {
-          const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, ...cfg } = n as LiveSessionNode &
-            EndpointNode;
+          const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, hasApiKey: _h, ...cfg } =
+            n as LiveSessionNode & EndpointNode & { hasApiKey?: boolean };
           return cfg;
         });
-        setSettings(prev => ({ ...prev, nodes: configs }));
+        // Live session strips apiKeys for web — never wipe local secrets on echo.
+        setSettings(prev => ({
+          ...prev,
+          nodes: configs.map(cfg => {
+            const prior = prev.nodes.find(p => p.id === cfg.id);
+            if ((!cfg.apiKey || (cfg as { hasApiKey?: boolean }).hasApiKey) && prior?.apiKey) {
+              return { ...cfg, apiKey: prior.apiKey };
+            }
+            return prior?.apiKey && !cfg.apiKey ? { ...cfg, apiKey: prior.apiKey } : cfg;
+          })
+        }));
         setNodes(prev => applySnapshotNodes(prev, session.nodes, false));
       } else if (session.source === 'seed') {
         setNodes(prev => applySnapshotNodes(prev, session.nodes, !isRemoteClient));
@@ -546,17 +561,26 @@ export const App: React.FC = () => {
       applyLiveSession(session);
     });
 
-    const poll = window.setInterval(() => {
+    // Desktop already receives push events; only remote web clients need a poll fallback.
+    let poll: number | undefined;
+    if (isRemoteClient) {
+      poll = window.setInterval(() => {
+        void window.electronAPI.getLiveSession?.().then(s => {
+          markHostUp();
+          if (s && s.updatedAt > 0) applyLiveSession(s);
+        });
+      }, 750);
+    } else {
+      // One seed read in case the push subscription races startup.
       void window.electronAPI.getLiveSession?.().then(s => {
-        markHostUp();
-        if (s && s.updatedAt > 0) applyLiveSession(s);
+        if (!cancelled && s && s.updatedAt > 0) applyLiveSession(s);
       });
-    }, 750);
+    }
 
     return () => {
       cancelled = true;
       unsub?.();
-      window.clearInterval(poll);
+      if (poll) window.clearInterval(poll);
     };
   }, [isRemoteClient, applyLiveSession]);
 
@@ -1148,6 +1172,10 @@ export const App: React.FC = () => {
     if (!window.electronAPI || !workspacePath) return false;
 
     const rel = clampWritePath(workspacePath, filePath);
+    if (!rel) {
+      console.error('Write rejected: path outside workspace', filePath);
+      return false;
+    }
     let writeContent = content;
     if (/(^|[/\\])package\.json$/i.test(rel.replace(/\\/g, '/'))) {
       const { sanitizePackageJsonContent } = await import('./lib/npmDeps');

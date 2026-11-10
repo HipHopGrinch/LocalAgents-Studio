@@ -107,6 +107,7 @@ app.whenReady().then(async () => {
     const raw = await fsp.readFile(settingsPath(), 'utf-8').catch(() => null);
     if (raw) {
       const saved = JSON.parse(raw);
+      if (saved?.lastWorkspace) rememberWorkspaceRoot(saved.lastWorkspace);
       if (saved?.webConsole) await webConsole.applyConfig(saved.webConsole);
     }
   } catch (err) {
@@ -138,7 +139,11 @@ async function invokeRpc(channel, args = []) {
 
 const send = (channel, payload) => {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
-  webConsole.broadcast(channel, payload);
+  const webPayload =
+    channel === 'session:changed' && payload && typeof payload === 'object'
+      ? { ...payload, nodes: stripNodeApiKeys(payload.nodes) }
+      : payload;
+  webConsole.broadcast(channel, webPayload);
 };
 
 webConsole.init({
@@ -156,18 +161,103 @@ webConsole.init({
 
 const settingsPath = () => path.join(app.getPath('userData'), 'settings.json');
 
+/** Serialize overlapping atomic writes to the same path. */
+const writeQueues = new Map();
+function withWriteLock(filePath, fn) {
+  const key = path.resolve(String(filePath || ''));
+  const prev = writeQueues.get(key) || Promise.resolve();
+  const next = prev.then(fn, fn);
+  writeQueues.set(
+    key,
+    next.then(
+      () => {},
+      () => {}
+    )
+  );
+  return next;
+}
+
+function uniqueTmpPath(filePath) {
+  return `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+}
+
+/** Active workspace root(s) for fs:* sandboxing. */
+let activeWorkspaceRoot = '';
+
+function rememberWorkspaceRoot(dirPath) {
+  const resolved = path.resolve(String(dirPath || '').trim());
+  if (resolved) activeWorkspaceRoot = resolved;
+  return resolved;
+}
+
+function workspaceRoots() {
+  const roots = [];
+  if (activeWorkspaceRoot) roots.push(path.resolve(activeWorkspaceRoot));
+  if (liveSession?.workspacePath) {
+    const ws = path.resolve(liveSession.workspacePath);
+    if (!roots.some(r => r.toLowerCase() === ws.toLowerCase())) roots.push(ws);
+  }
+  return roots;
+}
+
+function assertWithinWorkspace(targetPath) {
+  const abs = path.resolve(String(targetPath || ''));
+  const roots = workspaceRoots();
+  if (!roots.length) throw new Error('No workspace folder is open');
+  for (const root of roots) {
+    const rel = path.relative(root, abs);
+    if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) return abs;
+  }
+  throw new Error(`Path is outside the open workspace`);
+}
+
+function stripNodeApiKeys(nodes) {
+  if (!Array.isArray(nodes)) return nodes;
+  return nodes.map(n => {
+    if (!n || typeof n !== 'object') return n;
+    const { apiKey, ...rest } = n;
+    return { ...rest, hasApiKey: !!apiKey || !!n.hasApiKey };
+  });
+}
+
+function stripSecretsForWeb(data) {
+  if (!data || typeof data !== 'object') return data;
+  const out = { ...data };
+  if (out.webConsole) {
+    out.webConsole = {
+      enabled: !!out.webConsole.enabled,
+      port: out.webConsole.port || webConsole.DEFAULT_PORT
+    };
+  }
+  if (Array.isArray(out.nodes)) out.nodes = stripNodeApiKeys(out.nodes);
+  return out;
+}
+
+async function readSettingsFile() {
+  try {
+    return JSON.parse(await fsp.readFile(settingsPath(), 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+/** Web clients must not supply API keys; look them up from disk by URL/id. */
+async function resolveApiKeyForRequest(e, url, apiKey, nodeId) {
+  if (!e?.webConsole) return apiKey || '';
+  const data = await readSettingsFile();
+  const nodes = Array.isArray(data?.nodes) ? data.nodes : [];
+  const norm = (u) => String(u || '').replace(/\/+$/, '').toLowerCase();
+  const byId = nodeId ? nodes.find(n => n.id === nodeId) : null;
+  if (byId?.apiKey) return byId.apiKey;
+  const byUrl = nodes.find(n => norm(n.url) === norm(url));
+  return byUrl?.apiKey || '';
+}
+
 ipcMain.handle('settings:load', async (e) => {
   try {
-    const data = JSON.parse(await fsp.readFile(settingsPath(), 'utf-8'));
-    if (e?.webConsole && data?.webConsole) {
-      return {
-        ...data,
-        webConsole: {
-          enabled: !!data.webConsole.enabled,
-          port: data.webConsole.port || webConsole.DEFAULT_PORT
-        }
-      };
-    }
+    const data = await readSettingsFile();
+    if (!data) return null;
+    if (e?.webConsole) return stripSecretsForWeb(data);
     return data;
   } catch {
     return null;
@@ -177,12 +267,7 @@ ipcMain.handle('settings:load', async (e) => {
 ipcMain.handle('settings:save', async (e, settings) => {
   try {
     await fsp.mkdir(app.getPath('userData'), { recursive: true });
-    let existing = null;
-    try {
-      existing = JSON.parse(await fsp.readFile(settingsPath(), 'utf-8'));
-    } catch {
-      existing = null;
-    }
+    let existing = await readSettingsFile();
     if (settings && typeof settings === 'object') {
       // Web console lifecycle is owned only by webConsole:update / setPassword / app startup.
       // Never let a renderer settings save flip enabled off or restart the HTTP server
@@ -191,6 +276,19 @@ ipcMain.handle('settings:save', async (e, settings) => {
         settings.webConsole = { ...existing.webConsole };
       } else {
         delete settings.webConsole;
+      }
+      // Web clients never see real apiKeys — restore from disk when the payload is blank/masked.
+      if (e?.webConsole && Array.isArray(settings.nodes) && Array.isArray(existing?.nodes)) {
+        settings.nodes = settings.nodes.map(n => {
+          const prev = existing.nodes.find(p => p.id === n.id);
+          const incoming = n?.apiKey;
+          if ((!incoming || incoming === '********' || n?.hasApiKey) && prev?.apiKey) {
+            const { hasApiKey: _h, ...rest } = n;
+            return { ...rest, apiKey: prev.apiKey };
+          }
+          const { hasApiKey: _h2, ...rest } = n || {};
+          return rest;
+        });
       }
       // Guard against a second client racing with empty defaults and wiping the cluster.
       if (
@@ -241,9 +339,17 @@ ipcMain.handle('settings:save', async (e, settings) => {
         }
       }
     }
-    const tmp = settingsPath() + '.tmp';
-    await fsp.writeFile(tmp, JSON.stringify(settings, null, 2), 'utf-8');
-    await fsp.rename(tmp, settingsPath()); // atomic replace
+    const file = settingsPath();
+    await withWriteLock(file, async () => {
+      const tmp = uniqueTmpPath(file);
+      await fsp.writeFile(tmp, JSON.stringify(settings, null, 2), 'utf-8');
+      try {
+        await fsp.rename(tmp, file);
+      } catch {
+        await fsp.copyFile(tmp, file);
+        await fsp.unlink(tmp).catch(() => {});
+      }
+    });
     return { success: true };
   } catch (err) {
     return { error: err.message };
@@ -295,7 +401,13 @@ let liveSession = {
   clientId: null
 };
 
-ipcMain.handle('session:get', () => ({ ...liveSession }));
+ipcMain.handle('session:get', (e) => {
+  const snap = { ...liveSession };
+  if (e?.webConsole) {
+    return { ...snap, nodes: stripNodeApiKeys(snap.nodes) };
+  }
+  return snap;
+});
 
 ipcMain.handle('session:publish', (_e, snapshot = {}) => {
   try {
@@ -305,7 +417,7 @@ ipcMain.handle('session:publish', (_e, snapshot = {}) => {
     const nodes = fromWeb
       ? liveSession.nodes
       : Array.isArray(snapshot.nodes)
-        ? snapshot.nodes
+        ? stripNodeApiKeys(snapshot.nodes)
         : liveSession.nodes;
     const incomingRev =
       typeof snapshot.chatsRevision === 'number' ? snapshot.chatsRevision : liveSession.chatsRevision || 0;
@@ -341,6 +453,9 @@ ipcMain.handle('session:publish', (_e, snapshot = {}) => {
         ? snapshot.workspaceTokenUsage
         : null;
     const workspaceTokenUsage = incomingUsage || liveSession.workspaceTokenUsage;
+    if (typeof snapshot.workspacePath === 'string' && snapshot.workspacePath.trim()) {
+      rememberWorkspaceRoot(snapshot.workspacePath);
+    }
     liveSession = {
       updatedAt: Date.now(),
       workspacePath:
@@ -459,8 +574,12 @@ function logFilePath() {
 
 function redactLog(text) {
   return String(text || '')
+    .replace(/sk-or-v1-[A-Za-z0-9_\-]+/g, 'sk-or-v1-[redacted]')
     .replace(/sk-[A-Za-z0-9_\-]{8,}/g, 'sk-[redacted]')
+    .replace(/xai-[A-Za-z0-9_\-]+/gi, 'xai-[redacted]')
+    .replace(/AIzaSy[A-Za-z0-9_\-]{20,}/g, 'AIzaSy[redacted]')
     .replace(/Bearer\s+[A-Za-z0-9._\-+/=]+/gi, 'Bearer [redacted]')
+    .replace(/"apiKey"\s*:\s*"[^"]*"/gi, '"apiKey":"[redacted]"')
     .replace(/(api[_-]?key|token|password|passphrase|authorization)\s*[=:]\s*\S+/gi, '$1=[redacted]');
 }
 
@@ -918,7 +1037,8 @@ ipcMain.handle('workspace:select-folder', async (e) => {
     return null; // web clients use workspace:resolve-path after a typed path
   }
   const result = await dialog.showOpenDialog(mainWindow, { properties: ['openDirectory', 'createDirectory'] });
-  return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0];
+  if (result.canceled || result.filePaths.length === 0) return null;
+  return rememberWorkspaceRoot(result.filePaths[0]);
 });
 
 ipcMain.handle('workspace:resolve-path', async (_e, dirPath) => {
@@ -927,6 +1047,7 @@ ipcMain.handle('workspace:resolve-path', async (_e, dirPath) => {
     if (!resolved) return { error: 'Path required' };
     const st = await fsp.stat(resolved);
     if (!st.isDirectory()) return { error: 'Not a directory' };
+    rememberWorkspaceRoot(resolved);
     return { path: resolved };
   } catch {
     return { error: 'Path not found' };
@@ -977,6 +1098,7 @@ ipcMain.handle('workspace:createProject', async (_e, name) => {
       return { error: 'Invalid project path' };
     }
     await fsp.mkdir(dest, { recursive: true });
+    rememberWorkspaceRoot(dest);
     return { path: dest, name: cleaned };
   } catch (err) {
     return { error: err.message || 'Failed to create project' };
@@ -992,6 +1114,7 @@ function projectChatsPath(root) {
 ipcMain.handle('project:loadChats', async (_e, root) => {
   try {
     if (!root) return { conversations: [], activeConversationId: null };
+    rememberWorkspaceRoot(root);
     const raw = await fsp.readFile(projectChatsPath(root), 'utf-8');
     const data = JSON.parse(raw);
     return {
@@ -1006,6 +1129,7 @@ ipcMain.handle('project:loadChats', async (_e, root) => {
 ipcMain.handle('project:saveChats', async (_e, root, payload) => {
   try {
     if (!root) return { error: 'No workspace' };
+    rememberWorkspaceRoot(root);
     const dir = path.join(root, '.localagents');
     await fsp.mkdir(dir, { recursive: true });
     const body = JSON.stringify({
@@ -1014,14 +1138,7 @@ ipcMain.handle('project:saveChats', async (_e, root, payload) => {
       conversations: Array.isArray(payload?.conversations) ? payload.conversations : []
     });
     const file = projectChatsPath(root);
-    const tmp = file + '.tmp';
-    await fsp.writeFile(tmp, body, 'utf-8');
-    try {
-      await fsp.rename(tmp, file);
-    } catch {
-      await fsp.copyFile(tmp, file);
-      await fsp.unlink(tmp).catch(() => {});
-    }
+    await atomicWriteFile(file, body);
     return { success: true };
   } catch (err) {
     return { error: err.message };
@@ -1030,7 +1147,8 @@ ipcMain.handle('project:saveChats', async (_e, root, payload) => {
 
 ipcMain.handle('fs:read-dir', async (_e, dirPath) => {
   try {
-    return await readDirSorted(dirPath);
+    const abs = assertWithinWorkspace(dirPath);
+    return await readDirSorted(abs);
   } catch (err) {
     return { error: err.message };
   }
@@ -1038,9 +1156,10 @@ ipcMain.handle('fs:read-dir', async (_e, dirPath) => {
 
 ipcMain.handle('fs:read-file', async (_e, filePath) => {
   try {
-    const stat = await fsp.stat(filePath);
+    const abs = assertWithinWorkspace(filePath);
+    const stat = await fsp.stat(abs);
     if (stat.size > 5 * 1024 * 1024) return { error: `File too large to open (${(stat.size / 1048576).toFixed(1)} MB)` };
-    const buf = await fsp.readFile(filePath);
+    const buf = await fsp.readFile(abs);
     if (isBinary(buf)) return { error: 'Binary file - not opened in editor' };
     return { content: buf.toString('utf-8') };
   } catch (err) {
@@ -1049,32 +1168,35 @@ ipcMain.handle('fs:read-file', async (_e, filePath) => {
 });
 
 async function atomicWriteFile(filePath, body) {
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  const tmp = filePath + '.tmp';
-  await fsp.writeFile(tmp, body, 'utf-8');
-  try {
-    // Keep last-good copy for plan/progress recovery
-    if (
-      fs.existsSync(filePath) &&
-      (filePath.includes(`${path.sep}.localagents${path.sep}plans${path.sep}`) ||
-        filePath.includes(`${path.sep}.localagents${path.sep}progress${path.sep}`))
-    ) {
-      await fsp.copyFile(filePath, filePath + '.bak').catch(() => {});
+  return withWriteLock(filePath, async () => {
+    await fsp.mkdir(path.dirname(filePath), { recursive: true });
+    const tmp = uniqueTmpPath(filePath);
+    await fsp.writeFile(tmp, body, 'utf-8');
+    try {
+      // Keep last-good copy for plan/progress recovery
+      if (
+        fs.existsSync(filePath) &&
+        (filePath.includes(`${path.sep}.localagents${path.sep}plans${path.sep}`) ||
+          filePath.includes(`${path.sep}.localagents${path.sep}progress${path.sep}`))
+      ) {
+        await fsp.copyFile(filePath, filePath + '.bak').catch(() => {});
+      }
+      await fsp.rename(tmp, filePath);
+    } catch {
+      await fsp.copyFile(tmp, filePath);
+      await fsp.unlink(tmp).catch(() => {});
     }
-    await fsp.rename(tmp, filePath);
-  } catch {
-    await fsp.copyFile(tmp, filePath);
-    await fsp.unlink(tmp).catch(() => {});
-  }
+  });
 }
 
 ipcMain.handle('fs:write-file', async (_e, filePath, content) => {
   try {
+    const abs = assertWithinWorkspace(filePath);
     let body = content;
-    if (isPackageJsonPath(filePath)) {
+    if (isPackageJsonPath(abs)) {
       body = sanitizePackageJsonContent(String(content ?? '')).content;
     }
-    await atomicWriteFile(filePath, body);
+    await atomicWriteFile(abs, body);
     return { success: true };
   } catch (err) {
     return { error: err.message };
@@ -1083,8 +1205,9 @@ ipcMain.handle('fs:write-file', async (_e, filePath, content) => {
 
 ipcMain.handle('fs:create-file', async (_e, filePath) => {
   try {
-    await fsp.mkdir(path.dirname(filePath), { recursive: true });
-    if (!fs.existsSync(filePath)) await fsp.writeFile(filePath, '', 'utf-8');
+    const abs = assertWithinWorkspace(filePath);
+    await fsp.mkdir(path.dirname(abs), { recursive: true });
+    if (!fs.existsSync(abs)) await fsp.writeFile(abs, '', 'utf-8');
     return { success: true };
   } catch (err) {
     return { error: err.message };
@@ -1093,7 +1216,8 @@ ipcMain.handle('fs:create-file', async (_e, filePath) => {
 
 ipcMain.handle('fs:create-folder', async (_e, folderPath) => {
   try {
-    await fsp.mkdir(folderPath, { recursive: true });
+    const abs = assertWithinWorkspace(folderPath);
+    await fsp.mkdir(abs, { recursive: true });
     return { success: true };
   } catch (err) {
     return { error: err.message };
@@ -1102,8 +1226,9 @@ ipcMain.handle('fs:create-folder', async (_e, folderPath) => {
 
 ipcMain.handle('fs:delete', async (_e, targetPath) => {
   try {
+    const abs = assertWithinWorkspace(targetPath);
     // Send to Recycle Bin rather than hard-deleting
-    await shell.trashItem(targetPath);
+    await shell.trashItem(abs);
     return { success: true };
   } catch (err) {
     return { error: err.message };
@@ -1111,7 +1236,12 @@ ipcMain.handle('fs:delete', async (_e, targetPath) => {
 });
 
 ipcMain.handle('fs:reveal', (_e, targetPath) => {
-  shell.showItemInFolder(targetPath);
+  try {
+    const abs = assertWithinWorkspace(targetPath);
+    shell.showItemInFolder(abs);
+  } catch (err) {
+    appendLog('warn', `fs:reveal blocked: ${err.message}`);
+  }
 });
 
 function isBinary(buf) {
@@ -1274,6 +1404,7 @@ async function toolWriteFile(root, args) {
 
 ipcMain.handle('tools:exec', async (_e, root, name, args) => {
   try {
+    if (root) rememberWorkspaceRoot(root);
     switch (name) {
       case 'read_file': return await toolReadFile(root, args);
       case 'list_dir': return await toolListDir(root, args);
@@ -1299,7 +1430,8 @@ ipcMain.handle('tools:exec', async (_e, root, name, args) => {
           timeoutMs,
           echo: true,
           capture: true,
-          idleMs
+          idleMs,
+          kind: 'agent'
         });
         const cap = timeoutSec > 180 ? 24000 : 12000;
         const tail = res.output.length > cap ? '[...output truncated...]\n' + res.output.slice(-cap) : res.output;
@@ -1656,9 +1788,14 @@ ipcMain.handle('workspace:hasPackageJson', async (_e, root) => {
 // POWERSHELL EXECUTION
 // ==========================================
 
-const activeProcs = new Set();
+const userProcs = new Set();
+const agentProcs = new Set();
 const TERMINAL_BUF_MAX = 200000;
 let terminalBuffer = '';
+
+function activeProcCount() {
+  return userProcs.size + agentProcs.size;
+}
 
 function appendTerminalBuffer(text) {
   if (!text) return;
@@ -1679,7 +1816,7 @@ function getTerminalSnapshot(maxChars = 12000) {
     terminalBuffer.length > limit ? terminalBuffer.slice(-limit) : terminalBuffer;
   return {
     content: text || '(terminal is empty)',
-    running: activeProcs.size > 0,
+    running: activeProcCount() > 0,
     chars: text.length
   };
 }
@@ -1690,17 +1827,24 @@ function killTree(proc) {
   execFile('taskkill', ['/PID', String(proc.pid), '/T', '/F'], () => {});
 }
 
-function killAllProcesses() {
-  for (const p of activeProcs) killTree(p);
-  activeProcs.clear();
+function killUserProcesses() {
+  for (const p of userProcs) killTree(p);
+  userProcs.clear();
 }
 
-function runPowerShell(command, cwd, { timeoutMs = 0, echo = true, capture = false, idleMs = 45000 } = {}) {
+function killAllProcesses() {
+  killUserProcesses();
+  for (const p of agentProcs) killTree(p);
+  agentProcs.clear();
+}
+
+function runPowerShell(command, cwd, { timeoutMs = 0, echo = true, capture = false, idleMs = 45000, kind = 'agent' } = {}) {
   return new Promise(resolve => {
     let output = '';
     let timedOut = false;
     let idleTimedOut = false;
     const idleLimit = idleMs > 0 ? idleMs : 45000;
+    const bucket = kind === 'user' ? userProcs : agentProcs;
     const wrapped =
       `$env:CI='1'; $env:NONINTERACTIVE='1'; $env:TERM='dumb'; ` +
       `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $ProgressPreference = 'SilentlyContinue'; ${command}`;
@@ -1715,7 +1859,7 @@ function runPowerShell(command, cwd, { timeoutMs = 0, echo = true, capture = fal
     } catch (err) {
       return resolve({ code: -1, output: err.message, timedOut });
     }
-    activeProcs.add(proc);
+    bucket.add(proc);
     if (echo) echoTerminal(`\n> ${command}\n`);
 
     let idleTimer = null;
@@ -1744,17 +1888,17 @@ function runPowerShell(command, cwd, { timeoutMs = 0, echo = true, capture = fal
     proc.on('close', code => {
       if (timer) clearTimeout(timer);
       if (idleTimer) clearTimeout(idleTimer);
-      activeProcs.delete(proc);
+      bucket.delete(proc);
       if (echo) {
         if (idleTimedOut) echoTerminal(`\n[idle timeout ${idleLimit}ms — no output]\n`);
         echoTerminal(`\n[exit ${code}]\n`);
       }
-      send('terminal:state', { running: activeProcs.size > 0 });
+      send('terminal:state', { running: activeProcCount() > 0 });
       resolve({ code, output, timedOut });
     });
     proc.on('error', err => {
       if (timer) clearTimeout(timer);
-      activeProcs.delete(proc);
+      bucket.delete(proc);
       resolve({ code: -1, output: output + err.message, timedOut });
     });
     send('terminal:state', { running: true });
@@ -1762,14 +1906,15 @@ function runPowerShell(command, cwd, { timeoutMs = 0, echo = true, capture = fal
 }
 
 ipcMain.handle('terminal:execute', async (_e, command, cwd) => {
-  const res = await runPowerShell(command, cwd, { echo: true });
-  return { code: res.code };
+  const res = await runPowerShell(command, cwd, { echo: true, capture: true, kind: 'user' });
+  return { code: res.code, output: res.output || '' };
 });
 
 ipcMain.handle('terminal:kill', () => {
-  const had = activeProcs.size > 0;
-  killAllProcesses();
-  send('terminal:state', { running: false });
+  // User Stop only kills interactive terminal procs — not in-flight agent run_command.
+  const had = userProcs.size > 0;
+  killUserProcesses();
+  send('terminal:state', { running: activeProcCount() > 0 });
   return { success: had };
 });
 
@@ -1908,9 +2053,15 @@ async function nodeStatus(node) {
   }
 }
 
-ipcMain.handle('ollama:status', async (_e, nodes) => {
-  // Ping every node in parallel - total wait is the slowest node, not the sum
-  const entries = await Promise.all(nodes.map(async n => [n.id, await nodeStatus(n)]));
+ipcMain.handle('ollama:status', async (e, nodes) => {
+  // Ping every node in parallel - total wait is the slowest node, not the sum.
+  // Web clients omit apiKeys; restore them from disk before frontier probes.
+  const entries = await Promise.all(
+    (nodes || []).map(async n => {
+      const key = await resolveApiKeyForRequest(e, n.url, n.apiKey, n.id);
+      return [n.id, await nodeStatus({ ...n, apiKey: key || n.apiKey })];
+    })
+  );
   return Object.fromEntries(entries);
 });
 
@@ -2195,10 +2346,11 @@ async function streamOpenAI(requestId, url, apiKey, body, channel) {
   }
 }
 
-ipcMain.handle('ollama:chat', async (_e, requestId, url, body, nodeType, apiKey) => {
+ipcMain.handle('ollama:chat', async (e, requestId, url, body, nodeType, apiKey) => {
   const base = url.replace(/\/+$/, '');
-  
-  if (nodeType === 'openai' || apiKey) {
+  const resolvedKey = await resolveApiKeyForRequest(e, url, apiKey);
+
+  if (nodeType === 'openai' || resolvedKey) {
     // Translate Ollama-style messages (optional images[]) to OpenAI multimodal content parts
     const messages = (body.messages || []).map(m => {
       if (!m.images || !m.images.length) return { role: m.role, content: m.content };
@@ -2218,7 +2370,7 @@ ipcMain.handle('ollama:chat', async (_e, requestId, url, body, nodeType, apiKey)
       temperature: body.options?.temperature ?? 0.3,
       max_tokens: Number.isFinite(requested) && requested > 0 ? requested : frontierMaxTokens(base)
     };
-    return await streamOpenAI(requestId, base, apiKey, openAiBody, 'ollama:chat-event');
+    return await streamOpenAI(requestId, base, resolvedKey, openAiBody, 'ollama:chat-event');
   }
 
   let doneSent = false;
@@ -2250,16 +2402,21 @@ ipcMain.handle('ollama:chat', async (_e, requestId, url, body, nodeType, apiKey)
 // TOKEN/SEC BENCHMARK RUNNER
 // ==========================================
 
-ipcMain.handle('ollama:benchmark', async (_e, node, model) => {
-  const url = (node.url || '').replace(/\/+$/, '');
-  const isFrontier = node.type === 'openai' || !!node.apiKey;
+ipcMain.handle('ollama:benchmark', async (e, node, model) => {
+  const resolvedKey = await resolveApiKeyForRequest(e, node?.url, node?.apiKey, node?.id);
+  const isFrontier = node.type === 'openai' || !!resolvedKey || !!node.apiKey;
 
   if (isFrontier) {
     const started = Date.now();
     try {
-      const endpoint = url.endsWith('/chat/completions') ? url : `${url}/chat/completions`;
+      const baseUrl = normalizeFrontierEndpoint(node.url);
+      const endpoint = baseUrl.endsWith('/chat/completions') ? baseUrl : `${baseUrl}/chat/completions`;
       const headers = { 'Content-Type': 'application/json' };
-      if (node.apiKey) headers['Authorization'] = `Bearer ${node.apiKey}`;
+      const key = resolvedKey || node.apiKey || '';
+      if (key) {
+        headers['Authorization'] = `Bearer ${key}`;
+        if (baseUrl.includes('googleapis.com')) headers['x-goog-api-key'] = key;
+      }
 
       const resp = await fetch(endpoint, {
         method: 'POST',
@@ -2285,7 +2442,7 @@ ipcMain.handle('ollama:benchmark', async (_e, node, model) => {
         evalTokens: tokens,
         evalTokPerSec,
         promptTokens,
-        promptTokPerSec: Math.round(promptTokens / (totalMs / 2000)),
+        promptTokPerSec: Math.round(promptTokens / (totalMs / 1000)),
         loadMs: 0,
         totalMs
       };
@@ -2478,6 +2635,19 @@ ipcMain.handle('system:detect-hardware', async () => {
     const [name, mem] = smi.trim().split('\n')[0].split(',').map(s => s.trim());
     gpu = name.replace(/^NVIDIA\s+/i, '').replace(/^GeForce\s+/i, '');
     vramGB = Math.round(parseInt(mem, 10) / 1024);
+  } else {
+    // AMD / Intel Arc / iGPU fallback via WMI when nvidia-smi is absent.
+    const video = await run('powershell.exe', [
+      '-NoProfile',
+      '-Command',
+      '(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -and $_.Name -notmatch "Microsoft Basic" } | Select-Object -First 1 Name, AdapterRAM) | ForEach-Object { "$($_.Name)|$($_.AdapterRAM)" }'
+    ]);
+    if (video.trim()) {
+      const [name, ram] = video.trim().split('|').map(s => s.trim());
+      gpu = (name || '').replace(/^AMD\s+/i, '');
+      const bytes = parseInt(ram, 10);
+      if (Number.isFinite(bytes) && bytes > 0) vramGB = Math.max(1, Math.round(bytes / 1024 ** 3));
+    }
   }
   // RAM speed -> approximate dual-channel bandwidth: MT/s * 8 bytes * channels
   let ramMTs = 0;

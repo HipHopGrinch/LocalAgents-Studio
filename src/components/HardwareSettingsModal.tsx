@@ -19,7 +19,7 @@ import {
   EyeOff
 } from 'lucide-react';
 import { EndpointNode, NodeConfig, HardwareProfile, ModelMeta, NodeRole } from '../types';
-import { GPU_PRESETS, RAM_PRESETS } from '../config/defaults';
+import { GPU_PRESETS, RAM_PRESETS, guessGpuBandwidth } from '../config/defaults';
 import { TaskId } from '../config/modelCatalog';
 import { pullModel } from '../lib/ollamaClient';
 import {
@@ -190,6 +190,8 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
       );
       return { ...n, modelMeta, modelPrefs, models };
     });
+    // Keep ref in sync immediately so overlapping inspectModel calls don't clobber each other.
+    nodesRef.current = updated as EndpointNode[];
     onUpdateNodes(updated);
   };
 
@@ -417,7 +419,9 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     try {
       const detected = await window.electronAPI.detectHardware();
       if (!currentNode) return;
-      const updated = nodes.map(n => {
+      const gpuName = detected.gpu || currentNode.hardware.gpu;
+      const guessedBw = guessGpuBandwidth(gpuName);
+      const updated = nodesRef.current.map(n => {
         if (n.id === currentNode.id) {
           return {
             ...n,
@@ -427,7 +431,8 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
               gpu: detected.gpu || n.hardware.gpu,
               vramGB: detected.vramGB || n.hardware.vramGB,
               ramGB: detected.ramGB || n.hardware.ramGB,
-              ramBandwidthGBs: detected.ramBandwidthGBs || n.hardware.ramBandwidthGBs
+              ramBandwidthGBs: detected.ramBandwidthGBs || n.hardware.ramBandwidthGBs,
+              gpuBandwidthGBs: guessedBw || n.hardware.gpuBandwidthGBs
             }
           };
         }
@@ -1601,7 +1606,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
 
               <label className="block space-y-1.5">
                 <span className="text-[11px] text-zinc-400">
-                  {webStatus?.hasPassword ? 'Change password' : 'Set password'} (min 4 characters)
+                  {webStatus?.hasPassword ? 'Change password' : 'Set password'} (min 8 characters)
                 </span>
                 <div className="flex gap-2">
                   <div className="relative flex-1">
@@ -2078,7 +2083,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                   value={nodesIOPassphrase}
                   onChange={(e) => setNodesIOPassphrase(e.target.value)}
                   className="w-full mt-1 bg-[#121215] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1.5 outline-none text-xs"
-                  placeholder="Min. 4 characters"
+                  placeholder="Min. 8 characters"
                 />
               </div>
 

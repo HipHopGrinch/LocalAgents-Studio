@@ -24,10 +24,23 @@ export function toolContinuationLimit(maxAgentSteps?: number): number {
 }
 
 const DESTRUCTIVE_CMD =
-  /\brm\s+-rf\b|\bformat\s+[a-z]:|\bdiskpart\b|\bdel\s+\/s\b|\bremove-item\b[^\n]*-recurse[^\n]*-force|\bmkfs\b|\bshutdown\s+\/s\b|\bgit\s+push\b[^\n]*--force|\bgit\s+push\b[^\n]*\s-f\b/i;
+  /\brm\s+-rf\b|\bformat\s+[a-z]:|\bdiskpart\b|\bmkfs\b|\bdd\s+if=|\bshutdown\b|\breboot\b|\bgit\s+push\b[^\n]*(--force|\s-f\b)|\bgit\s+reset\b[^\n]*--hard|\bgit\s+clean\b[^\n]*-[a-z]*f|\bgit\s+checkout\s+--\s+\./i;
+
+/** PowerShell / cmd destructive deletes with flags in any order. */
+function isDestructiveDelete(cmd: string): boolean {
+  const c = cmd.replace(/\s+/g, ' ');
+  if (/\b(remove-item|ri)\b/i.test(c) && /(-\s*recurse|\s-r\b)/i.test(c) && /(-\s*force|\s-fo\b)/i.test(c)) {
+    return true;
+  }
+  if (/\b(del|erase|rd|rmdir)\b/i.test(c) && /\/s\b/i.test(c) && /\/[fq]\b/i.test(c)) {
+    return true;
+  }
+  if (/\bdel\s+\/s\b/i.test(c) || /\brmdir\s+\/s\b/i.test(c)) return true;
+  return false;
+}
 
 export function isDestructiveCommand(cmd: string): boolean {
-  return DESTRUCTIVE_CMD.test(cmd);
+  return DESTRUCTIVE_CMD.test(cmd) || isDestructiveDelete(cmd);
 }
 
 export function commandSignature(tool: ToolCall): string {
@@ -98,11 +111,12 @@ export async function executeTool(tool: ToolCall, deps: ToolExecutorDeps): Promi
       if (!window.electronAPI) {
         return { ...next, status: 'error', result: 'Electron API unavailable' };
       }
-      const absPath = filePath.includes(':')
-        ? filePath
-        : `${deps.workspacePath}\\${filePath.replace(/^[\\/]+/, '')}`;
-      const readRes = await window.electronAPI.readFile(absPath);
-      if (readRes.content === undefined) {
+      // Route through tools:exec so resolveScoped enforces the workspace boundary.
+      const readRes = await window.electronAPI.execTool(deps.workspacePath, 'read_file', {
+        path: filePath,
+        raw: true
+      });
+      if (readRes.error || readRes.content === undefined) {
         return { ...next, status: 'error', result: readRes.error || `Could not read ${filePath}` };
       }
       const editRes = applyEdits(readRes.content, body);

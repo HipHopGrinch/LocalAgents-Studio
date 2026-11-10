@@ -134,9 +134,11 @@ export const ToolActionCard: React.FC<ToolActionCardProps> = ({
         return false;
       }
       if (!window.electronAPI) return false;
-      const absPath = filePath.includes(':') ? filePath : `${workspacePath}\\${filePath.replace(/^[\\/]+/, '')}`;
-      const readRes = await window.electronAPI.readFile(absPath);
-      if (readRes.content === undefined) return false;
+      const readRes = await window.electronAPI.execTool(workspacePath, 'read_file', {
+        path: filePath,
+        raw: true
+      });
+      if (readRes.error || readRes.content === undefined) return false;
       const editRes = applyEdits(readRes.content, nextBody);
       if (editRes.content === undefined) {
         alert(`Could not apply diff: ${editRes.error}`);

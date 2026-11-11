@@ -2403,8 +2403,9 @@ ipcMain.handle('ollama:chat', async (e, requestId, url, body, nodeType, apiKey) 
 // ==========================================
 
 ipcMain.handle('ollama:benchmark', async (e, node, model) => {
+  const url = (node?.url || '').replace(/\/+$/, '');
   const resolvedKey = await resolveApiKeyForRequest(e, node?.url, node?.apiKey, node?.id);
-  const isFrontier = node.type === 'openai' || !!resolvedKey || !!node.apiKey;
+  const isFrontier = node?.type === 'openai' || !!resolvedKey || !!node?.apiKey;
 
   if (isFrontier) {
     const started = Date.now();

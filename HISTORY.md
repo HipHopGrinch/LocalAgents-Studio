@@ -59,13 +59,24 @@ The core goal of LocalAgents Studio is to eliminate costly API token consumption
   - **Immutable tool card state** so running/done/error updates reliably in React.
   - **Universal Fallback Parser:** Markdown fences become writes only when create-intent is detected, an explicit path is present, or the Conductor assigned `expectedFilePath`.
 
-### Phase 4: Conductor Swarm — Contract-First Two-Pass (Current State)
+### Phase 4: Conductor Swarm — Contract-First Two-Pass
 - **Pass 1 (Lead Architect):** High-VRAM `@coder` (or frontier backup) emits a JSON manifest — shared `contractCode` + per-file tasks with locked imports/exports. Thinking blocks stripped before `JSON.parse`.
 - **Contract verify:** Electron writes the contract file and runs isolated `tsc --noEmit`; architect self-corrects once on failure before workers wake.
 - **Pass 2 (GPU workers):** Tasks assigned by live tok/s × complexity × role bonus (`assignSwarmTasksToCluster`); each worker gets the contract injected read-only.
 - **Workspace repair:** After `Promise.allSettled`, project `tsc --noEmit` routes errors back to the owning GPU for a targeted re-prompt.
 - Local-first routing; frontier only when no local Ollama workers are online.
 - Per-node model toggles, soft `roles`, and resizable sidebars unchanged.
+
+### Phase 5: Pillar A — Smart Cluster Auto-Configurator & Cloud Strategist Multi-GPU Router (Current State)
+- **Smart Cluster Auto-Configurator (`src/lib/clusterAdvisor.ts` & `HardwareSettingsModal.tsx`):**
+  - Deterministic **Hardware-Physics Scorer** + 1-click **Cloud Strategist Audit** (sends full cluster JSON inventory to the Frontier model and merges recommendations).
+  - **OS / Display VRAM Overhead Profiles:** `windows_desktop` (`1.0 GB` reserve), `headless_linux` (`0.2 GB` reserve -> `10.8 GB` usable on an 11 GB GTX 1080 Ti), and `igpu_display` (`0.1 GB` reserve -> `5.9 GB` usable on a 6 GB Laptop RTX 3060).
+  - **Zero-Thrashing Model Pinning:** Automatically pins 1 optimal primary generative model (`activeModel`) per local GPU and disables secondary/spilling models (`disabledModels`) so Ollama never unloads/reloads multi-GB weights mid-workflow.
+  - **Architecture-Aware Context Caps (`num_ctx`):** Caps Pascal (`GTX 1080 Ti`) at `8K–12K` so FP32 prefill stays snappy, 6 GB Ampere (`RTX 3060`) at `8K` to prevent system RAM spill, and 16 GB Blackwell/Ada (`RTX 5070 Ti`) at `16K–32K`.
+  - **Cluster Role Specialties (`NodeSpecialty`):** Assigns `architect`, `heavy_coder`, `module_coder`, `reviewer`, `scout`, and `strategist` badges across nodes and recommends 1-click `ollama pull` tags from `MODEL_CATALOG`.
+- **Cloud Strategist Pass-1 Routing & Wave-Balanced Multi-GPU Scheduling (`src/lib/swarmContract.ts`, `src/lib/tools.ts`, `src/components/AgentChat.tsx`):**
+  - Optional **Cloud Strategist** toggle (`cloudStrategistEnabled`) in Conductor routes Pass-1 Swarm decomposition (~500 tokens) to an online Cloud Frontier node (or falls back to the local `architect` GPU) with the full `CLUSTER WORKER ROSTER`.
+  - Wave-aware GPU load balancing (`waveLoadByGpu` in `assignSwarmTasksToCluster` and `loadByNodeId` in `assignJobsToCluster`) honors `targetNodeId` and spreads concurrent tasks across all online GPUs simultaneously (`high` -> `architect`, `medium` -> `module_coder`, `low` -> `scout`).
 
 ---
 
@@ -75,10 +86,12 @@ The core goal of LocalAgents Studio is to eliminate costly API token consumption
 |---|---|
 | [`electron/main.cjs`](electron/main.cjs) | Electron main process, IPC tools, PowerShell, cluster pinging, and benchmarks. |
 | [`electron/preload.cjs`](electron/preload.cjs) | Context-bridge API for the sandboxed renderer. |
-| [`src/types.ts`](src/types.ts) | Core TypeScript types for nodes, benchmarks, tool calls, chat messages, and settings. |
+| [`src/types.ts`](src/types.ts) | Core TypeScript types for nodes (`NodeSpecialty`, `vramOverheadMode`), benchmarks, tool calls, chat messages, and settings (`cloudStrategistEnabled`). |
 | [`src/config/defaults.ts`](src/config/defaults.ts) | Default nodes, roles, personas, and settings. |
-| [`src/lib/tools.ts`](src/lib/tools.ts) | System prompts, parsers, diff patcher, and routing helpers. |
-| [`src/lib/swarmContract.ts`](src/lib/swarmContract.ts) | Contract-first Swarm manifest parse/prompts, Lead Architect selection, tok/s assignment, tsc error grouping. |
+| [`src/lib/clusterAdvisor.ts`](src/lib/clusterAdvisor.ts) | Smart Cluster Auto-Configurator (Hardware-Physics scorer, VRAM overhead profiles, `num_ctx` tuner, 1-model-per-GPU pinning, and Cloud Strategist JSON audit). |
+| [`src/lib/clusterInventory.ts`](src/lib/clusterInventory.ts) | Formats live cluster roster (including node IDs, specialties, and usable VRAM) for prompts. |
+| [`src/lib/tools.ts`](src/lib/tools.ts) | System prompts, parsers, diff patcher, specialty-aware `selectBestEndpointForTask`, and load-balanced `assignJobsToCluster`. |
+| [`src/lib/swarmContract.ts`](src/lib/swarmContract.ts) | Contract-first Swarm manifest parse/prompts, Cloud Strategist `findLeadArchitect`, and wave-balanced `assignSwarmTasksToCluster`. |
 | [`src/lib/agentLoop.ts`](src/lib/agentLoop.ts) | Immutable tool execution, auto-apply, continuation helpers. |
 | [`src/lib/ollamaClient.ts`](src/lib/ollamaClient.ts) | Streaming chat client (Ollama + OpenAI-compatible Frontier). |
 | [`src/components/AgentChat.tsx`](src/components/AgentChat.tsx) | Agent Conductor chat, pipeline dispatch, tool review cards. |

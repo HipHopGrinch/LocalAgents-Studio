@@ -16,21 +16,34 @@ import {
   Globe,
   Copy,
   Eye,
-  EyeOff
+  EyeOff,
+  Sparkles,
+  Zap,
+  Cloud
 } from 'lucide-react';
 import { EndpointNode, NodeConfig, HardwareProfile, ModelMeta, NodeRole } from '../types';
 import { GPU_PRESETS, RAM_PRESETS, guessGpuBandwidth } from '../config/defaults';
 import { TaskId } from '../config/modelCatalog';
-import { pullModel } from '../lib/ollamaClient';
+import { pullModel, streamChat } from '../lib/ollamaClient';
 import {
   ALL_NODE_ROLES,
   assignAllowedRoles,
   assignDevNode,
   findNodeHoldingDev,
+  getEnabledModelsForNode,
   isEmbeddingModelName,
+  isFrontierNode,
   isRoleAuto,
   normalizeClusterNodes
 } from '../lib/tools';
+import {
+  SPECIALTY_META,
+  applyClusterAutoConfigPlan,
+  buildCloudClusterAuditPrompt,
+  buildClusterAutoConfigPlan,
+  mergeCloudAuditIntoPlan,
+  type ClusterAutoConfigPlan
+} from '../lib/clusterAdvisor';
 import { modelSupportsThinking, normalizeThinkingInfo } from '../lib/thinking';
 import { ModelHubPanel } from './hardware/ModelHubPanel';
 import { InstalledModelsPanel } from './hardware/InstalledModelsPanel';
@@ -149,6 +162,12 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   const [nodesIOMergeMode, setNodesIOMergeMode] = useState<'replace' | 'merge'>('replace');
   const [nodesIOBusy, setNodesIOBusy] = useState(false);
   const [nodesIOError, setNodesIOError] = useState<string | null>(null);
+
+  // Smart Cluster Auto-Configurator & Cloud Strategist Audit state
+  const [advisorPlan, setAdvisorPlan] = useState<ClusterAutoConfigPlan | null>(null);
+  const [advisorOpen, setAdvisorOpen] = useState(false);
+  const [advisorCloudBusy, setAdvisorCloudBusy] = useState(false);
+  const [advisorStatusNote, setAdvisorStatusNote] = useState<string | null>(null);
 
   const nodesRef = useRef(nodes);
   nodesRef.current = nodes;
@@ -412,6 +431,106 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     handleUpdateHardware('gpu', preset.name);
     handleUpdateHardware('vramGB', preset.vramGB);
     handleUpdateHardware('gpuBandwidthGBs', preset.bandwidth);
+  };
+
+  const handleSetVramOverheadMode = (mode: 'windows_desktop' | 'headless_linux' | 'igpu_display') => {
+    if (!currentNode) return;
+    const reserve =
+      mode === 'headless_linux' ? 0.2 : mode === 'igpu_display' ? 0.1 : 1.0;
+    const updated = nodes.map(n => {
+      if (n.id !== currentNode.id) return n;
+      return {
+        ...n,
+        hardware: {
+          ...n.hardware,
+          vramOverheadMode: mode,
+          reserveVramGB: reserve
+        }
+      };
+    });
+    onUpdateNodes(updated);
+  };
+
+  const handleRunSmartAutoConfig = (applyImmediately = false) => {
+    const plan = buildClusterAutoConfigPlan(nodesRef.current);
+    setAdvisorPlan(plan);
+    setAdvisorOpen(true);
+    if (applyImmediately) {
+      const updated = applyClusterAutoConfigPlan(nodesRef.current, plan);
+      onUpdateNodes(normalizeClusterNodes(updated));
+      setAdvisorStatusNote('Applied Physics-optimized roles, pinned primary models, and set optimal num_ctx caps.');
+    } else {
+      setAdvisorStatusNote('Generated Hardware-Physics plan. Review below or click Apply to update all nodes.');
+    }
+  };
+
+  const handleApplyAdvisorPlan = (planToApply?: ClusterAutoConfigPlan) => {
+    const plan = planToApply || advisorPlan;
+    if (!plan) return;
+    const updated = applyClusterAutoConfigPlan(nodesRef.current, plan);
+    onUpdateNodes(normalizeClusterNodes(updated));
+    setAdvisorStatusNote(
+      plan.source === 'cloud_strategist'
+        ? 'Applied Cloud Strategist + Physics cluster configuration!'
+        : 'Applied Smart Hardware-Physics cluster configuration!'
+    );
+  };
+
+  const handleRunCloudStrategistAudit = async () => {
+    const frontierNodes = nodesRef.current.filter(
+      n => isFrontierNode(n) && n.online && getEnabledModelsForNode(n).length > 0
+    );
+    const fallbackPlanner = nodesRef.current
+      .filter(n => n.online && !isFrontierNode(n) && getEnabledModelsForNode(n).length > 0)
+      .sort((a, b) => (b.hardware.vramGB || 0) - (a.hardware.vramGB || 0))[0];
+
+    const auditorNode = frontierNodes[0] || fallbackPlanner;
+    if (!auditorNode) {
+      setAdvisorStatusNote('No online Frontier API or local GPU node available to run the audit.');
+      return;
+    }
+    const enabled = getEnabledModelsForNode(auditorNode);
+    const auditorModel =
+      auditorNode.activeModel && enabled.includes(auditorNode.activeModel)
+        ? auditorNode.activeModel
+        : enabled[0];
+
+    const basePlan = advisorPlan || buildClusterAutoConfigPlan(nodesRef.current);
+    setAdvisorPlan(basePlan);
+    setAdvisorOpen(true);
+    setAdvisorCloudBusy(true);
+    setAdvisorStatusNote(`Auditing cluster inventory with ${auditorNode.name} (${auditorModel})...`);
+
+    try {
+      const prompt = buildCloudClusterAuditPrompt(nodesRef.current, basePlan);
+      const { done } = streamChat(
+        auditorNode.url,
+        {
+          model: auditorModel,
+          messages: [
+            {
+              role: 'system',
+              content: 'You are an expert distributed GPU systems architect. Respond ONLY with valid JSON.'
+            },
+            { role: 'user', content: prompt }
+          ],
+          options: { temperature: 0.1, num_ctx: 8192 }
+        },
+        () => {},
+        auditorNode.type,
+        auditorNode.apiKey
+      );
+      const res = await done;
+      const merged = mergeCloudAuditIntoPlan(res.content, basePlan, `${auditorNode.name} (${auditorModel})`);
+      setAdvisorPlan(merged);
+      const updated = applyClusterAutoConfigPlan(nodesRef.current, merged);
+      onUpdateNodes(normalizeClusterNodes(updated));
+      setAdvisorStatusNote(`Cloud Strategist audit complete via ${auditorNode.name} (${auditorModel}) and applied to cluster!`);
+    } catch (err: any) {
+      setAdvisorStatusNote(`Cloud audit failed (${err?.message || 'error'}) — kept deterministic Physics plan.`);
+    } finally {
+      setAdvisorCloudBusy(false);
+    }
   };
 
   const handleDetectHardware = async () => {
@@ -895,6 +1014,157 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                 className="min-w-0 flex-1 select-text bg-[#18181d] border border-[#2c2c38] text-zinc-200 rounded px-2 py-1 text-[10px] font-mono"
               />
             </div>
+
+            {/* Smart Cluster Auto-Configurator Banner */}
+            <div className="px-3 py-2.5 border-b border-[#27272a] bg-gradient-to-r from-indigo-950/35 via-[#16161d] to-violet-950/30 flex flex-col gap-2">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Sparkles className="w-4 h-4 text-amber-400 shrink-0" />
+                  <div className="min-w-0">
+                    <div className="text-xs font-bold text-zinc-100 flex items-center gap-1.5 flex-wrap">
+                      <span>Smart Cluster Auto-Configurator</span>
+                      <span className="text-[9px] font-mono uppercase px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+                        Multi-GPU Physics + Cloud Strategist
+                      </span>
+                    </div>
+                    <p className="text-[10px] text-zinc-400 truncate">
+                      Pins 1 primary model per GPU to stop VRAM swap thrashing, tunes <code className="text-zinc-300">num_ctx</code> &amp; VRAM overhead (Headless Linux 0.2GB / iGPU 0.1GB), and assigns optimal cluster roles.
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={() => handleRunSmartAutoConfig(true)}
+                    disabled={nodes.length === 0 || advisorCloudBusy}
+                    className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold bg-indigo-600 hover:bg-indigo-500 text-white shadow flex items-center gap-1.5 transition disabled:opacity-40"
+                    title="Inspects all nodes, pins the best primary model per GPU, sets optimal num_ctx & VRAM overhead, and assigns roles"
+                  >
+                    <Zap className="w-3.5 h-3.5 text-amber-300" />
+                    <span>Smart Auto-Configure Cluster</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleRunCloudStrategistAudit}
+                    disabled={nodes.length === 0 || advisorCloudBusy}
+                    className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold bg-sky-600/25 hover:bg-sky-600/40 text-sky-200 border border-sky-500/40 flex items-center gap-1.5 transition disabled:opacity-40"
+                    title="Calls your Cloud Frontier model (or top local planner) with the full cluster JSON inventory to audit roles, primary models, and context limits"
+                  >
+                    <Cloud className="w-3.5 h-3.5 text-sky-300" />
+                    <span>{advisorCloudBusy ? 'Auditing Cluster…' : 'Cloud Strategist Audit'}</span>
+                  </button>
+                  {advisorPlan && (
+                    <button
+                      type="button"
+                      onClick={() => setAdvisorOpen(v => !v)}
+                      className="px-2 py-1 rounded text-[10px] text-zinc-400 hover:text-zinc-200 bg-[#1e1e26] border border-[#2e2e3a]"
+                    >
+                      {advisorOpen ? 'Hide Plan' : 'Show Plan'}
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {advisorStatusNote && (
+                <div className="text-[11px] text-emerald-300 bg-emerald-950/30 border border-emerald-500/30 rounded px-2.5 py-1 flex items-center justify-between gap-2">
+                  <span>{advisorStatusNote}</span>
+                  <button
+                    type="button"
+                    onClick={() => setAdvisorStatusNote(null)}
+                    className="text-zinc-400 hover:text-white text-[10px]"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+
+              {advisorOpen && advisorPlan && (
+                <div className="bg-[#111116] border border-[#2b2b38] rounded-lg p-3 space-y-2.5 max-h-60 overflow-y-auto">
+                  <div className="flex items-center justify-between gap-2 flex-wrap border-b border-[#23232e] pb-1.5">
+                    <div className="text-[11px] text-zinc-200 font-medium">
+                      {advisorPlan.summary}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleApplyAdvisorPlan(advisorPlan)}
+                      className="px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-semibold shrink-0"
+                    >
+                      Re-Apply All Recommendations
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                    {advisorPlan.nodes.map(rec => {
+                      const meta = SPECIALTY_META[rec.specialty];
+                      const targetNode = nodes.find(n => n.id === rec.nodeId);
+                      return (
+                        <div
+                          key={rec.nodeId}
+                          onClick={() => setSelectedNodeId(rec.nodeId)}
+                          className="p-2.5 rounded-lg bg-[#17171f] border border-[#292936] hover:border-indigo-500/50 cursor-pointer space-y-1.5 transition"
+                        >
+                          <div className="flex items-center justify-between gap-1.5">
+                            <span className="text-xs font-bold text-zinc-100 truncate">{rec.nodeName}</span>
+                            <span className={`text-[9px] font-mono uppercase px-1.5 py-0.5 rounded border ${meta.badgeClass}`}>
+                              {meta.shortLabel}: {meta.label}
+                            </span>
+                          </div>
+                          <div className="text-[10px] font-mono text-zinc-300 flex flex-wrap gap-x-3 gap-y-0.5">
+                            <span>
+                              Primary:{' '}
+                              <strong className="text-indigo-300">
+                                {rec.primaryModel || '(none installed)'}
+                              </strong>
+                            </span>
+                            {rec.primaryModel && rec.modelNumCtx[rec.primaryModel] && (
+                              <span>
+                                num_ctx:{' '}
+                                <strong className="text-emerald-300">
+                                  {(rec.modelNumCtx[rec.primaryModel] / 1024).toFixed(0)}k
+                                </strong>
+                              </span>
+                            )}
+                            <span>
+                              Usable VRAM:{' '}
+                              <strong className="text-amber-300">{rec.usableVramGB} GB</strong> (reserve {rec.recommendedReserveVramGB} GB)
+                            </span>
+                          </div>
+                          <p className="text-[10px] text-zinc-400 leading-relaxed">{rec.rationale}</p>
+                          {rec.disabledModels.length > 0 && (
+                            <div className="text-[10px] text-amber-300/90">
+                              • Disabled {rec.disabledModels.length} secondary model{rec.disabledModels.length === 1 ? '' : 's'} ({rec.disabledModels.slice(0, 3).join(', ')}) to prevent VRAM swap thrashing.
+                            </div>
+                          )}
+                          {rec.recommendedPulls.length > 0 && targetNode && targetNode.type !== 'openai' && (
+                            <div className="pt-1 flex items-center gap-1.5 flex-wrap">
+                              <span className="text-[9px] uppercase tracking-wider text-zinc-500">Suggested Pulls:</span>
+                              {rec.recommendedPulls.map(p => {
+                                const pullKey = `${targetNode.id}:${p.tag}`;
+                                const prog = pullProgress[pullKey];
+                                return (
+                                  <button
+                                    key={p.tag}
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handlePullModel(targetNode, p.tag);
+                                    }}
+                                    disabled={!!prog}
+                                    className="px-2 py-0.5 rounded text-[10px] font-mono bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-200 border border-indigo-500/30 transition"
+                                    title={`${p.tag} (${p.sizeGB} GB · ~${p.estimatedTokPerSec} tok/s) — ${p.reason}`}
+                                  >
+                                    {prog ? `${p.tag} (${prog.status})` : `⬇ ollama pull ${p.tag}`}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
             <div className="flex-1 flex overflow-hidden min-h-0">
             {/* Left Node Sidebar — full width on phone until a node is opened */}
             <div
@@ -949,7 +1219,19 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                               Dev
                             </span>
                           )}
-                          <span className="truncate">{isFrontier ? 'Frontier API' : `${n.hardware.vramGB}GB VRAM`}</span>
+                          {n.specialty && SPECIALTY_META[n.specialty] && (
+                            <span
+                              className={`shrink-0 text-[9px] uppercase tracking-wide px-1 rounded border ${SPECIALTY_META[n.specialty].badgeClass}`}
+                              title={SPECIALTY_META[n.specialty].description}
+                            >
+                              {SPECIALTY_META[n.specialty].shortLabel}
+                            </span>
+                          )}
+                          <span className="truncate">
+                            {isFrontier
+                              ? 'Frontier API'
+                              : `${Math.max(0, +(n.hardware.vramGB - (n.hardware.reserveVramGB ?? 1)).toFixed(1))}/${n.hardware.vramGB}GB`}
+                          </span>
                         </span>
                         {n.online && n.latency !== null && (
                           <span className="text-emerald-400 shrink-0">{n.latency}ms</span>
@@ -1021,6 +1303,14 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                         ) : (
                           <span className="text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 px-2 py-0.5 rounded font-mono">
                             Local Ollama Node
+                          </span>
+                        )}
+                        {currentNode.specialty && SPECIALTY_META[currentNode.specialty] && (
+                          <span
+                            className={`text-[10px] px-2 py-0.5 rounded font-mono border ${SPECIALTY_META[currentNode.specialty].badgeClass}`}
+                            title={SPECIALTY_META[currentNode.specialty].description}
+                          >
+                            {SPECIALTY_META[currentNode.specialty].label}
                           </span>
                         )}
                       </div>
@@ -1328,7 +1618,12 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                           />
                         </div>
                         <div>
-                          <label className="text-[11px] text-zinc-400">Reserved VRAM (GB)</label>
+                          <label className="text-[11px] text-zinc-400">
+                            Reserved VRAM (GB)
+                            <span className="text-[10px] text-emerald-400 font-mono ml-1.5">
+                              ({Math.max(0, +(currentNode.hardware.vramGB - (currentNode.hardware.reserveVramGB ?? 1)).toFixed(1))} GB usable)
+                            </span>
+                          </label>
                           <input
                             type="number"
                             step="0.1"
@@ -1337,6 +1632,61 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                             className="w-full mt-1 bg-[#1a1a20] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1 outline-none font-mono"
                           />
                         </div>
+                      </div>
+
+                      {/* Quick OS / Display VRAM Overhead Mode Presets */}
+                      <div className="space-y-1.5 pt-1 border-t border-[#22222c]">
+                        <div className="flex items-center justify-between gap-2 flex-wrap">
+                          <label className="text-[11px] text-zinc-400">
+                            OS / Display VRAM Overhead Profile:
+                          </label>
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            {[
+                              {
+                                id: 'windows_desktop' as const,
+                                label: 'Windows Desktop (1.0 GB)',
+                                reserve: 1.0,
+                                hint: 'Primary Windows monitor connected to this GPU'
+                              },
+                              {
+                                id: 'headless_linux' as const,
+                                label: 'Headless Linux (0.2 GB)',
+                                reserve: 0.2,
+                                hint: 'Headless Linux server (e.g. GTX 1080 Ti with 10.8 GB usable VRAM)'
+                              },
+                              {
+                                id: 'igpu_display' as const,
+                                label: 'iGPU Display / 100% Dedicated (0.1 GB)',
+                                reserve: 0.1,
+                                hint: 'Windows/Linux display runs on iGPU — dGPU 100% free for Ollama (e.g. Laptop RTX 3060)'
+                              }
+                            ].map(preset => {
+                              const active =
+                                currentNode.hardware.vramOverheadMode === preset.id ||
+                                Math.abs((currentNode.hardware.reserveVramGB ?? 1) - preset.reserve) < 0.05;
+                              return (
+                                <button
+                                  key={preset.id}
+                                  type="button"
+                                  onClick={() => handleSetVramOverheadMode(preset.id)}
+                                  title={preset.hint}
+                                  className={`px-2 py-0.5 rounded text-[10px] border transition ${
+                                    active
+                                      ? 'bg-emerald-600/30 text-emerald-200 border-emerald-500/50 font-semibold'
+                                      : 'bg-[#1a1a20] border-[#2b2b36] text-zinc-400 hover:text-zinc-200'
+                                  }`}
+                                >
+                                  {preset.label}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                        {currentNode.advisorNote && (
+                          <div className="text-[10px] text-indigo-300/90 bg-indigo-950/25 border border-indigo-500/25 rounded px-2.5 py-1.5 leading-relaxed">
+                            <strong className="text-indigo-200">Cluster Advisor:</strong> {currentNode.advisorNote}
+                          </div>
+                        )}
                       </div>
                     </div>
                   )}

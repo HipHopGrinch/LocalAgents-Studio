@@ -35,6 +35,10 @@ export interface SwarmTask {
    * Empty/omitted = can run in the first wave (after the shared contract).
    */
   dependsOn?: string[];
+  /** Optional target GPU node id recommended by Cloud Strategist / Lead Architect */
+  targetNodeId?: string;
+  /** Optional target model id recommended by Cloud Strategist / Lead Architect */
+  targetModel?: string;
 }
 
 export interface SwarmManifest {
@@ -328,7 +332,9 @@ export function parseSwarmManifest(raw: string, userTask: string): SwarmManifest
             filePath,
             userTask
           ),
-          role: String(t.role || preferredRole || 'Worker')
+          role: String(t.role || preferredRole || 'Worker'),
+          targetNodeId: typeof t.targetNodeId === 'string' && t.targetNodeId.trim() ? t.targetNodeId.trim() : undefined,
+          targetModel: typeof t.targetModel === 'string' && t.targetModel.trim() ? t.targetModel.trim() : undefined
         } as SwarmTask;
       })
       .filter((t: SwarmTask) => {
@@ -774,7 +780,8 @@ export function buildLeadArchitectPrompt(
   existingSnippets: string,
   approvedPlanText?: string | null,
   workLog?: string | null,
-  devHostSection?: string | null
+  devHostSection?: string | null,
+  nodes?: EndpointNode[]
 ): string {
   const planSection = approvedPlanText?.trim()
     ? `
@@ -794,10 +801,31 @@ Workers may run on other GPUs; they still write into this Dev workspace. Install
 The workspace, installs, and terminal live on the Dev PC where LocalAgents Studio is open — not necessarily on the GPU that runs this pass. Plan file paths for that Dev workspace.
 `;
 
+  const onlineWorkers = (nodes || []).filter(
+    n => n.online && !isFrontierNode(n) && getEnabledModelsForNode(n).length > 0
+  );
+  const clusterRosterSection = onlineWorkers.length > 0
+    ? `
+### CLUSTER WORKER ROSTER (Distribute tasks across these GPUs in parallel waves!)
+${onlineWorkers.map(n => {
+  const totalVram = n.hardware?.vramGB ?? 16;
+  const reserve = n.hardware?.reserveVramGB ?? 1;
+  const usable = Math.max(1, +(totalVram - reserve).toFixed(1));
+  const enabled = getEnabledModelsForNode(n);
+  const pinned = n.activeModel && enabled.includes(n.activeModel) ? n.activeModel : enabled[0];
+  return `- targetNodeId: "${n.id}" | ${n.name} (${n.hardware?.gpu || 'GPU'}, ${usable}GB usable VRAM) | specialty: ${n.specialty || 'auto'} | roles: [${(n.roles || []).join(', ') || 'auto'}] | primaryModel: "${pinned}"`;
+}).join('\n')}
+When decomposing tasks, you MAY set \`"targetNodeId"\` on each task to balance parallel execution across ALL online GPUs simultaneously:
+- Assign \`"high"\` complexity core logic/entry files to the \`architect\` / \`heavy_coder\` GPU (e.g., 16GB RTX 5070 Ti).
+- Assign \`"medium"\` complexity modules/components/services to the \`module_coder\` GPU (e.g., 11GB GTX 1080 Ti with 10.8GB usable VRAM).
+- Assign \`"low"\` complexity config/styles/HTML/utility files to the \`scout\` GPU (e.g., 6GB Laptop RTX 3060 with 5.9GB usable VRAM).
+`
+    : '';
+
   return `You are the Lead Architect for LocalAgents Studio's Conductor Swarm.
 Decompose a multi-file coding request into a JSON manifest. The shared contract is written first; then workers write ONE file each — **in dependency order** (waves). Independent files in the same wave may run in parallel.
 When an APPROVED PLAN is present, honor the chosen stack and scope — never invent React/TypeScript for native C++/Win32 or static HTML.
-${hostBlock}
+${hostBlock}${clusterRosterSection}
 ### WORKSPACE CONTEXT
 Existing file tree:
 ${workspaceOverview || '(empty or unknown)'}
@@ -819,7 +847,7 @@ Respond ONLY with a valid JSON object. Do NOT write full implementation bodies i
    - typescript: prefer \`src/types/swarm-contract.ts\` with real shared types that typecheck **alone** (no \`import\` from \`three\`, \`react\`, \`@react-three/fiber\`, etc. until deps are installed — use plain interfaces/types only).
    - For R3F / Three.js apps, put \`@react-three/fiber\` in package.json (never the obsolete unscoped \`react-three-fiber\` name).
    - static-web / python / go / rust / node / native-win32: prefer \`SWARM.md\` with SHORT shared notes (names, APIs, rules). Markdown is fine — not TypeScript unless the stack is typescript.
-3. \`tasks\`: 2–4 distinct \`filePath\`s (never the contract file). List foundation files **before** files that import them. Each needs SHORT \`instructions\` (1–3 sentences). Never paste Intent Analysis, option lists, or the approved-plan essay into \`instructions\` or \`contractCode\`.
+3. \`tasks\`: 2–5 distinct \`filePath\`s (never the contract file). List foundation files **before** files that import them. Each needs SHORT \`instructions\` (1–3 sentences). Never paste Intent Analysis, option lists, or the approved-plan essay into \`instructions\` or \`contractCode\`. Include optional \`"targetNodeId"\` from the CLUSTER WORKER ROSTER to spread independent tasks across all GPUs in parallel.
 4. \`dependsOn\` (REQUIRED when a file imports/uses another task file): array of those \`filePath\` strings. Example: logic that imports models → \`"dependsOn": ["internal/models/game.go"]\`. Omit or \`[]\` only when the file truly needs nothing else from this task list (contract is always written first).
 5. \`verifyCommand\`: one shell check, or null when typescript (tsc is run separately). For native-win32, prefer verifying \`build.bat\` exists and is a real batch file.
 
@@ -1052,12 +1080,35 @@ function nodeAllowsPreferred(n: EndpointNode, preferred: SwarmPreferredRole): bo
 }
 
 /**
- * Lead Architect (Pass-1): largest local model that may plan.
- * Frontier is the fallback only when no local planner-capable node is online.
+ * Lead Architect (Pass-1):
+ * - When `preferCloudStrategist` is enabled and a Frontier/Cloud node is online with an enabled model,
+ *   routes Pass-1 decomposition to the Cloud Strategist (~500 tokens) so it can decompose the manifest
+ *   and assign each file to the ideal local GPU in the cluster.
+ * - Otherwise picks the largest local model that may plan (or Frontier as fallback when all local planners are offline).
  */
 export function findLeadArchitect(
-  nodes: EndpointNode[]
-): { node: EndpointNode; model: string; tokPerSec: number; usedFrontierBackup?: boolean } | null {
+  nodes: EndpointNode[],
+  opts?: { preferCloudStrategist?: boolean }
+): { node: EndpointNode; model: string; tokPerSec: number; usedFrontierBackup?: boolean; usedCloudStrategist?: boolean } | null {
+  if (opts?.preferCloudStrategist) {
+    const cloudNodes = nodes.filter(
+      n => n.online && isFrontierNode(n) && getEnabledModelsForNode(n).length > 0 && nodeAllowsRole(n, 'planner')
+    );
+    if (cloudNodes.length > 0) {
+      const strategist = cloudNodes.find(n => n.specialty === 'strategist') || cloudNodes[0];
+      const enabled = getEnabledModelsForNode(strategist);
+      const model = strategist.activeModel && enabled.includes(strategist.activeModel)
+        ? strategist.activeModel
+        : enabled[0];
+      return {
+        node: strategist,
+        model,
+        tokPerSec: nodeTokPerSec(strategist, model),
+        usedCloudStrategist: true
+      };
+    }
+  }
+
   const picked = pickCapableReviewTarget(nodes, 'planner');
   if (!picked) return null;
   const explicitPlanners = nodes.filter(
@@ -1072,10 +1123,11 @@ export function findLeadArchitect(
 }
 
 /**
- * Assign Pass-2 tasks across online GPUs.
- * High and medium files use the largest enabled local model allowed for the role.
- * Low / one-file tasks may use a smaller faster model. Speed only breaks equal-size ties.
- * Frontier is the pool only when no local worker is online.
+ * Assign Pass-2 tasks across online GPUs with wave-aware multi-GPU load balancing.
+ * - Honors `task.targetNodeId` / `task.targetModel` from the Cloud Strategist / Lead Architect when valid.
+ * - Matches `node.specialty` (`architect`/`heavy_coder` -> high, `module_coder` -> medium, `scout` -> low).
+ * - Balances concurrent assignments across distinct GPU endpoints so a 3-node cluster (e.g. 5070 Ti + 1080 Ti + 3060)
+ *   executes wave files in parallel across all 3 GPUs instead of stacking everything onto one card.
  */
 export function assignSwarmTasksToCluster(
   tasks: SwarmTask[],
@@ -1107,6 +1159,9 @@ export function assignSwarmTasksToCluster(
     });
   }
 
+  // Track how many tasks in this wave have been assigned to each physical GPU URL
+  const waveLoadByGpu = new Map<string, number>();
+
   return sortedTasks.map(task => {
     const eligible = activeNodes.filter(n => nodeAllowsPreferred(n, task.preferredRole));
     // Never fall back to Planner/Reviewer-only GPUs for @coder work.
@@ -1124,14 +1179,68 @@ export function assignSwarmTasksToCluster(
         skippedReason: `No node allows role ${task.preferredRole} — check Allowed Roles`
       };
     }
-    const picked = rankModelsForWeight(candidates, weight);
-    const bestNode = picked?.node || candidates[0];
-    const model = picked?.model || pickBestModelForComplexity(bestNode, weight);
+
+    // 1. Check if Cloud Strategist / Lead Architect explicitly targeted a node that is eligible & idle
+    let chosenNode: EndpointNode | null = null;
+    let chosenModel: string | null = null;
+
+    if (task.targetNodeId) {
+      const targetMatch = candidates.find(
+        n => n.id.toLowerCase() === task.targetNodeId!.toLowerCase() ||
+             n.name.toLowerCase() === task.targetNodeId!.toLowerCase()
+      );
+      if (targetMatch) {
+        const targetLoad = waveLoadByGpu.get(endpointQueueKey(targetMatch)) || 0;
+        const hasIdleAlternative = candidates.some(
+          c => (waveLoadByGpu.get(endpointQueueKey(c)) || 0) === 0
+        );
+        // Honor targetNodeId unless it's already busy in this wave AND another eligible GPU is completely idle
+        if (targetLoad === 0 || !hasIdleAlternative) {
+          chosenNode = targetMatch;
+          const enabled = getEnabledModelsForNode(targetMatch);
+          if (task.targetModel && enabled.includes(task.targetModel)) {
+            chosenModel = task.targetModel;
+          } else if (targetMatch.activeModel && enabled.includes(targetMatch.activeModel)) {
+            chosenModel = targetMatch.activeModel;
+          } else {
+            chosenModel = pickBestModelForComplexity(targetMatch, weight);
+          }
+        }
+      }
+    }
+
+    // 2. Otherwise prefer idle GPUs in this wave, breaking ties with specialty match + rankModelsForWeight
+    if (!chosenNode) {
+      const idleCandidates = candidates.filter(
+        c => (waveLoadByGpu.get(endpointQueueKey(c)) || 0) === 0
+      );
+      const poolToRank = idleCandidates.length > 0 ? idleCandidates : candidates;
+
+      // Filter to specialty match within the idle pool if available
+      const specialtyMatches = poolToRank.filter(c => {
+        if (weight === 'heavy') return c.specialty === 'architect' || c.specialty === 'heavy_coder';
+        if (weight === 'medium') return c.specialty === 'module_coder' || c.specialty === 'heavy_coder';
+        if (weight === 'light') return c.specialty === 'scout' || c.specialty === 'module_coder';
+        return false;
+      });
+
+      const finalPool = specialtyMatches.length > 0 ? specialtyMatches : poolToRank;
+      const picked = rankModelsForWeight(finalPool, weight);
+      chosenNode = picked?.node || finalPool[0];
+      const enabled = getEnabledModelsForNode(chosenNode);
+      // Prefer pinned activeModel if enabled so the GPU never swaps weights mid-wave
+      chosenModel = (chosenNode.activeModel && enabled.includes(chosenNode.activeModel))
+        ? chosenNode.activeModel
+        : (picked?.model || pickBestModelForComplexity(chosenNode, weight));
+    }
+
+    const gpuKey = endpointQueueKey(chosenNode);
+    waveLoadByGpu.set(gpuKey, (waveLoadByGpu.get(gpuKey) || 0) + 1);
 
     return {
       task,
-      node: bestNode,
-      model,
+      node: chosenNode,
+      model: chosenModel || pickBestModelForComplexity(chosenNode, weight),
       usedFrontierBackup,
       skippedReason: usedFrontierBackup
         ? 'Frontier backup — no local Ollama nodes online'

@@ -159,6 +159,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   autoSelectEndpoint: true,
   autoApplyWrites: true,
   autoReview: true,
+  cloudStrategistEnabled: true,
   webConsole: {
     enabled: false,
     port: 3847

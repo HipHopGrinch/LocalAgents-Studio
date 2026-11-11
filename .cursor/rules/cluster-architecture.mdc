@@ -1,0 +1,34 @@
+---
+description: LocalAgents Studio architecture, multi-GPU cluster routing, and Smart Cluster Auto-Configurator conventions
+globs: **/*
+alwaysApply: true
+---
+
+# LocalAgents Studio — Cursor Project Context
+
+## Overview
+LocalAgents Studio is an Electron + React 19 + TypeScript + Vite desktop IDE designed to orchestrate a distributed local Ollama multi-GPU cluster alongside an optional Cloud Frontier API (Gemini / Grok / OpenAI / OpenRouter).
+
+## Reference Cluster Topology & Hardware Rules
+- **Main Rig — RTX 5070 Ti (16 GB VRAM, ~896 GB/s GDDR7, Blackwell):**
+  - Runs Windows desktop (`windows_desktop` overhead profile = `1.0 GB` reserve -> `15.0 GB` usable VRAM).
+  - Specialty: `architect` (`planner`, `coder`, `reviewer`).
+  - Context cap (`num_ctx`): `16K–32K`.
+- **Headless Linux — GTX 1080 Ti (11 GB VRAM, ~484 GB/s GDDR5X, Pascal):**
+  - Runs headless Linux (`headless_linux` overhead profile = `0.2 GB` reserve -> `10.8 GB` usable VRAM).
+  - Specialty: `module_coder` (`coder`, `reviewer`).
+  - Context cap (`num_ctx`): `8K–12K` (Pascal lacks Tensor Cores; capping prefill keeps prompt evaluation fast while fitting 14B Q4_K_M 100% in VRAM).
+- **Laptop — RTX 3060 (6 GB VRAM, ~336 GB/s GDDR6, Ampere):**
+  - Runs Windows with display on the **iGPU** (`igpu_display` overhead profile = `0.1 GB` reserve -> `5.9 GB` usable VRAM, 100% available to Ollama).
+  - Specialty: `scout` (`coder`, `docs`, `reviewer`).
+  - Context cap (`num_ctx`): `8K` (prevents 7B/8B Q4_K_M models from spilling into system RAM).
+- **Cloud Frontier Model (OpenAI-compatible endpoint):**
+  - Specialty: `strategist` (`planner`, `reviewer`).
+  - Used for 1-click **Cloud Strategist Cluster Audit** and lightweight (~500 token) Pass-1 Swarm task decomposition & multi-GPU routing when `cloudStrategistEnabled` is on.
+
+## Key Modules Updated in Pillar A
+- `src/lib/clusterAdvisor.ts`: Deterministic Hardware-Physics Scorer (`buildClusterAutoConfigPlan`, `applyClusterAutoConfigPlan`), VRAM overhead profiles (`recommendReserveVram`), architecture-aware `num_ctx` calculation (`computeOptimalNumCtxForModel`), 1-primary-model-per-GPU pinning (to eliminate Ollama weight-swap thrashing), and Cloud Strategist JSON audit (`buildCloudClusterAuditPrompt`, `mergeCloudAuditIntoPlan`).
+- `src/lib/swarmContract.ts`: Cloud-assisted `findLeadArchitect(nodes, { preferCloudStrategist })`, `CLUSTER WORKER ROSTER` injection in `buildLeadArchitectPrompt`, `targetNodeId` / `targetModel` support on `SwarmTask`, and wave-aware multi-GPU load balancing in `assignSwarmTasksToCluster`.
+- `src/lib/tools.ts`: Specialty-aware `selectBestEndpointForTask` and GPU-load-balanced `assignJobsToCluster`.
+- `src/components/HardwareSettingsModal.tsx`: **Smart Cluster Auto-Configurator** & **Cloud Strategist Audit** banner, 1-click OS/Display VRAM overhead pills (`1.0 GB` Windows Desktop / `0.2 GB` Headless Linux / `0.1 GB` iGPU Display), and node specialty badges.
+- `src/components/AgentChat.tsx` & `src/App.tsx`: **Cloud Strategist** toggle and quick **Smart Auto-Configure** button in the Conductor panel.

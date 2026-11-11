@@ -60,6 +60,8 @@ export interface HardwareProfile {
   ramBandwidthGBs: number; // effective system RAM bandwidth (dual channel)
   reserveVramGB: number; // VRAM kept free for desktop / other apps
   kvCacheType: 'f16' | 'q8_0' | 'q4_0'; // mirrors OLLAMA_KV_CACHE_TYPE on that node (needs flash attention)
+  /** Optional display/OS overhead preset for accurate usable VRAM calculation. */
+  vramOverheadMode?: 'windows_desktop' | 'headless_linux' | 'igpu_display';
 }
 
 export interface BenchmarkResult {
@@ -81,6 +83,15 @@ export interface BenchmarkResult {
 
 export type NodeRole = 'coder' | 'reviewer' | 'docs' | 'planner';
 
+/** Hardware-matched specialized tier badge assigned by Smart Cluster Auto-Configurator / Cloud Strategist. */
+export type NodeSpecialty =
+  | 'architect'
+  | 'heavy_coder'
+  | 'module_coder'
+  | 'reviewer'
+  | 'scout'
+  | 'strategist';
+
 /** Persisted node configuration */
 export interface NodeConfig {
   id: string;
@@ -96,6 +107,10 @@ export interface NodeConfig {
    * Multiple nodes may allow the same role.
    */
   roles?: NodeRole[];
+  /** Specialized hardware role badge (architect, heavy_coder, module_coder, reviewer, scout, strategist). */
+  specialty?: NodeSpecialty;
+  /** Short rationale from Smart Auto-Configure / Cloud Strategist for this node's setup. */
+  advisorNote?: string;
   /**
    * Dev node: workspace, installs, package managers, and run_command live here
    * (the PC where LocalAgents Studio is open). At most one node; independent of
@@ -310,6 +325,8 @@ export interface AppSettings {
   autoApplyWrites?: boolean;
   /** Reviewer continues without waiting. Missing on old settings files means on. */
   autoReview?: boolean;
+  /** Cloud Strategist: use Frontier model for Pass-1 Swarm task routing & node assignment when online. */
+  cloudStrategistEnabled?: boolean;
   /**
    * Local MCP servers (stdio). JSON array: [{ "name", "command", "args": [] }].
    * Remote URLs are ignored. Empty = no MCP tools.

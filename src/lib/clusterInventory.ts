@@ -106,7 +106,12 @@ export function formatClusterInventory(
     const status = n.online ? 'online' : 'offline';
     const dev = n.isDevNode ? ' · Dev' : '';
     const frontier = n.type === 'openai' || n.apiKey ? ' · frontier' : '';
-    lines.push(`- **${n.name}** (${status}${dev}${frontier}) · roles: ${rolesLabel(n)}`);
+    const spec = n.specialty ? ` · specialty: ${n.specialty}` : '';
+    const vram =
+      !frontier && n.hardware?.vramGB
+        ? ` · ${Math.max(0, n.hardware.vramGB - (n.hardware.reserveVramGB || 0)).toFixed(1)}/${n.hardware.vramGB}GB VRAM`
+        : '';
+    lines.push(`- **${n.name}** [id=${n.id}] (${status}${dev}${frontier}${vram}${spec}) · roles: ${rolesLabel(n)}`);
     const enabled = enabledModelsOnNode(n);
     if (!enabled.length) {
       lines.push('  - (no enabled models)');

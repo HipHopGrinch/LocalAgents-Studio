@@ -3,6 +3,7 @@ import {
   AgentPersona,
   ApprovedPlan,
   EndpointNode,
+  NodeConfig,
   ChatMessage,
   ToolCall,
   OpenTab,
@@ -284,6 +285,12 @@ import {
   taskFixesWrittenFiles,
   tasksTooSimilar
 } from '../lib/continuationReview';
+import {
+  SPECIALTY_META,
+  applyClusterAutoConfigPlan,
+  buildClusterAutoConfigPlan
+} from '../lib/clusterAdvisor';
+import { normalizeClusterNodes } from '../lib/tools';
 
 interface AgentChatProps {
   agents: AgentPersona[];
@@ -336,9 +343,17 @@ interface AgentChatProps {
   autoNodeEnabled?: boolean;
   autoApplyEnabled?: boolean;
   autoReviewEnabled?: boolean;
+  cloudStrategistEnabled?: boolean;
   onConductorPrefsChange?: (
-    patch: Partial<Pick<AppSettings, 'swarmEnabled' | 'autoSelectEndpoint' | 'autoApplyWrites' | 'autoReview'>>
+    patch: Partial<
+      Pick<
+        AppSettings,
+        'swarmEnabled' | 'autoSelectEndpoint' | 'autoApplyWrites' | 'autoReview' | 'cloudStrategistEnabled'
+      >
+    >
   ) => void;
+  /** Allow Conductor quick Auto-Configure Cluster button to update node configs */
+  onUpdateNodes?: (nodes: NodeConfig[]) => void;
   /** Inner tool-loop budget (settings.maxAgentSteps). */
   maxAgentSteps?: number;
   /** True while a local/frontier agent turn (or stuck ladder) is in flight — blocks update restart. */
@@ -389,7 +404,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   autoNodeEnabled = true,
   autoApplyEnabled = true,
   autoReviewEnabled = true,
+  cloudStrategistEnabled = true,
   onConductorPrefsChange,
+  onUpdateNodes,
   maxAgentSteps = 12,
   onBusyChange,
   peerConductor = null,
@@ -425,6 +442,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   /** After each coding step: Reviewer runs; ON = auto Send to Planner→Coder / continue, OFF = wait for user */
   const [autoReview, setAutoReview] = useState(autoReviewEnabled);
   const autoReviewRef = useRef(autoReviewEnabled);
+  const [cloudStrategist, setCloudStrategist] = useState<boolean>(cloudStrategistEnabled);
+  const cloudStrategistRef = useRef(cloudStrategistEnabled);
+  cloudStrategistRef.current = cloudStrategist;
   /** Resume depth when user approval is required after a post-step review */
   const pendingReviewResumeRef = useRef<{ depth: number; previousTask: string } | null>(null);
   /**
@@ -2365,7 +2385,9 @@ ${instruction}`,
       }
 
       // ── Pass 1: Generate Shared Contract & Manifest ──
-      architect = findLeadArchitect(nodesRef.current);
+      architect = findLeadArchitect(nodesRef.current, {
+        preferCloudStrategist: cloudStrategistRef.current
+      });
       if (!architect?.node?.online || !getEnabledModelsForNode(architect.node).includes(architect.model)) {
         patchPipelineMsg({
           display:
@@ -2373,7 +2395,11 @@ ${instruction}`,
         });
         return;
       }
-      beginActivity('pass1', 'Pass 1 — Lead Architect', architect.node.name);
+      beginActivity(
+        'pass1',
+        architect.usedCloudStrategist ? 'Pass 1 — Cloud Strategist' : 'Pass 1 — Lead Architect',
+        architect.node.name
+      );
       const swarmTaskText = lockedPlan
         ? `${userText}\n\n${formatApprovedPlanForSwarm(lockedPlan)}`
         : userText;
@@ -2395,7 +2421,8 @@ ${instruction}`,
           snippets,
           lockedPlan ? formatApprovedPlanForSwarm(lockedPlan) : null,
           progressForPrompt() || null,
-          swarmDevHost
+          swarmDevHost,
+          nodesRef.current
         );
         const architectMsgs = [
           {
@@ -6631,7 +6658,11 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                 ) : (
                   nodes.map(n => (
                     <option key={n.id} value={n.id} disabled={!n.online}>
-                      {n.name} {n.online ? `(${n.latency}ms)` : '(Offline)'}
+                      {n.name}
+                      {n.specialty && SPECIALTY_META[n.specialty]
+                        ? ` [${SPECIALTY_META[n.specialty].shortLabel}]`
+                        : ''}{' '}
+                      {n.online ? `(${n.latency}ms)` : '(Offline)'}
                     </option>
                   ))
                 )}
@@ -6725,7 +6756,43 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
             </span>
           </button>
 
+          {onUpdateNodes && nodes.length > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                const plan = buildClusterAutoConfigPlan(nodesRef.current);
+                const updated = applyClusterAutoConfigPlan(nodesRef.current, plan);
+                onUpdateNodes(normalizeClusterNodes(updated));
+                setExecutingPlanNotice('⚡ Smart Auto-Configured cluster roles, primary models, and num_ctx caps.');
+              }}
+              className="w-full flex items-center justify-center space-x-1.5 px-2 py-1 rounded border border-indigo-500/35 bg-indigo-600/15 hover:bg-indigo-600/30 text-indigo-200 font-medium transition"
+              title="Auto-configure primary pinned models, optimal num_ctx caps, VRAM overhead (0.2GB headless / 0.1GB iGPU), and role specialties across all nodes"
+            >
+              <Sparkles className="w-3 h-3 text-amber-300 shrink-0" />
+              <span className="truncate">Smart Auto-Configure</span>
+            </button>
+          )}
+
           <div className="flex flex-col gap-1.5 text-zinc-400">
+            <label
+              className="flex items-center space-x-1.5 cursor-pointer hover:text-zinc-200"
+              title="When enabled and a Cloud Frontier API is online, uses a lightweight (~500 tok) Cloud Strategist call for Pass-1 Swarm task decomposition and multi-GPU routing"
+            >
+              <input
+                type="checkbox"
+                checked={cloudStrategist}
+                onChange={(e) => {
+                  cloudStrategistRef.current = e.target.checked;
+                  setCloudStrategist(e.target.checked);
+                  onConductorPrefsChange?.({ cloudStrategistEnabled: e.target.checked });
+                }}
+                className="rounded border-[#31313e] bg-[#1e1e24] text-sky-500"
+              />
+              <span className="flex items-center gap-1">
+                <span>Cloud Strategist</span>
+                <Cloud className="w-2.5 h-2.5 text-sky-400 shrink-0" />
+              </span>
+            </label>
             <label className="flex items-center space-x-1.5 cursor-pointer hover:text-zinc-200">
               <input
                 type="checkbox"

@@ -1140,29 +1140,42 @@ export function selectBestEndpointForTask(
 
   const lower = taskText.toLowerCase();
 
-  /** Largest enabled model among nodes that allow this role. Local pool first. */
-  const pickForPersona = (role: NodeRole): EndpointNode | undefined => {
+  /** Largest enabled model among nodes that allow this role. Local pool first, honoring specialty tags. */
+  const pickForPersona = (
+    role: NodeRole,
+    preferredSpecialties?: string[],
+    weight: ConductorFileJob['complexity'] = 'heavy'
+  ): EndpointNode | undefined => {
     const allowed = onlineUsable.filter(n => nodeAllowsRole(n, role));
     const local = allowed.filter(n => !isFrontierNode(n));
     const rolePool = local.length > 0 ? local : allowed;
-    return rankModelsForWeight(rolePool, 'heavy')?.node;
+    if (preferredSpecialties?.length) {
+      const specPool = rolePool.filter(n => n.specialty && preferredSpecialties.includes(n.specialty));
+      if (specPool.length > 0) {
+        return rankModelsForWeight(specPool, weight)?.node;
+      }
+    }
+    return rankModelsForWeight(rolePool, weight)?.node;
   };
 
-  if (agentHandle === 'planner') return pickForPersona('planner');
-  if (agentHandle === 'reviewer') return pickForPersona('reviewer');
-  if (agentHandle === 'docs') return pickForPersona('docs');
-  if (agentHandle === 'coder') return pickForPersona('coder');
+  if (agentHandle === 'planner') return pickForPersona('planner', ['architect', 'strategist'], 'heavy');
+  if (agentHandle === 'reviewer') return pickForPersona('reviewer', ['reviewer', 'module_coder', 'architect'], 'medium');
+  if (agentHandle === 'docs') return pickForPersona('docs', ['scout', 'module_coder'], 'light');
 
   if (/\b(test|unit test|readme|document|docstring|comment)\b/.test(lower)) {
-    const hit = pickForPersona('docs');
+    const hit = pickForPersona('docs', ['scout', 'module_coder'], 'light');
     if (hit) return hit;
   }
   if (/\b(review|lint|typo|css|style|color|format|quick)\b/.test(lower)) {
-    const hit = pickForPersona('reviewer');
+    const hit = pickForPersona('coder', ['scout', 'module_coder'], 'light') || pickForPersona('reviewer', ['reviewer', 'module_coder'], 'medium');
     if (hit) return hit;
   }
 
-  return pickForPersona('coder') || rankModelsForWeight(pool, 'heavy')?.node;
+  if (agentHandle === 'coder') {
+    return pickForPersona('coder', ['architect', 'heavy_coder', 'module_coder'], 'heavy');
+  }
+
+  return pickForPersona('coder', ['architect', 'heavy_coder'], 'heavy') || rankModelsForWeight(pool, 'heavy')?.node;
 }
 
 function modelSpeed(n: EndpointNode, model: string): { speed: number; provisional: boolean } {
@@ -1440,10 +1453,17 @@ export function assignJobsToCluster(
     });
   }
 
+  const loadByNodeId = new Map<string, number>();
   return sortedJobs.map(job => {
-    const picked = rankModelsForWeight(pool, job.complexity);
-    const targetNode = picked?.node || pool[0];
+    // Prefer idle GPUs in this batch first so all GPUs work in parallel
+    const minLoad = Math.min(...pool.map(n => loadByNodeId.get(n.id) ?? 0));
+    const leastLoadedPool = pool.filter(n => (loadByNodeId.get(n.id) ?? 0) === minLoad);
+    const activePool = leastLoadedPool.length > 0 ? leastLoadedPool : pool;
+
+    const picked = rankModelsForWeight(activePool, job.complexity);
+    const targetNode = picked?.node || activePool[0];
     const model = picked?.model || pickBestModelForComplexity(targetNode, job.complexity);
+    loadByNodeId.set(targetNode.id, (loadByNodeId.get(targetNode.id) ?? 0) + 1);
     return {
       job,
       node: targetNode,

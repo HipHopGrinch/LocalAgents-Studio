@@ -84,4 +84,4 @@ Artifacts land in `release\`:
 
 Ollama is still installed separately on each machine; the EXE only packages LocalAgents Studio. Your endpoints/API keys stay in `%APPDATA%\LocalAgents Studio\` and are not part of the build.
 
-See [HISTORY.md](HISTORY.md) for architecture and evolution notes.
+**Collaborators / Cursor onboarding:** start with [`AGENTS.md`](AGENTS.md) (history, cluster topology, release ladder, ship process). Architecture evolution notes: [`HISTORY.md`](HISTORY.md).

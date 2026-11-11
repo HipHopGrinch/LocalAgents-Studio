@@ -1,5 +1,7 @@
 # LocalAgents Studio - Project History & Technical Overview
 
+> **Collaborators:** for a Cursor-ready briefing (clone → run → release ladder → “do not regress”), use [`AGENTS.md`](AGENTS.md). This file is the longer architecture / phase narrative.
+
 ## 1. Project Background & Motivation
 **LocalAgents Studio** was created to bridge a critical capability gap in modern AI coding environments: tools like Google Antigravity and Cursor rely heavily on cloud-hosted frontier LLMs and lack first-class native multi-agent execution targeting locally hosted Ollama/vLLM endpoints across a local hardware cluster.
 

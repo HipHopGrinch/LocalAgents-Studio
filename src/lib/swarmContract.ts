@@ -17,6 +17,7 @@ import {
 } from './tools';
 import type { NodeRole } from '../types';
 import { pickCapableReviewTarget } from './continuationReview';
+import { fileContextCapsForTier, type ModelFitTier } from './clusterInventory';
 
 export type SwarmComplexity = 'high' | 'medium' | 'low';
 export type SwarmPreferredRole = '@coder' | '@docs' | '@reviewer';
@@ -370,56 +371,66 @@ function normPathKey(p: string): string {
   return (p || '').replace(/\\/g, '/').trim().toLowerCase();
 }
 
-function basenameNoExt(p: string): string {
-  const base = (p || '').replace(/\\/g, '/').split('/').pop() || '';
-  return base.replace(/\.[^.]+$/, '').toLowerCase();
+const IMPORT_EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.rs', '.h', '.hpp', '.cpp', '.cs'];
+
+/** Resolve `./` and `../` against the importing file. Bare names stay as given — never a basename search. */
+function resolveSpec(fromFile: string, spec: string): string {
+  const raw = spec.replace(/\\/g, '/').trim();
+  if (!raw) return '';
+  if (!raw.startsWith('.')) return raw.replace(/^\//, '');
+  const dir = fromFile.replace(/\\/g, '/').split('/').slice(0, -1);
+  const stack = [...dir];
+  for (const part of raw.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') stack.pop();
+    else stack.push(part);
+  }
+  return stack.join('/');
+}
+
+function lookupTaskPath(byKey: Map<string, string>, fromFile: string, spec: string): string | undefined {
+  const resolved = resolveSpec(fromFile, spec);
+  if (!resolved) return undefined;
+  const candidates = [resolved];
+  if (!/\.[A-Za-z0-9]+$/.test(resolved)) {
+    for (const ext of IMPORT_EXTS) candidates.push(resolved + ext);
+  }
+  for (const c of candidates) {
+    const hit = byKey.get(normPathKey(c));
+    if (hit) return hit;
+  }
+  return undefined;
 }
 
 /**
- * Fill missing dependsOn from requiredImports that clearly name another task file,
- * and drop dependsOn entries that are not sibling tasks (or self).
+ * Fill missing dependsOn from requiredImports that resolve to another task's full relative path.
+ * Basename-only matches are ignored so `src/util.ts` is not tied to `tests/util.ts`.
  */
 export function inferTaskDependsOn(tasks: SwarmTask[]): SwarmTask[] {
   const byKey = new Map(tasks.map(t => [normPathKey(t.filePath), t.filePath]));
-  const byBase = new Map<string, string>();
-  for (const t of tasks) {
-    const b = basenameNoExt(t.filePath);
-    if (b && !byBase.has(b)) byBase.set(b, t.filePath);
-  }
 
   return tasks.map(task => {
     const selfKey = normPathKey(task.filePath);
     const declared = [...(task.dependsOn || [])];
     for (const imp of task.requiredImports || []) {
-      // from './foo' | from "../bar/baz" | "internal/models/game"
       const m =
         imp.match(/from\s+['"]([^'"]+)['"]/i) ||
         imp.match(/#include\s*[<"]([^>"]+)[>"]/i) ||
         imp.match(/['"]([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+)['"]/);
       const raw = (m?.[1] || '').replace(/\\/g, '/');
       if (!raw) continue;
-      const candidates = [
-        raw,
-        raw.replace(/^\.\//, ''),
-        `${raw}.ts`,
-        `${raw}.tsx`,
-        `${raw}.go`,
-        `${raw}.js`
-      ];
-      for (const c of candidates) {
-        const hit = byKey.get(normPathKey(c)) || byBase.get(basenameNoExt(c));
-        if (hit && normPathKey(hit) !== selfKey) declared.push(hit);
-      }
+      const hit = lookupTaskPath(byKey, task.filePath, raw);
+      if (hit && normPathKey(hit) !== selfKey) declared.push(hit);
     }
     const uniq: string[] = [];
     const seen = new Set<string>();
     for (const d of declared) {
-      const key = normPathKey(d);
+      const hit = lookupTaskPath(byKey, task.filePath, d);
+      if (!hit) continue;
+      const key = normPathKey(hit);
       if (!key || key === selfKey || seen.has(key)) continue;
-      const resolved = byKey.get(key);
-      if (!resolved) continue; // only deps that are other tasks in this swarm
       seen.add(key);
-      uniq.push(resolved);
+      uniq.push(hit);
     }
     return { ...task, dependsOn: uniq };
   });
@@ -427,7 +438,7 @@ export function inferTaskDependsOn(tasks: SwarmTask[]): SwarmTask[] {
 
 /**
  * Partition tasks into sequential waves. Within a wave, files may run in parallel.
- * Cycles / unsatisfiable deps fall into the last wave in listed order (best-effort).
+ * A dependency cycle is serialized (one file per wave) instead of one parallel wave.
  */
 export function partitionSwarmTasksIntoWaves(tasks: SwarmTask[]): SwarmTask[][] {
   if (!tasks.length) return [];
@@ -444,8 +455,8 @@ export function partitionSwarmTasksIntoWaves(tasks: SwarmTask[]): SwarmTask[][] 
       if (ok) ready.push(task);
     }
     if (!ready.length) {
-      // Cycle or bad deps — flush rest as one final wave to avoid deadlock
-      waves.push([...remaining.values()]);
+      // Cycle: one task per wave so those files are not written in parallel.
+      for (const task of remaining.values()) waves.push([task]);
       break;
     }
     // Heavier files first within a wave (same as prior assigner preference)
@@ -774,6 +785,122 @@ export function getDefaultConfig(): AppConfig {
   };
 }
 
+function clipText(text: string, max: number): string {
+  const t = (text || '').trim();
+  if (t.length <= max) return t;
+  return `${t.slice(0, max)}\n…(truncated)`;
+}
+
+function stripRepeatedPlan(userTask: string, plan: string): string {
+  const p = plan.trim();
+  if (!p || !userTask.includes(p)) return userTask;
+  return userTask.split(p).join('').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function capSnippetBlob(text: string, maxFiles: number, maxEach: number, maxTotal: number): string {
+  const raw = (text || '').trim();
+  if (!raw) return '(none loaded)';
+  const parts = raw.split(/\n(?=###\s+)/).map(p => p.trim()).filter(Boolean);
+  const chunks = (parts.length ? parts : [raw]).slice(0, maxFiles).map(p =>
+    p.length <= maxEach ? p : `${p.slice(0, maxEach)}\n…(snippet truncated)`
+  );
+  let out = chunks.join('\n\n');
+  if (out.length > maxTotal) out = `${out.slice(0, maxTotal)}\n…(snippets truncated)`;
+  return out;
+}
+
+function overviewPathsOnly(overview: string, maxLines: number): string {
+  const kept: string[] = [];
+  let inFence = false;
+  for (const line of (overview || '').split(/\r?\n/)) {
+    const t = line.trim();
+    if (t.startsWith('```')) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence || !t || t.length > 160) continue;
+    if (/[{};]/.test(t) && t.length > 48) continue;
+    kept.push(line.replace(/\s+$/, ''));
+    if (kept.length >= maxLines) break;
+  }
+  return kept.join('\n') || '(no files)';
+}
+
+function formatStrategistRoster(nodes: EndpointNode[]): string {
+  return nodes
+    .filter(n => n.online && !isFrontierNode(n) && getEnabledModelsForNode(n).length > 0)
+    .map(n => {
+      const enabled = getEnabledModelsForNode(n);
+      const pinned =
+        n.activeModel && enabled.includes(n.activeModel) ? n.activeModel : enabled[0];
+      const total = n.hardware?.vramGB ?? 0;
+      const reserve = n.hardware?.reserveVramGB ?? 0;
+      const usable = total > 0 ? Math.max(0, +(total - reserve).toFixed(1)) : 0;
+      return `- ${n.id} | ${n.name} | ${usable}GB | ${n.specialty || 'auto'} | ${pinned}`;
+    })
+    .join('\n');
+}
+
+function takeNamedSnippets(existing: string, maxFiles: number, maxChars: number): string {
+  const raw = (existing || '').trim();
+  if (!raw) return '';
+  const parts = raw.split(/\n(?=###\s+)/).map(p => p.trim()).filter(Boolean);
+  return (parts.length ? parts : [raw])
+    .slice(0, maxFiles)
+    .map(p => {
+      const lines = p.split('\n');
+      const title = lines[0].replace(/^###\s+/, '').trim() || 'snippet';
+      const body = lines.slice(lines[0].startsWith('###') ? 1 : 0).join('\n').trim();
+      const clipped = body.length > maxChars ? `${body.slice(0, maxChars)}…` : body;
+      return clipped ? `### ${title}\n${clipped}` : `### ${title}`;
+    })
+    .join('\n\n');
+}
+
+export interface CloudStrategistPromptInput {
+  userTask: string;
+  approvedPlanBrief?: string | null;
+  nodes?: EndpointNode[];
+  rosterLines?: string;
+  workspaceOverview?: string;
+  existingSnippets?: string;
+  snippets?: { path: string; body: string }[];
+}
+
+/**
+ * Short Pass-1 packet for the Cloud Strategist (~1.5K tokens): task, plan brief once,
+ * roster lines, file-tree paths, and at most three named snippets.
+ */
+export function buildCloudStrategistPrompt(input: CloudStrategistPromptInput): string {
+  const plan = (input.approvedPlanBrief || '').trim();
+  const task = clipText(stripRepeatedPlan(input.userTask || '', plan), 1200);
+  const planBlock = plan ? clipText(plan, 800) : '';
+  const roster = input.rosterLines?.trim() || formatStrategistRoster(input.nodes || []);
+  const tree = clipText(overviewPathsOnly(input.workspaceOverview || '', 50), 800);
+  const named = input.snippets?.length
+    ? input.snippets
+        .slice(0, 3)
+        .map(s => `### ${s.path}\n${clipText(s.body, 350)}`)
+        .join('\n\n')
+    : takeNamedSnippets(input.existingSnippets || '', 3, 350);
+  return `You are the Cloud Strategist. Decompose the task into a Swarm JSON manifest. JSON only — no implementation bodies.
+
+Paths live on the Dev workspace. Set targetNodeId from the roster so independent files run in parallel.
+
+### TASK
+${task || '(none)'}
+${planBlock ? `\n### APPROVED PLAN (follow this once)\n${planBlock}\n` : ''}
+### ROSTER
+${roster || '(no local workers online)'}
+
+### FILE TREE (paths only)
+${tree}
+${named ? `\n### SNIPPETS (at most 3)\n${named}\n` : ''}
+### OUTPUT
+JSON object with stack, contractFile, short contractCode, and 2–5 tasks (filePath, complexity high|medium|low, preferredRole, requiredExports, requiredImports, dependsOn, 1–3 sentence instructions, optional targetNodeId), plus verifyCommand.
+Do not paste the approved plan into instructions. Output JSON only.`;
+}
+
 export function buildLeadArchitectPrompt(
   userTask: string,
   workspaceOverview: string,
@@ -781,12 +908,25 @@ export function buildLeadArchitectPrompt(
   approvedPlanText?: string | null,
   workLog?: string | null,
   devHostSection?: string | null,
-  nodes?: EndpointNode[]
+  nodes?: EndpointNode[],
+  opts?: { cloudStrategist?: boolean }
 ): string {
-  const planSection = approvedPlanText?.trim()
+  if (opts?.cloudStrategist) {
+    return buildCloudStrategistPrompt({
+      userTask,
+      approvedPlanBrief: approvedPlanText,
+      nodes,
+      workspaceOverview,
+      existingSnippets
+    });
+  }
+  const planText = approvedPlanText?.trim() || '';
+  const taskForPrompt = stripRepeatedPlan(userTask, planText);
+  const cappedSnippets = capSnippetBlob(existingSnippets, 3, 1200, 3600);
+  const planSection = planText
     ? `
 ### APPROVED PLAN (user already chose — follow this architecture)
-${approvedPlanText.trim()}
+${planText}
 `
     : '';
 
@@ -831,14 +971,14 @@ Existing file tree:
 ${workspaceOverview || '(empty or unknown)'}
 
 Relevant existing files:
-${existingSnippets || '(none loaded)'}
+${cappedSnippets}
 
 ### WORK LOG
 ${workLog?.trim() || '(none yet)'}
 Do not assign a task that is already under Done. Do not ask the user a question listed under Already asked.
 
 ### USER REQUEST
-${userTask}
+${taskForPrompt}
 ${planSection}
 ### OUTPUT REQUIREMENTS
 Respond ONLY with a valid JSON object. Do NOT write full implementation bodies in the JSON.
@@ -910,25 +1050,148 @@ Use complexity "high" | "medium" | "low" and preferredRole "@coder" | "@docs" | 
 Output JSON only.`;
 }
 
+function capFileBody(content: string, maxChars: number): string {
+  const text = (content || '').replace(/\r\n/g, '\n');
+  if (text.length <= maxChars) return text;
+  const marker = '\n…(truncated)…\n';
+  const budget = Math.max(80, maxChars - marker.length);
+  const head = Math.floor(budget * 0.65);
+  const tail = budget - head;
+  return `${text.slice(0, head)}${marker}${text.slice(-tail)}`;
+}
+
+/** Export signatures only — not function bodies or the rest of the contract. */
+export function extractContractExports(code: string, maxLines = 40): string {
+  const lines = (code || '').replace(/\r\n/g, '\n').split('\n');
+  const kept: string[] = [];
+  for (const line of lines) {
+    if (!/^\s*export\s+/.test(line)) continue;
+    const sig = /\{/.test(line) && !/\}/.test(line) ? line.replace(/\{.*/, '{ /* … */ }') : line;
+    kept.push(sig.trim());
+    if (kept.length >= maxLines) break;
+  }
+  if (kept.length) return kept.join('\n');
+  const decls = lines.filter(l =>
+    /^\s*(export\s+)?(interface|type|function|class|const|enum)\s+/.test(l)
+  );
+  return decls.slice(0, maxLines).join('\n') || '(no exports parsed)';
+}
+
+/** At most `max` diagnostic lines (error lines preferred). */
+export function capDiagnosticLines(text: string, max = 40): string {
+  const lines = (text || '').split(/\r?\n/);
+  const interesting = lines.filter(l => /error|TS\d+/i.test(l));
+  const source = interesting.length ? interesting : lines.filter(l => l.trim());
+  const picked = source.slice(0, max);
+  const omitted = Math.max(0, source.length - picked.length);
+  const body = picked.join('\n');
+  return omitted > 0 ? `${body}\n…(${omitted} more lines omitted)` : body;
+}
+
+/** ±radius lines around each error, merged when windows overlap. */
+export function sliceErrorWindows(content: string, errors: string, radius = 40): string {
+  const lines = (content || '').replace(/\r\n/g, '\n').split('\n');
+  const nums = [
+    ...new Set(
+      [...(errors || '').matchAll(/\((\d+),\d+\)|:(\d+):\d+/g)]
+        .map(m => Number(m[1] || m[2]))
+        .filter(n => n > 0)
+    )
+  ].sort((a, b) => a - b);
+  if (!nums.length || !lines.length) {
+    return lines
+      .slice(0, 40)
+      .map((l, i) => `${i + 1}|${l}`)
+      .join('\n');
+  }
+  const ranges: [number, number][] = [];
+  for (const n of nums) {
+    const start = Math.max(1, n - radius);
+    const end = Math.min(lines.length, n + radius);
+    const last = ranges[ranges.length - 1];
+    if (last && start <= last[1] + 1) last[1] = Math.max(last[1], end);
+    else ranges.push([start, end]);
+  }
+  return ranges
+    .map(([a, b]) => {
+      const body = lines
+        .slice(a - 1, b)
+        .map((l, i) => `${a + i}|${l}`)
+        .join('\n');
+      return `// lines ${a}-${b}\n${body}`;
+    })
+    .join('\n\n');
+}
+
 export function buildContractRepairPrompt(
   userTask: string,
   previous: SwarmManifest,
-  tscError: string
+  tscError: string,
+  opts?: { tier?: ModelFitTier }
 ): string {
-  return `You previously produced a Swarm TypeScript contract that failed typecheck.
+  const exports = extractContractExports(previous.contractCode);
+  const tightNote =
+    opts?.tier === 'tight' ? '\nTight context: keep contractCode to the export signatures that failed.' : '';
+  const tasks = previous.tasks
+    .map(t => {
+      const exp = t.requiredExports.length ? ` exports: ${t.requiredExports.join('; ')}` : '';
+      return `- ${t.filePath}${exp}`;
+    })
+    .join('\n');
+  const errors = capDiagnosticLines(tscError, 40);
+  return `The swarm contract failed typecheck. Return the full JSON manifest with fixed contractCode. JSON only.
 
-### USER REQUEST
-${userTask}
+### REQUEST
+${clipText(userTask, 800)}
 
-### PREVIOUS MANIFEST (fix contractCode; keep tasks unless a path must change)
-${JSON.stringify(previous, null, 2)}
+### CONTRACT EXPORTS (\`${previous.contractFile}\`)
+${exports}
 
-### TSC ERRORS
-${tscError}
+### TASK PATHS
+${tasks || '(none)'}
 
-Return the FULL corrected JSON manifest (same schema). Fix \`contractCode\` so \`tsc --noEmit\` succeeds.
-Prefer plain exported types/interfaces with **no** third-party imports in \`contractCode\` (workers import packages later).
-If package.json is wrong, use \`@react-three/fiber\` not \`react-three-fiber\`. JSON only.`;
+### ERRORS (≤40)
+${errors}
+
+Keep task file paths. Prefer plain exported types with no third-party imports in contractCode.
+If package.json is wrong, use \`@react-three/fiber\` not \`react-three-fiber\`. Do not paste task essays.${tightNote}`;
+}
+
+export interface SwarmSiblingFile {
+  path: string;
+  exports?: string[];
+  /** Inlined only when this path is a direct dependsOn of the task. */
+  content?: string;
+}
+
+/**
+ * Stable swarm-worker system prompt (~400 tokens): persona, tool skeleton, write only this path.
+ * Dev-host blurb and work log stay out — they belong in the user turn if needed at all.
+ */
+export function buildSwarmWorkerSystemStub(filePath: string, stack?: string): string {
+  const path = (filePath || 'the assigned file').replace(/\\/g, '/');
+  const lang = stack || 'source';
+  return `You are one GPU worker in a Conductor Swarm. Write ONLY \`${path}\` (${lang}).
+Other workers own other paths. Do not rewrite them. The shared contract is read-only.
+Filesystem tools apply to the Dev workspace, not to this GPU.
+
+Emit exactly one tool, then stop:
+<write_file path="${path}">
+complete ${lang} for this path only
+</write_file>
+
+When the current file is already shown, prefer a hunk:
+<edit_file path="${path}">
+<<<<<<< SEARCH
+exact lines
+=======
+new lines
+>>>>>>> REPLACE
+</edit_file>
+
+Rules: no Intent Analysis, no option lists, no markdown plan inside the tag.
+Match required exports. Do not redefine contract types.
+If a sibling is listed as a path plus exports, import it — do not paste that file.`;
 }
 
 export function buildSwarmWorkerPrompt(opts: {
@@ -938,12 +1201,16 @@ export function buildSwarmWorkerPrompt(opts: {
   siblingSummary: string;
   currentFileContent?: string;
   userPrompt: string;
-  /** Dev-host context (workspace/installs on Studio PC) */
+  /** Accepted for compatibility. Not repeated here — the system stub covers the worker role. */
   devHostSection?: string | null;
   stack?: DeliveryStack;
+  tier?: ModelFitTier;
+  siblingFiles?: SwarmSiblingFile[];
 }): string {
   const { task, contractFile, contractCode, siblingSummary, currentFileContent, userPrompt } = opts;
   const stack = opts.stack || 'typescript';
+  const tier = opts.tier ?? 'tight';
+  const caps = fileContextCapsForTier(tier);
   const tsMode = stack === 'typescript' && isTypeScriptContractPath(contractFile);
   const imports = task.requiredImports.length
     ? task.requiredImports.map(i => `- ${i}`).join('\n')
@@ -951,74 +1218,73 @@ export function buildSwarmWorkerPrompt(opts: {
   const exports = task.requiredExports.length
     ? task.requiredExports.map(e => `- ${e}`).join('\n')
     : '- (export what the instructions require)';
-  const hostBlock = opts.devHostSection?.trim()
-    ? `
-### DEVELOPMENT HOST
-${opts.devHostSection.trim()}
-You are a collaborative multimodal worker: generate code for the Dev workspace, and when images are in context analyze them. Tool tags that touch files or the terminal execute on the Dev PC — do not treat your GPU host as the install/run machine.
-`
-    : `
-### DEVELOPMENT HOST
-Workspace files, package installs, and run_command execute on the Dev PC (where Studio is open), not on your GPU host. You still fully collaborate — code, review context, and vision when images are provided — for that Dev workspace.
-`;
-
+  const contractBody =
+    contractCode.length > caps.maxCharsPerFile
+      ? extractContractExports(contractCode)
+      : contractCode;
   const contractBlock = tsMode
-    ? `### STRICT TYPESCRIPT CONTRACT
-1. Import shared types as specified:
+    ? `### CONTRACT (\`${contractFile}\`) — read-only
+Imports:
 ${imports}
-
-2. Read-only contract (\`${contractFile}\`):
-\`\`\`typescript
-${contractCode}
-\`\`\`
-
-3. Export these signatures when listed:
+Exports to provide:
 ${exports}
-
-4. Do NOT redefine types from \`${contractFile}\`.
-5. Scope output strictly to \`${task.filePath}\`.`
-    : `### SHARED NOTES (\`${contractFile}\`) — read-only context, not a TypeScript mandate
+\`\`\`typescript
+${contractBody}
 \`\`\`
-${contractCode}
+Do not redefine types from \`${contractFile}\`.`
+    : `### SHARED NOTES (\`${contractFile}\`)
 \`\`\`
+${capFileBody(contractBody, caps.maxCharsPerFile)}
+\`\`\`
+Write real ${stack} for \`${task.filePath}\` only. No plans inside the file.`;
 
-Write real contents for \`${task.filePath}\` only (${stack}).
-- If this is \`.bat\` / \`.cmd\`: real shell commands (\`@echo off\`, compile/link). NEVER paste plans or Intent Analysis.
-- If this is \`.h\` / \`.hpp\`: include guards and declarations only.
-- If this is \`.cpp\` / \`.c\` / \`.cs\` / \`.rc\`: valid source for that language.
-- Do not invent React/TypeScript unless this path is \`.ts\`/\`.tsx\`.`;
+  const fileBody = currentFileContent?.trim()
+    ? capFileBody(currentFileContent, caps.maxCharsPerFile)
+    : '(new file — create it from scratch)';
 
-  const depNote =
-    task.dependsOn && task.dependsOn.length
-      ? `\nPrerequisite files already written (do not recreate them): ${task.dependsOn.join(', ')}.`
-      : '';
+  const depKeys = new Set((task.dependsOn || []).map(normPathKey));
+  let siblingBlock: string;
+  if (opts.siblingFiles?.length) {
+    const lines = opts.siblingFiles.map(s => {
+      const exp = s.exports?.length ? ` — exports: ${s.exports.join(', ')}` : '';
+      return `- ${s.path}${exp}`;
+    });
+    const inlineCap = Math.min(1500, Math.floor(caps.maxCharsPerFile / 2));
+    let budget = Math.min(caps.maxTotalChars, inlineCap * 2);
+    const inlined: string[] = [];
+    for (const s of opts.siblingFiles) {
+      if (!depKeys.has(normPathKey(s.path)) || !s.content || budget <= 0) continue;
+      const body = capFileBody(s.content, Math.min(inlineCap, budget));
+      inlined.push(`#### ${s.path}\n\`\`\`\n${body}\n\`\`\``);
+      budget -= body.length;
+    }
+    siblingBlock = [`### SIBLINGS (path + exports)`, lines.join('\n'), inlined.length ? `### DIRECT DEPENDENCIES\n${inlined.join('\n\n')}` : '']
+      .filter(Boolean)
+      .join('\n');
+  } else {
+    siblingBlock = `### SIBLINGS\n${capFileBody(siblingSummary || '(none)', Math.min(2000, caps.maxTotalChars))}`;
+  }
 
-  return `You are an autonomous GPU Worker in a distributed Conductor Swarm.
-You are assigned to implement ONE specific file: \`${task.filePath}\` (stack: ${stack}).
-Independent siblings may run in parallel; files you depend on are already on disk.
+  const depNote = task.dependsOn?.length
+    ? `Prerequisites already on disk: ${task.dependsOn.join(', ')}.`
+    : '';
+
+  return `Implement ONLY \`${task.filePath}\` (stack: ${stack}).
 ${depNote}
-${hostBlock}
 ${contractBlock}
 
-### SIBLING / PREREQUISITE CONTEXT
-${siblingSummary}
+### CURRENT FILE
+${fileBody}
 
-### CURRENT FILE CONTENT
-${currentFileContent?.trim()
-  ? currentFileContent
-  : '(new file — create it from scratch)'}
+${siblingBlock}
 
-### TASK INSTRUCTIONS
+### BRIEF
+${clipText(userPrompt, 500)}
+
+### TASK
 ${task.instructions}
 
-### OVERALL REQUEST (brief — do not paste this into the file)
-${userPrompt}
-
-Output the complete file using:
-<write_file path="${task.filePath}">
-...complete source for this path only...
-</write_file>
-Output ONLY valid source code inside <write_file>. Do not include conversational preambles, summaries, reviews, or plans. Never put Intent Analysis, option lists, or markdown plans inside the write_file body.`;
+Emit one <edit_file path="${task.filePath}"> hunk if the current file is shown, otherwise one <write_file path="${task.filePath}">. This path only.`;
 }
 
 export function buildRepairWorkerPrompt(opts: {
@@ -1027,37 +1293,33 @@ export function buildRepairWorkerPrompt(opts: {
   contractCode: string;
   currentFileContent: string;
   tscErrors: string;
+  /** Accepted for compatibility. Omitted so the repair packet stays on the error window. */
   devHostSection?: string | null;
+  tier?: ModelFitTier;
 }): string {
-  const host = opts.devHostSection?.trim()
-    ? `\n### DEVELOPMENT HOST\n${opts.devHostSection.trim()}\nFixes apply to the Dev workspace; installs/runtime are on that PC.\n`
-    : '';
-  return `You own \`${opts.task.filePath}\` in a Conductor Swarm. Workspace typecheck failed for your file.
-${host}
-### CONTRACT (\`${opts.contractFile}\`) — read-only
-\`\`\`typescript
-${opts.contractCode}
-\`\`\`
+  const tier = opts.tier ?? 'tight';
+  const errors = capDiagnosticLines(opts.tscErrors, 40);
+  const windows = sliceErrorWindows(opts.currentFileContent, opts.tscErrors, 40);
+  const exports = extractContractExports(opts.contractCode);
+  const preferEdit = tier === 'tight';
+  const how = preferEdit
+    ? `Use <edit_file path="${opts.task.filePath}"> SEARCH/REPLACE hunks on the windows below. Do not rewrite the whole file.`
+    : `Prefer <edit_file path="${opts.task.filePath}"> hunks. Use <write_file path="${opts.task.filePath}"> only when a hunk cannot fix the window.`;
+  return `Repair ONLY \`${opts.task.filePath}\`.
 
-### REQUIRED EXPORTS
-${opts.task.requiredExports.map(e => `- ${e}`).join('\n') || '(see file)'}
+### CONTRACT EXPORTS (\`${opts.contractFile}\`)
+${exports}
 
-### REQUIRED IMPORTS
-${opts.task.requiredImports.map(i => `- ${i}`).join('\n') || '(see file)'}
+### YOUR EXPORTS
+${opts.task.requiredExports.map(e => `- ${e}`).join('\n') || '(see windows)'}
 
-### CURRENT FILE
-\`\`\`
-${opts.currentFileContent}
-\`\`\`
+### ERRORS (≤40)
+${errors}
 
-### TSC ERRORS (fix these)
-${opts.tscErrors}
+### WINDOWS (±40 lines)
+${windows}
 
-Output a corrected full file via:
-<write_file path="${opts.task.filePath}">
-...fixed code...
-</write_file>
-Output ONLY valid source code inside <write_file> — no conversational text, no summaries, and no planning essays.`;
+${how}`;
 }
 
 function nodeTokPerSec(n: EndpointNode, model: string): number {
@@ -1084,7 +1346,9 @@ function nodeAllowsPreferred(n: EndpointNode, preferred: SwarmPreferredRole): bo
  * - When `preferCloudStrategist` is enabled and a Frontier/Cloud node is online with an enabled model,
  *   routes Pass-1 decomposition to the Cloud Strategist (~500 tokens) so it can decompose the manifest
  *   and assign each file to the ideal local GPU in the cluster.
- * - Otherwise picks the largest local model that may plan (or Frontier as fallback when all local planners are offline).
+ * - Otherwise picks the largest local model that fits and may plan (or Frontier as fallback when all local planners are offline).
+ * When `usedCloudStrategist` is set, pass `{ cloudStrategist: true }` to `buildLeadArchitectPrompt`
+ * (or call `buildCloudStrategistPrompt`) so Pass-1 stays on the short strategist packet.
  */
 export function findLeadArchitect(
   nodes: EndpointNode[],

@@ -12,6 +12,24 @@ export interface RepoMap {
 }
 
 const CODE_EXT = /\.(tsx?|jsx?|mjs|cjs|py|rs|go|vue|svelte)$/i;
+
+const SKIP_DIR_EXACT = new Set(['node_modules', 'dist', 'build', 'out', 'coverage', '.localagents', '.git']);
+
+/** Dependency, build, VCS, and dot directories are not source. `release*` covers release-NNN. */
+export function isSkippedRepoDir(name: string): boolean {
+  const n = (name || '').trim();
+  if (!n || n === '.' || n === '..') return n === '.' || n === '..';
+  if (n.startsWith('.')) return true;
+  if (SKIP_DIR_EXACT.has(n.toLowerCase())) return true;
+  return /^release/i.test(n);
+}
+
+/** True when a parent directory of this relative path should not be mapped. */
+export function pathHasSkippedRepoDir(relPath: string): boolean {
+  const parts = (relPath || '').split(/[\\/]/).filter(Boolean);
+  const dirs = parts.length > 1 ? parts.slice(0, -1) : [];
+  return dirs.some(seg => isSkippedRepoDir(seg));
+}
 const EXPORT_RE =
   /^\s*export\s+(?:default\s+)?(?:async\s+)?(?:function|class|const|let|type|interface|enum)\s+([A-Za-z0-9_]+)/gm;
 const FN_RE = /^\s*(?:async\s+)?function\s+([A-Za-z0-9_]+)/gm;
@@ -50,7 +68,7 @@ export async function listSourceFolderFiles(root: string): Promise<string[]> {
   const seen = new Set<string>();
   const push = (abs: string) => {
     const r = rel(root, abs);
-    if (!r || seen.has(r.toLowerCase()) || SKIP_SOURCE_FILE.test(r)) return;
+    if (!r || seen.has(r.toLowerCase()) || SKIP_SOURCE_FILE.test(r) || pathHasSkippedRepoDir(r)) return;
     seen.add(r.toLowerCase());
     files.push(r);
   };
@@ -66,7 +84,7 @@ export async function listSourceFolderFiles(root: string): Promise<string[]> {
     for (const ent of entries) {
       if (files.length >= 200) return;
       if (ent.isDirectory) {
-        await walk(ent.path, depth + 1);
+        if (!isSkippedRepoDir(ent.name)) await walk(ent.path, depth + 1);
         continue;
       }
       push(ent.path);
@@ -119,11 +137,12 @@ export async function buildRepoMap(root: string): Promise<RepoMap> {
     for (const ent of entries) {
       if (files.length >= 350) return;
       if (ent.isDirectory) {
+        if (isSkippedRepoDir(ent.name)) continue;
         await walk(ent.path, depth + 1);
         continue;
       }
       const r = rel(root, ent.path);
-      if (!r || r.startsWith('.')) continue;
+      if (!r || r.startsWith('.') || pathHasSkippedRepoDir(r)) continue;
       files.push(r);
       if (!CODE_EXT.test(r) || symbols.length > 180 || files.filter(f => CODE_EXT.test(f)).length > 60) continue;
       try {
@@ -140,30 +159,74 @@ export async function buildRepoMap(root: string): Promise<RepoMap> {
   return { files, symbols, builtAt: Date.now() };
 }
 
-/** Tight models get paths plus one symbol line for files named in the task. */
+function taskTokens(taskText: string): string[] {
+  return (taskText || '').toLowerCase().match(/[a-z0-9_./-]{3,}/g) || [];
+}
+
+/**
+ * Files that match the task, best first. Score is basename/path token hits plus symbol hits.
+ * Dependency and build paths never rank. Default limit is 8.
+ */
+export function relevantFilesForTask(map: RepoMap | null, taskText: string, limit = 8): string[] {
+  if (!map?.files?.length || limit < 1) return [];
+  const files = map.files.filter(f => f && !pathHasSkippedRepoDir(f));
+  const tokens = new Set(taskTokens(taskText));
+  const lowerTask = (taskText || '').toLowerCase();
+  const scored = files.map(file => {
+    let score = 0;
+    const lower = file.toLowerCase().replace(/\\/g, '/');
+    const base = lower.split('/').pop() || lower;
+    const stem = base.replace(/\.[a-z0-9]+$/, '');
+    if (base.length > 2 && lowerTask.includes(base)) score += 10;
+    if (stem.length > 2 && (tokens.has(stem) || lowerTask.includes(stem))) score += 6;
+    for (const tok of tokens) {
+      if (tok.length >= 4 && tok !== base && tok !== stem && lower.includes(tok)) score += 2;
+    }
+    for (const sym of map.symbols) {
+      if (sym.file.replace(/\\/g, '/') !== file.replace(/\\/g, '/')) continue;
+      const name = sym.name.toLowerCase();
+      if (name.length < 2) continue;
+      if (tokens.has(name) || lowerTask.includes(name)) score += 5;
+    }
+    return { file, score };
+  });
+  scored.sort((a, b) => b.score - a.score || a.file.localeCompare(b.file));
+  return scored.filter(row => row.score > 0).slice(0, limit).map(row => row.file);
+}
+
+/** Drop the cached map. The caller rebuilds with {@link buildRepoMap} after writes. */
+export function invalidateRepoMap(map: RepoMap | null): RepoMap | null {
+  if (!map) return null;
+  return { ...map, builtAt: 0 };
+}
+
+export function repoMapNeedsRebuild(map: RepoMap | null): boolean {
+  return !map || !(map.builtAt > 0);
+}
+
+/** Tight models get the ranked files for this task, not the first paths the walk saw. */
 export function formatRepoMap(
   map: RepoMap | null,
   tier: 'tight' | 'standard' | 'wide',
   focusText = ''
 ): string {
   if (!map || map.files.length === 0) return '';
-  const focus = focusText.toLowerCase();
-  const named = map.files.filter(f => {
-    const base = f.split('/').pop()?.toLowerCase() || '';
-    return base.length > 2 && focus.includes(base);
-  });
+  const sourceFiles = map.files.filter(f => f && !pathHasSkippedRepoDir(f));
+  if (!sourceFiles.length) return '';
   if (tier === 'tight') {
-    const paths = (named.length ? named : map.files.slice(0, 40)).slice(0, 40);
+    const ranked = relevantFilesForTask({ ...map, files: sourceFiles }, focusText, 8);
+    const paths = (ranked.length ? ranked : sourceFiles.slice(0, 8)).slice(0, 8);
     const lines = paths.map(f => {
       const sym = map.symbols.filter(s => s.file === f).slice(0, 4);
       return sym.length ? `${f} — ${sym.map(s => s.name).join(', ')}` : f;
     });
-    return `REPO MAP (tight — named files first):\n${lines.join('\n')}`;
+    return `REPO MAP (tight — relevant files):\n${lines.join('\n')}`;
   }
   const cap = tier === 'wide' ? 180 : 80;
-  const pathBlock = map.files.slice(0, cap).join('\n');
+  const pathBlock = sourceFiles.slice(0, cap).join('\n');
   const byFile = new Map<string, string[]>();
   for (const s of map.symbols) {
+    if (pathHasSkippedRepoDir(s.file)) continue;
     const list = byFile.get(s.file) || [];
     if (list.length < 6) list.push(s.name);
     byFile.set(s.file, list);

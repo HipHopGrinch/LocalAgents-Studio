@@ -73,6 +73,10 @@ export interface BenchmarkResult {
   promptTokPerSec: number;
   loadMs: number;
   totalMs: number;
+  /** Time to first streamed token on a frontier bench. */
+  ttftMs?: number;
+  /** Context window the local bench actually loaded. */
+  numCtx?: number;
   isEmbedding?: boolean;
   embeddingDim?: number;
   error?: string;
@@ -99,6 +103,9 @@ export interface NodeConfig {
   url: string;
   type?: 'ollama' | 'openai'; // 'ollama' for local Ollama, 'openai' for frontier models (Grok, OpenRouter, OpenAI)
   apiKey?: string;
+  /** OS-encrypted key (safeStorage). Desktop load decrypts this into apiKey and does not return the blob. */
+  apiKeyEnc?: string;
+  apiKeyEncV?: number;
   dnsAlias?: string;
   /**
    * Allowed roles for Auto-Node / Swarm routing.
@@ -206,7 +213,9 @@ export interface ApprovedPlan {
 
 /** Planner-owned execution plan: steps contain coder tasks; Reviewer Yay/Nay per step. */
 export type PlannerPlanStatus = 'draft' | 'active' | 'completed' | 'abandoned';
-export type PlannerStepStatus = 'pending' | 'in_progress' | 'completed' | 'failed';
+export type PlannerStepStatus = 'pending' | 'in_progress' | 'completed' | 'failed' | 'abandoned';
+/** Why a step is blocked. A green verify may auto-advance `compiler` only. */
+export type PlanBlockerKind = 'compiler' | 'review';
 
 export interface PlannerTask {
   id: string;
@@ -230,10 +239,17 @@ export interface PlannerStep {
   reviewNote?: string;
   /** Durable Auto-review Nay rework count for this step (survives app reopen). */
   reworkCount?: number;
+  /** compiler = tsc/verify failure; review = logic Nay. Unset on older plans. */
+  blockerKind?: PlanBlockerKind;
+  /**
+   * Heal budget was spent on this step. Play/Heal will not auto-select it
+   * until the user presses Retry, which clears the flag.
+   */
+  healExhausted?: boolean;
 }
 
 /** Where Play should pick up after Pause / app close. */
-export type PlannerResumePhase = 'coder' | 'review' | 'verdict';
+export type PlannerResumePhase = 'coder' | 'review' | 'verdict' | 'final-review';
 
 export interface PlannerPlan {
   id: string;
@@ -250,7 +266,8 @@ export interface PlannerPlan {
   delivery?: DeliveryTarget;
   /**
    * Checkpoint for seamless Play after Pause / app reopen.
-   * coder = implement (or finish tools); review = Reviewer Yay/Nay; verdict = apply pending Yay/Nay.
+   * coder = implement (or finish tools); review = Reviewer Yay/Nay; verdict = apply pending Yay/Nay;
+   * final-review = every step completed with no failed/abandoned debt.
    */
   resumePhase?: PlannerResumePhase;
   /** Last verify / install command stored for Resume idempotency. */
@@ -264,6 +281,8 @@ export interface PlannerPlan {
   healAttempts?: number;
   /** Last compiler error fingerprint from heal/verify. */
   lastErrorFingerprint?: string;
+  /** Blocker on the active step, mirrored for older callers that only read the plan. */
+  blockerKind?: PlanBlockerKind;
 }
 
 /** One agent chat thread (Cursor/VS Code-style conversation). */
@@ -347,6 +366,13 @@ export interface AppSettings {
     port: number;
     passwordHash?: string;
     passwordSalt?: string;
+    /** Listen on all interfaces (LAN). Off = 127.0.0.1 only. */
+    lanEnabled?: boolean;
+    /** Allow web clients to run terminal / agent shell / MCP commands. */
+    allowShell?: boolean;
+    /** Optional PEM paths; when both are set the console serves HTTPS/WSS. */
+    tlsCertPath?: string;
+    tlsKeyPath?: string;
   };
 }
 
@@ -367,6 +393,8 @@ export interface OpenTab {
   originalContent: string;
   isDirty: boolean;
   language: string;
+  /** 1-based Monaco cursor line. Used to cap the active file around the caret. */
+  cursorLine?: number;
 }
 
 // ==========================================
@@ -510,6 +538,13 @@ export interface ChatEvent {
   content?: string;
   thinking?: string;
   error?: string;
+  /**
+   * Set by the main process when the stream died from an idle stall or absolute deadline.
+   * The renderer rejects these with a retriable StreamChatError instead of hanging.
+   */
+  retriable?: boolean;
+  /** 'idle_timeout' | 'absolute_timeout' | 'stall' when the main process classified the failure. */
+  code?: string;
   stats?: {
     evalCount?: number;
     evalDuration?: number;
@@ -518,6 +553,8 @@ export interface ChatEvent {
     loadDuration?: number;
     totalDuration?: number;
     doneReason?: string;
+    /** Frontier reasoning tokens when the provider reports them separately. */
+    reasoningTokens?: number;
   };
 }
 
@@ -648,16 +685,31 @@ export interface ElectronAPI {
   }>;
   hasPackageJson: (root: string) => Promise<{ exists: boolean }>;
 
-  executeCommand: (command: string, cwd?: string) => Promise<{ code?: number; output?: string }>;
+  executeCommand: (command: string, cwd?: string, opts?: { timeoutMs?: number }) => Promise<{ code?: number; output?: string }>;
+  /**
+   * Silent git in the desktop workspace. Args are argv (no shell). Web console
+   * is denied unless allowShell is on. Push is not allowlisted.
+   */
+  gitRun: (args: string[]) => Promise<{ code: number; stdout: string; stderr: string; error?: string }>;
   killCommand: () => Promise<{ success: boolean }>;
   getTerminalBuffer: (opts?: { maxChars?: number }) => Promise<{ content: string; running: boolean; chars: number }>;
   clearTerminalBuffer: () => Promise<{ success: boolean }>;
   onTerminalOutput: (cb: (text: string) => void) => () => void;
   onTerminalState: (cb: (s: { running: boolean }) => void) => () => void;
 
-  clusterStatus: (nodes: { id: string; url: string; type?: 'ollama' | 'openai'; apiKey?: string }[]) => Promise<Record<string, NodeStatus>>;
+  clusterStatus: (
+    nodes: { id: string; url: string; type?: 'ollama' | 'openai'; apiKey?: string }[],
+    opts?: { force?: boolean }
+  ) => Promise<Record<string, NodeStatus>>;
   chat: (requestId: string, url: string, body: unknown, nodeType?: 'ollama' | 'openai', apiKey?: string) => Promise<void>;
-  benchmarkModel: (node: NodeConfig, model: string) => Promise<BenchmarkResult>;
+  benchmarkModel: (node: NodeConfig, model: string, numCtx?: number) => Promise<BenchmarkResult>;
+  /** 1-token generate so a pinned model is resident before a swarm wave. */
+  warmModel?: (
+    url: string,
+    model: string,
+    numCtx?: number,
+    keepAlive?: string | number
+  ) => Promise<{ success?: boolean; error?: string }>;
   onChatEvent: (cb: (e: ChatEvent) => void) => () => void;
   pullModel: (requestId: string, url: string, model: string) => Promise<void>;
   onPullEvent: (cb: (e: PullEvent) => void) => () => void;
@@ -706,11 +758,18 @@ export interface ElectronAPI {
     candidateUrls?: string[];
     lanAddresses: string[];
     clientCount: number;
+    lanEnabled?: boolean;
+    allowShell?: boolean;
+    tls?: boolean;
   }>;
   webConsoleUpdate?: (patch: {
     enabled?: boolean;
     port?: number;
     password?: string;
+    lanEnabled?: boolean;
+    allowShell?: boolean;
+    tlsCertPath?: string;
+    tlsKeyPath?: string;
   }) => Promise<{
     success?: boolean;
     error?: string;
@@ -823,6 +882,8 @@ export interface AppUpdateStatus {
   percent: number;
   message: string;
   error: string | null;
+  /** Set by the main process when signature verification is off. */
+  unsigned?: boolean;
 }
 
 declare global {

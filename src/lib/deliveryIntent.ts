@@ -83,8 +83,22 @@ export function stackFromFilePaths(paths: string[]): DeliveryStack | null {
   return null;
 }
 
+/**
+ * One incremental TypeScript check. Not combined with `npm run build`.
+ * This names the project compiler. Callers must not shell `npx` (it may download).
+ * When `node_modules/.bin/tsc` is missing, run Studio's bundled tsc over IPC instead.
+ */
+export const TYPESCRIPT_VERIFY_COMMAND =
+  'node_modules/.bin/tsc --noEmit --incremental --tsBuildInfoFile ".localagents/tsconfig.tsbuildinfo"';
+
+/** Syntax/presence check. Verify must not run `npm install`. */
+export const NODE_VERIFY_COMMAND =
+  'node -e "const fs=require(\'fs\'); if(!fs.existsSync(\'package.json\')){console.error(\'missing package.json\'); process.exit(1)} console.log(\'package.json ok\')"';
+
 export function verifyCommandForStack(stack: DeliveryStack): string | null {
   switch (stack) {
+    case 'typescript':
+      return TYPESCRIPT_VERIFY_COMMAND;
     case 'python':
       return 'python -c "import pathlib,py_compile,sys; files=list(pathlib.Path(\'.\').rglob(\'*.py\'));\n[py_compile.compile(str(f), doraise=True) for f in files[:12]]; print(\'python ok\', len(files))"';
     case 'go':
@@ -92,7 +106,7 @@ export function verifyCommandForStack(stack: DeliveryStack): string | null {
     case 'rust':
       return 'cargo build';
     case 'node':
-      return 'npm install';
+      return NODE_VERIFY_COMMAND;
     case 'static-web':
       return 'powershell -NoProfile -Command "if (Test-Path -Path index.html) { Write-Output \'index.html ok\'; exit 0 } else { Write-Output \'missing index.html\'; exit 1 }"';
     case 'native-win32':

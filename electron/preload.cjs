@@ -67,7 +67,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   generateImage: (url, model, prompt) => ipcRenderer.invoke('image:generate', url, model, prompt),
 
   // Terminal
-  executeCommand: (command, cwd) => ipcRenderer.invoke('terminal:execute', command, cwd),
+  executeCommand: (command, cwd, opts) => ipcRenderer.invoke('terminal:execute', command, cwd, opts),
+  gitRun: args => ipcRenderer.invoke('git:run', args),
   killCommand: () => ipcRenderer.invoke('terminal:kill'),
   getTerminalBuffer: opts => ipcRenderer.invoke('terminal:getBuffer', opts),
   clearTerminalBuffer: () => ipcRenderer.invoke('terminal:clearBuffer'),
@@ -75,9 +76,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onTerminalState: subscribe('terminal:state'),
 
   // Ollama & Frontier cluster
-  clusterStatus: nodes => ipcRenderer.invoke('ollama:status', nodes),
+  clusterStatus: (nodes, opts) => ipcRenderer.invoke('ollama:status', nodes, opts),
   chat: (requestId, url, body, nodeType, apiKey) => ipcRenderer.invoke('ollama:chat', requestId, url, body, nodeType, apiKey),
-  benchmarkModel: (node, model) => ipcRenderer.invoke('ollama:benchmark', node, model),
+  benchmarkModel: (node, model, numCtx) => ipcRenderer.invoke('ollama:benchmark', node, model, numCtx),
+  warmModel: (url, model, numCtx, keepAlive) => ipcRenderer.invoke('ollama:warm', url, model, numCtx, keepAlive),
   onChatEvent: subscribe('ollama:chat-event'),
   pullModel: (requestId, url, model) => ipcRenderer.invoke('ollama:pull', requestId, url, model),
   onPullEvent: subscribe('ollama:pull-event'),

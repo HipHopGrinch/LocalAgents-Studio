@@ -1,0 +1,77 @@
+# Unsigned Windows installers uploaded as a draft release.
+# Code signing is a pending decision (PLAT-10): CSC_IDENTITY_AUTO_DISCOVERY is
+# false and package.json sets signAndEditExecutable: false.
+# Tag the commit v<package.json version> (example: v1.2.27) after the version bump lands.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  draft:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build unsigned installers
+        shell: pwsh
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx vite build && npx electron-builder --win --publish never --config.directories.output=release
+
+      - name: Upload draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $ver = (Get-Content -Raw package.json | ConvertFrom-Json).version
+          $tag = '${{ github.ref_name }}'
+          if ($tag -ne "v$ver") {
+            throw "Tag '$tag' does not match package.json version v$ver. Bump the version before tagging."
+          }
+          $assets = @(Get-ChildItem -Path release -File | Where-Object {
+            $_.Name -eq 'latest.yml' -or $_.Extension -eq '.exe' -or $_.Extension -eq '.blockmap'
+          } | ForEach-Object { $_.FullName })
+          if ($assets.Count -eq 0) { throw 'No installer artifacts in release\.' }
+          $prev = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          gh release view $tag 1>$null 2>$null
+          $exists = ($LASTEXITCODE -eq 0)
+          $ErrorActionPreference = $prev
+          if ($exists) {
+            throw "Release $tag already exists. Refusing to clobber. Delete the draft or publish locally with -Force."
+          }
+          $notes = @"
+          Unsigned Windows build of LocalAgents Studio $ver.
+
+          Code signing is a pending decision (PLAT-10). This draft is not visible to electron-updater until it is published.
+
+          - NSIS setup: in-app updates (latest.yml)
+          - Portable exe: manual replace
+          "@
+          gh release create $tag --draft --title "LocalAgents Studio $ver" --notes $notes @assets
+          gh release view $tag --json assets --jq '.assets[].name'

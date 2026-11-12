@@ -4,8 +4,8 @@
 import assert from 'node:assert/strict';
 import { liveRoutePin, parseFinalReview, pickCapableReviewTarget, pickFinalSourceReviewTarget, reviewModelSizeB } from './continuationReview';
 import { assignSwarmTasksToCluster, findLeadArchitect, type SwarmTask } from './swarmContract';
-import { findFastestConductor, pickBestModelForComplexity, selectBestEndpointForTask } from './tools';
-import { mergeSettings } from '../config/defaults';
+import { findFastestConductor, pickBestModelForComplexity, pickFailoverTarget, selectBestEndpointForTask } from './tools';
+import { mergeSettings, MIN_CHAT_WIDTH } from '../config/defaults';
 import type { BenchmarkResult, EndpointNode, HardwareProfile } from '../types';
 
 const hw = (vramGB: number): HardwareProfile => ({
@@ -40,7 +40,7 @@ const big = node({
   id: 'rig',
   name: '5070',
   hardware: hw(8),
-  modelPrefs: { 'gemma4:12b': { numCtx: 65536 } },
+  modelPrefs: { 'gemma4:12b': { numCtx: 16384 } },
   models: [{ name: 'gemma4:12b', size: 1, details: { parameter_size: '12B', family: 'gemma' } }]
 });
 const mid = node({
@@ -78,6 +78,10 @@ const lead = findLeadArchitect(cluster);
 assert.equal(lead?.model, 'gemma4:12b');
 assert.equal(lead?.usedFrontierBackup, false);
 
+// A 12B pinned at 64k on an 8 GB card spills to system RAM, so the largest model that fits wins.
+const spilling = { ...big, modelPrefs: { 'gemma4:12b': { numCtx: 65536 } } };
+assert.equal(pickCapableReviewTarget([laptop, mid, spilling], 'reviewer')?.model, 'gemma4:e4b');
+
 const plannerOnly = node({
   id: 'plan',
   name: 'planner box',
@@ -107,14 +111,33 @@ assert.equal(
 );
 
 const fresh = mergeSettings(null);
-assert.equal(fresh.swarmEnabled, true);
-assert.equal(fresh.autoSelectEndpoint, true);
-assert.equal(fresh.autoApplyWrites, true);
-assert.equal(fresh.autoReview, true);
-const kept = mergeSettings({ swarmEnabled: false, autoReview: false });
-assert.equal(kept.swarmEnabled, false);
-assert.equal(kept.autoReview, false);
-assert.equal(kept.autoApplyWrites, true);
+assert.equal(fresh.swarmEnabled, false);
+assert.equal(fresh.autoSelectEndpoint, false);
+assert.equal(fresh.autoApplyWrites, false);
+assert.equal(fresh.autoReview, false);
+assert.equal(fresh.cloudStrategistEnabled, false);
+assert.ok((fresh.chatWidth ?? 0) >= MIN_CHAT_WIDTH);
+const keptOff = mergeSettings({ swarmEnabled: false, autoReview: false });
+assert.equal(keptOff.swarmEnabled, false);
+assert.equal(keptOff.autoReview, false);
+assert.equal(keptOff.autoApplyWrites, false);
+assert.equal(keptOff.autoSelectEndpoint, false);
+assert.equal(keptOff.cloudStrategistEnabled, false);
+const keptOn = mergeSettings({
+  swarmEnabled: true,
+  autoSelectEndpoint: true,
+  autoApplyWrites: true,
+  autoReview: true,
+  cloudStrategistEnabled: true,
+  chatWidth: 1100
+});
+assert.equal(keptOn.swarmEnabled, true);
+assert.equal(keptOn.autoSelectEndpoint, true);
+assert.equal(keptOn.autoApplyWrites, true);
+assert.equal(keptOn.autoReview, true);
+assert.equal(keptOn.cloudStrategistEnabled, true);
+assert.equal(keptOn.chatWidth, 1100);
+assert.equal(mergeSettings({ chatWidth: 400 }).chatWidth, MIN_CHAT_WIDTH);
 
 function bench(model: string, nodeId: string, evalTokPerSec: number): BenchmarkResult {
   return {
@@ -228,5 +251,33 @@ assert.equal(
 );
 // The 12B card coming back online is eligible without a restart.
 assert.equal(pickCapableReviewTarget(speedTrap, 'reviewer')?.node.id, 'rig');
+
+const docsOnly = node({
+  id: 'docs-only',
+  name: 'docs',
+  roles: ['docs'],
+  hardware: hw(24),
+  models: [{ name: 'gemma4:12b', size: 1, details: { parameter_size: '12B' } }]
+});
+assert.equal(pickFailoverTarget([docsOnly, big], 'gone', 'gemma4:12b', { role: 'planner' })?.node.id, 'rig');
+const spillPlanner = node({
+  id: 'spill-planner',
+  name: 'spill',
+  hardware: hw(6),
+  roles: ['planner'],
+  models: [{ name: 'gemma4:12b', size: 20e9, details: { parameter_size: '12B' } }],
+  loaded: [{ name: 'gemma4:12b', size: 1, sizeVram: 1 }]
+});
+const fitPlanner = node({
+  id: 'fit-planner',
+  name: 'fit',
+  hardware: hw(16),
+  roles: ['planner'],
+  models: [{ name: 'gemma4:e2b', size: 2e9, details: { parameter_size: '2B' } }]
+});
+assert.equal(
+  pickFailoverTarget([spillPlanner, fitPlanner], 'gone', 'gemma4:12b', { role: 'planner' })?.model,
+  'gemma4:e2b'
+);
 
 console.log('plannerRoute.selftest ok');

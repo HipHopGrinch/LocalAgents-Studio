@@ -8,8 +8,14 @@ import {
   formatApprovedPlanContext
 } from './planOptions';
 import { DELIVERY_POLICY, TOOLCHAIN_PLAYBOOK } from './deliveryIntent';
-import { formatClusterInventory } from './clusterInventory';
-import { installedModelSizeB } from './recommender';
+import { formatClusterInventory, type ModelFitTier } from './clusterInventory';
+import { findCatalogModel, installedModelSizeB } from './recommender';
+import {
+  isFullGpuFit,
+  isModelLoaded,
+  measuredEvalTokPerSec,
+  measuredPromptTokPerSec
+} from './modelFit';
 
 const NODE_ROLES: NodeRole[] = ['coder', 'reviewer', 'docs', 'planner'];
 
@@ -95,6 +101,11 @@ export interface ParseResponseOptions {
   expectedFilePath?: string;
   /** When true, language-default filenames may be invented from fences */
   createIntent?: boolean;
+  /**
+   * When true, an unclosed `<write_file>` / `<edit_file>` may be written.
+   * Default is safe: a missing close tag is not salvaged into a partial file.
+   */
+  allowUnclosedSalvage?: boolean;
 }
 
 /**
@@ -138,7 +149,8 @@ export function parseResponse(
 
   // A frontier/local reply often stops inside the last file, with no closing tag.
   // Closed tags are already placeholders, so the last remaining tag is the cutoff.
-  if (!streaming) {
+  // Default refuses that salvage — a missing close tag must not write a partial file.
+  if (!streaming && opts.allowUnclosedSalvage) {
     const openRe = /<(write_file|edit_file)\b([^>]*)>/gi;
     let lastOpen: RegExpExecArray | null = null;
     let openMatch: RegExpExecArray | null;
@@ -216,7 +228,10 @@ export function parseResponse(
 
   // Universal Fallback: If no explicit XML tool tags were detected and generation finished,
   // inspect markdown code blocks. Guarded so Q&A / explanatory replies do not invent files.
-  if (!streaming && toolCalls.length === 0 && (createIntent || expectedFilePath)) {
+  // An unclosed write/edit tag is not turned into a file unless salvage was explicitly allowed.
+  const refusePartialWrite =
+    !streaming && !opts.allowUnclosedSalvage && !!hasUnclosedWrite(text);
+  if (!streaming && !refusePartialWrite && toolCalls.length === 0 && (createIntent || expectedFilePath)) {
     const codeBlockRe = /```([a-zA-Z0-9_\-\+#]*)(?:[ \t:]+([^\r\n]+))?\r?\n([\s\S]*?)\r?\n```/g;
     let match: RegExpExecArray | null;
     let fallbackIdx = 0;
@@ -339,16 +354,68 @@ export interface EditResult {
   applied: number;
 }
 
-export function parseEditBlocks(body: string): { search: string; replace: string }[] {
-  const normalized = body.replace(/\r\n/g, '\n');
+function collectSearchReplace(
+  normalized: string,
+  re: RegExp
+): { search: string; replace: string }[] {
   const blocks: { search: string; replace: string }[] = [];
-  const re = /^<{5,9}\s*SEARCH[^\n]*\n([\s\S]*?)^={5,9}[ \t]*\n([\s\S]*?)^>{5,9}\s*REPLACE/gm;
-  let m;
+  let m: RegExpExecArray | null;
   while ((m = re.exec(normalized)) !== null) {
     blocks.push({
       search: m[1].replace(/\n$/, ''),
       replace: m[2].replace(/\n$/, '')
     });
+  }
+  return blocks;
+}
+
+/** `<<<<<<< SEARCH` blocks, then plain `SEARCH / ======= / REPLACE` without angle brackets. */
+export function parseEditBlocks(body: string): { search: string; replace: string }[] {
+  const normalized = body.replace(/\r\n/g, '\n');
+  const angled = collectSearchReplace(
+    normalized,
+    /^<{5,9}\s*SEARCH[^\n]*\n([\s\S]*?)^={5,9}[ \t]*\n([\s\S]*?)^>{5,9}\s*REPLACE/gm
+  );
+  if (angled.length) return angled;
+  const plain = collectSearchReplace(
+    normalized,
+    /^(?:<{3,9}\s*)?SEARCH[^\n]*\n([\s\S]*?)^={3,9}[ \t]*\n([\s\S]*?)^(?:>{3,9}\s*)?REPLACE[^\n]*/gm
+  );
+  if (plain.length) return plain;
+  return parseUnifiedDiffHunks(normalized);
+}
+
+/** One unified-diff hunk → search (context + deletions) / replace (context + additions). */
+function parseUnifiedDiffHunks(text: string): { search: string; replace: string }[] {
+  if (!/^@@/m.test(text)) return [];
+  const lines = text.split('\n');
+  const blocks: { search: string; replace: string }[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (!lines[i].startsWith('@@')) {
+      i += 1;
+      continue;
+    }
+    i += 1;
+    const search: string[] = [];
+    const replace: string[] = [];
+    while (i < lines.length && !lines[i].startsWith('@@') && !lines[i].startsWith('diff ')) {
+      const line = lines[i];
+      if (line.startsWith('\\')) {
+        i += 1;
+        continue;
+      }
+      if (line.startsWith('+')) replace.push(line.slice(1));
+      else if (line.startsWith('-')) search.push(line.slice(1));
+      else if (line.startsWith(' ')) {
+        search.push(line.slice(1));
+        replace.push(line.slice(1));
+      } else break;
+      i += 1;
+    }
+    if (search.length || replace.length) {
+      blocks.push({ search: search.join('\n'), replace: replace.join('\n') });
+    }
   }
   return blocks;
 }
@@ -449,10 +516,47 @@ function anchorLineMatch(lines: string[], searchLines: string[]): [number, numbe
   return hits.length === 1 ? [hits[0], hits[0] + len] : null;
 }
 
+/** ~8 lines around the closest window, with a 0-based line offset, when SEARCH misses. */
+function nearestMismatchHint(text: string, search: string): string {
+  const lines = text.split('\n');
+  if (!lines.length) return 'Nearest lines at offset 0 (line 1): (empty file)';
+  const target = search
+    .split('\n')
+    .map(l => normalizeLine(l).trim())
+    .filter(Boolean);
+  const probe = target[0] || search.trim().slice(0, 120);
+  let best = 0;
+  let bestScore = -1;
+  for (let i = 0; i < lines.length; i++) {
+    let score = lineSimilarity(lines[i], probe);
+    if (target.length > 1) {
+      const n = Math.min(target.length, lines.length - i, 8);
+      let acc = 0;
+      for (let j = 0; j < n; j++) acc += lineSimilarity(lines[i + j], target[j] || '');
+      score = n > 0 ? acc / n : score;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = i;
+    }
+  }
+  const start = Math.max(0, Math.min(best, Math.max(0, lines.length - 8)));
+  const end = Math.min(lines.length, start + 8);
+  const snippet = lines
+    .slice(start, end)
+    .map((l, k) => `${start + k + 1}| ${l}`)
+    .join('\n');
+  return `Nearest lines at offset ${start} (line ${start + 1}):\n${snippet}`;
+}
+
 export function applyEdits(original: string, body: string): EditResult {
   const blocks = parseEditBlocks(body);
   if (!blocks.length) {
-    return { applied: 0, error: 'No valid SEARCH/REPLACE blocks found. Use the exact <<<<<<< SEARCH / ======= / >>>>>>> REPLACE format.' };
+    return {
+      applied: 0,
+      error:
+        'No valid SEARCH/REPLACE blocks found. Use <<<<<<< SEARCH / ======= / >>>>>>> REPLACE, a plain SEARCH / ======= / REPLACE block, or a unified diff hunk.'
+    };
   }
   const eol = original.includes('\r\n') ? '\r\n' : '\n';
   let text = original.replace(/\r\n/g, '\n');
@@ -486,7 +590,7 @@ export function applyEdits(original: string, body: string): EditResult {
     if (!range) {
       return {
         applied: i,
-        error: `Block ${i + 1}: SEARCH text not found in the file. Re-read the file with read_file, or emit the full file with <write_file path="...">.`
+        error: `Block ${i + 1}: SEARCH text not found in the file. ${nearestMismatchHint(text, search)}`
       };
     }
     lines.splice(range[0], range[1] - range[0], ...replace.split('\n'));
@@ -616,6 +720,58 @@ When a command fails (non-zero exit), diagnose from the output, fix with <edit_f
 - Paths are relative to the workspace root. Do not prefix with leading slash.
 - State a brief 1-2 sentence description before or after the tool tags.`;
 
+type SmallPersonaMode = 'plan' | 'lock-plan' | 'review' | 'step-verdict' | 'contract';
+
+/** One schema, placed after the short tool card. Not the long protocol's repeated examples. */
+const SMALL_REQUIRED_OUTPUT: Record<SmallPersonaMode, string> = {
+  plan: `### Required output (last)
+Do NOT write deliverable files. End with exactly one block:
+
+<plan_options>
+<option id="1" delivery="web" title="Web">What this choice builds.</option>
+<option id="2" delivery="python" title="Python">What this choice builds.</option>
+</plan_options>`,
+  'lock-plan': `### Required output (last)
+Do NOT write deliverable files. End with exactly one block:
+
+<execution_plan>
+<summary>One-line goal</summary>
+<step id="1" title="First step">
+<task id="1a" file="path.ext" title="Do the thing">Concrete change in that file.</task>
+</step>
+</execution_plan>`,
+  review: `### Required output (last)
+Do NOT write or edit files. End with exactly one block:
+
+<review_plan>
+<summary>What is wrong, or that nothing blocking was found.</summary>
+<task id="1" file="app.js" title="Fix the bug">Concrete change. Omit tasks when the review is clean.</task>
+</review_plan>`,
+  'step-verdict': `### Required output (last)
+Do NOT write or edit files. End with exactly one block:
+
+<step_verdict step_id="1">
+<result>yay</result>
+<notes>What you checked. Use nay only for a concrete file and failure.</notes>
+</step_verdict>`,
+  contract: `### Required output (last)
+You may write only a thin shared contract file. End with exactly one block:
+
+<fix_contract>
+<summary>One-line fix goal</summary>
+<files>paths Coder must touch</files>
+<notes>APIs and order of work</notes>
+</fix_contract>`
+};
+
+const SMALL_PERSONA_LINE: Record<SmallPersonaMode, string> = {
+  plan: 'Planner: inspect only. Do not implement the app.',
+  'lock-plan': 'Lock-plan: emit the execution plan only. Do not write deliverables.',
+  review: 'Reviewer: findings only. Do not patch files.',
+  'step-verdict': 'Step verdict: judge the one active step. Do not patch files or invent a new plan.',
+  contract: 'Contract: lock the fix contract. Do not implement the full fix list.'
+};
+
 export interface BuildSystemPromptOptions {
   /** Planner turn: force plan+options protocol; skip write-heavy pressure */
   planMode?: boolean;
@@ -639,6 +795,25 @@ export interface BuildSystemPromptOptions {
   inferenceModel?: string;
   /** Durable project brief, owned files, rules — injected on every role. */
   projectContext?: string;
+  /**
+   * Byte-stable system prefix: persona, tool protocol, delivery rules, project rules, workspace root.
+   * Date, dev-host, live inventory, work log, workspace overview, and the approved plan move to
+   * {@link buildVolatileContextBlock} (put that in the user message).
+   */
+  stablePrefix?: boolean;
+}
+
+export interface VolatileContextBlockInput {
+  nodes?: EndpointNode[];
+  inferenceNodeId?: string;
+  /** Planner / lock-plan / contract turns include the live cluster roster. */
+  includeInventory?: boolean;
+  fallbackNumCtx?: number;
+  progressLog?: string;
+  overview?: string;
+  approvedPlan?: ApprovedPlan | null;
+  /** YYYY-MM-DD. Defaults to today so the block stays out of the cached prefix. */
+  date?: string;
 }
 
 export function buildSystemPrompt(
@@ -647,6 +822,7 @@ export function buildSystemPrompt(
   overview: string,
   opts?: BuildSystemPromptOptions
 ): string {
+  const stablePrefix = !!opts?.stablePrefix;
   const contractMode = !!opts?.contractMode;
   const lockPlanMode = !!opts?.lockPlanMode;
   const stepVerdictMode = !!opts?.stepVerdictMode;
@@ -658,22 +834,39 @@ export function buildSystemPrompt(
     contractMode || lockPlanMode || stepVerdictMode
       ? stepVerdictMode
       : (opts?.reviewMode ?? (agent.handle === 'reviewer' || agent.id === 'reviewer'));
-  const parts = [
-    agent.systemPrompt.trim(),
-    `## Environment
-- Host OS: Windows (PowerShell)
-- Workspace root: ${workspace || '(no folder open)'}
-- Date: ${new Date().toISOString().slice(0, 10)}`
+  const env = [
+    '## Environment',
+    '- Host OS: Windows (PowerShell)',
+    `- Workspace root: ${workspace || '(no folder open)'}`
   ];
-  if (opts?.nodes?.length) {
+  if (!stablePrefix) env.push(`- Date: ${new Date().toISOString().slice(0, 10)}`);
+  const parts = [agent.systemPrompt.trim(), env.join('\n')];
+  if (!stablePrefix && opts?.nodes?.length) {
     parts.push(buildDevHostPromptSection(opts.nodes, opts.inferenceNodeId));
   }
   if (opts?.projectContext?.trim()) parts.push(opts.projectContext.trim());
   const plannerControlled = planMode || lockPlanMode || contractMode;
-  if (plannerControlled && opts?.nodes?.length) {
+  if (!stablePrefix && plannerControlled && opts?.nodes?.length) {
     parts.push(formatClusterInventory(opts.nodes, { fallbackNumCtx: agent.numCtx }));
   }
-  if (lockPlanMode) {
+  const routedModel = opts?.inferenceModel || agent.model;
+  const small = isSmallModel(routedModel);
+  const smallMode: SmallPersonaMode | null = lockPlanMode
+    ? 'lock-plan'
+    : stepVerdictMode
+      ? 'step-verdict'
+      : contractMode
+        ? 'contract'
+        : planMode
+          ? 'plan'
+          : reviewMode
+            ? 'review'
+            : null;
+  if (small && smallMode) {
+    parts.push(SMALL_PERSONA_LINE[smallMode]);
+    if (agent.toolsEnabled) parts.push(SMALL_MODEL_TOOL_PROTOCOL);
+    parts.push(SMALL_REQUIRED_OUTPUT[smallMode]);
+  } else if (lockPlanMode) {
     parts.push(EXECUTION_PLAN_LOCK_PROTOCOL);
     if (agent.toolsEnabled) {
       parts.push(
@@ -717,9 +910,7 @@ export function buildSystemPrompt(
     }
   } else {
     if (agent.toolsEnabled) {
-      const routedModel = opts?.inferenceModel || agent.model;
-      const isSmall = isSmallModel(routedModel);
-      if (isSmall) {
+      if (small) {
         parts.push(SMALL_MODEL_TOOL_PROTOCOL);
       } else {
         parts.push(TOOL_PROTOCOL);
@@ -727,18 +918,84 @@ export function buildSystemPrompt(
         parts.push(TOOLCHAIN_PLAYBOOK);
       }
     }
-    if (opts?.approvedPlan) parts.push(formatApprovedPlanContext(opts.approvedPlan));
+    if (!stablePrefix && opts?.approvedPlan) parts.push(formatApprovedPlanContext(opts.approvedPlan));
   }
-  if (opts?.progressLog?.trim()) {
+  if (!stablePrefix && opts?.progressLog?.trim()) {
     parts.push(`## Work log
 This is the memory of the task. Trust it after a compacted chat. Do the Next step. Do not redo Done steps. Do not ask a question listed under Already asked.
 ${opts.progressLog.trim()}`);
   }
-  if (overview) parts.push(`## Workspace overview\n${overview}`);
+  if (!stablePrefix && overview) parts.push(`## Workspace overview\n${overview}`);
   return parts.join('\n\n');
 }
 
-export function formatToolResult(call: ToolCall): string {
+/**
+ * Turn-volatile context that must NOT live in the system message (it defeats Ollama KV prefix reuse).
+ * Callers prepend this to the user message when `buildSystemPrompt(..., { stablePrefix: true })`.
+ */
+export function buildVolatileContextBlock(input: VolatileContextBlockInput = {}): string {
+  const parts: string[] = [];
+  const date = input.date || new Date().toISOString().slice(0, 10);
+  parts.push(`## Turn context\n- Date: ${date}`);
+  if (input.nodes?.length) {
+    parts.push(buildDevHostPromptSection(input.nodes, input.inferenceNodeId));
+  }
+  if (input.includeInventory && input.nodes?.length) {
+    parts.push(formatClusterInventory(input.nodes, { fallbackNumCtx: input.fallbackNumCtx }));
+  }
+  if (input.approvedPlan) parts.push(formatApprovedPlanContext(input.approvedPlan));
+  if (input.progressLog?.trim()) {
+    parts.push(`## Work log
+This is the memory of the task. Trust it after a compacted chat. Do the Next step. Do not redo Done steps. Do not ask a question listed under Already asked.
+${input.progressLog.trim()}`);
+  }
+  if (input.overview?.trim()) parts.push(`## Workspace overview\n${input.overview.trim()}`);
+  return parts.join('\n\n');
+}
+
+const TOOL_RESULT_CAPS: Record<
+  ModelFitTier,
+  { head: number; tail: number; errors: number; maxChars: number }
+> = {
+  tight: { head: 24, tail: 24, errors: 40, maxChars: 3500 },
+  standard: { head: 48, tail: 48, errors: 40, maxChars: 8000 },
+  wide: { head: 80, tail: 80, errors: 60, maxChars: 16000 }
+};
+
+const TOOL_RESULT_ERROR_RE = /(?:\berror\b|\bexception\b|\bfailed\b|\bTS\d{3,}\b|^\s*at\s+\S)/i;
+
+/** Keep error lines plus a head and a tail so one read cannot fill an 8K window. */
+export function capToolResultText(text: string, tier: ModelFitTier = 'standard'): string {
+  const caps = TOOL_RESULT_CAPS[tier] || TOOL_RESULT_CAPS.standard;
+  const normalized = (text || '').replace(/\r\n/g, '\n');
+  if (!normalized) return '';
+  const lines = normalized.split('\n');
+  if (lines.length <= caps.head + caps.tail && normalized.length <= caps.maxChars) return normalized;
+  const keep = new Set<number>();
+  const headN = Math.min(caps.head, lines.length);
+  for (let i = 0; i < headN; i++) keep.add(i);
+  const tailStart = Math.max(0, lines.length - caps.tail);
+  for (let i = tailStart; i < lines.length; i++) keep.add(i);
+  let errors = 0;
+  for (let i = 0; i < lines.length && errors < caps.errors; i++) {
+    if (!TOOL_RESULT_ERROR_RE.test(lines[i])) continue;
+    keep.add(i);
+    errors += 1;
+  }
+  const ordered = [...keep].sort((a, b) => a - b);
+  const out: string[] = [];
+  let prev = -1;
+  for (const i of ordered) {
+    if (prev >= 0 && i > prev + 1) out.push(`…(${i - prev - 1} lines omitted)`);
+    out.push(lines[i]);
+    prev = i;
+  }
+  let joined = out.join('\n');
+  if (joined.length > caps.maxChars) joined = `${joined.slice(0, caps.maxChars - 20)}\n…(truncated)`;
+  return joined;
+}
+
+export function formatToolResult(call: ToolCall, opts?: { tier?: ModelFitTier }): string {
   const attrs = call.args.path
     ? ` path="${call.args.path}"`
     : call.name === 'run_command'
@@ -746,7 +1003,8 @@ export function formatToolResult(call: ToolCall): string {
       : call.name === 'read_terminal' && call.args.lines
         ? ` lines="${call.args.lines}"`
         : '';
-  return `<tool_result name="${call.name}"${attrs} status="${call.status}">\n${call.result ?? ''}\n</tool_result>`;
+  const body = capToolResultText(call.result ?? '', opts?.tier ?? 'standard');
+  return `<tool_result name="${call.name}"${attrs} status="${call.status}">\n${body}\n</tool_result>`;
 }
 
 export function describeTool(call: ToolCall): string {
@@ -862,6 +1120,29 @@ export function getPreferredModelForNode(node?: EndpointNode, fallbackModel?: st
 export function isFrontierNode(n?: EndpointNode): boolean {
   if (!n) return false;
   return n.type === 'openai' || !!n.apiKey;
+}
+
+/** True when a continuation appended the missing close tag for an open write/edit. */
+export function continuationClosedWrite(before: string, after: string): boolean {
+  return !!hasUnclosedWrite(before) && !hasUnclosedWrite(after);
+}
+
+/** Error card for a write/edit that stayed open after the one continuation. Not applied to disk. */
+export function truncatedWriteToolCall(
+  text: string,
+  msgId: string,
+  expectedFilePath?: string
+): ToolCall | null {
+  const open = hasUnclosedWrite(text);
+  if (!open) return null;
+  const path = open.path && open.path !== 'file' ? open.path : expectedFilePath || open.path;
+  return {
+    id: `${msgId}-truncated`,
+    name: open.name,
+    args: { path: path || 'file' },
+    status: 'error',
+    result: 'output truncated; file not written'
+  };
 }
 
 /** The reply opened a file tag and never closed it (typical of a capped frontier stream). */
@@ -1152,10 +1433,10 @@ export function selectBestEndpointForTask(
     if (preferredSpecialties?.length) {
       const specPool = rolePool.filter(n => n.specialty && preferredSpecialties.includes(n.specialty));
       if (specPool.length > 0) {
-        return rankModelsForWeight(specPool, weight)?.node;
+        return rankModelsForWeight(specPool, weight, { role })?.node;
       }
     }
-    return rankModelsForWeight(rolePool, weight)?.node;
+    return rankModelsForWeight(rolePool, weight, { role })?.node;
   };
 
   if (agentHandle === 'planner') return pickForPersona('planner', ['architect', 'strategist'], 'heavy');
@@ -1175,7 +1456,10 @@ export function selectBestEndpointForTask(
     return pickForPersona('coder', ['architect', 'heavy_coder', 'module_coder'], 'heavy');
   }
 
-  return pickForPersona('coder', ['architect', 'heavy_coder'], 'heavy') || rankModelsForWeight(pool, 'heavy')?.node;
+  return (
+    pickForPersona('coder', ['architect', 'heavy_coder'], 'heavy') ||
+    rankModelsForWeight(pool, 'heavy', { role: 'coder' })?.node
+  );
 }
 
 function modelSpeed(n: EndpointNode, model: string): { speed: number; provisional: boolean } {
@@ -1194,6 +1478,23 @@ export function endpointModelSizeB(node: EndpointNode | undefined, model: string
   return installedModelSizeB(model, live?.details?.parameter_size);
 }
 
+/**
+ * MoE models rank by catalog `activeB`, not the total `parameter_size` (a 30B/3B MoE is not a 30B dense model).
+ */
+export function routingActiveParamsB(node: EndpointNode | undefined, model: string): number {
+  const row = findCatalogModel(model);
+  if (
+    row &&
+    typeof row.activeB === 'number' &&
+    row.activeB > 0 &&
+    typeof row.paramsB === 'number' &&
+    row.activeB + 0.05 < row.paramsB
+  ) {
+    return row.activeB;
+  }
+  return endpointModelSizeB(node, model);
+}
+
 export interface RankedModelChoice {
   node: EndpointNode;
   model: string;
@@ -1201,37 +1502,156 @@ export interface RankedModelChoice {
   speed: number;
 }
 
+export interface RankModelsOptions {
+  /** Planner uses reasoning quality; reviewer uses review quality. */
+  role?: NodeRole;
+}
+
+export interface FailoverTarget {
+  node: EndpointNode;
+  model: string;
+}
+
+function catalogQuality(
+  model: string,
+  weight: ConductorFileJob['complexity'],
+  role?: NodeRole
+): number {
+  const q = findCatalogModel(model)?.quality;
+  if (!q) return 0;
+  if (role === 'planner') return q.reasoning ?? q.agent ?? 0;
+  if (role === 'reviewer') return q.review ?? 0;
+  if (role === 'docs' || weight === 'light') return q.chat ?? q.coding ?? 0;
+  return Math.max(q.coding ?? 0, q.agent ?? 0);
+}
+
+/** When any candidate has a real bench, guessed tok/s is ignored. Otherwise guesses are heavily discounted. */
+function rankingEvalSpeed(node: EndpointNode, model: string, anyMeasured: boolean): number {
+  const measured = measuredEvalTokPerSec(node, model);
+  if (typeof measured === 'number') return measured;
+  if (anyMeasured) return 0;
+  return Math.round(modelSpeed(node, model).speed * 0.05);
+}
+
+function modelFullyFits(node: EndpointNode, model: string): boolean {
+  if (isFrontierNode(node)) return true;
+  return isFullGpuFit(node, model);
+}
+
+/**
+ * Drop models that spill out of VRAM when any candidate fits fully.
+ * If nothing fits, the original list is kept so a small rig can still run.
+ */
+function preferFullGpuFits<T extends { node: EndpointNode; model: string }>(options: T[]): T[] {
+  const fitting = options.filter(o => modelFullyFits(o.node, o.model));
+  return fitting.length > 0 ? fitting : options;
+}
+
+/**
+ * Light work stays on the pinned activeModel when that pin is enabled, so a second
+ * model is not loaded onto that GPU. Another loaded model is used only when the pin
+ * is absent. With no pin and nothing loaded, every enabled model stays eligible.
+ */
+function lightCandidateModels(node: EndpointNode): string[] {
+  const enabled = getEnabledModelsForNode(node);
+  if (!enabled.length) return [];
+  const pin = node.activeModel && enabled.includes(node.activeModel) ? node.activeModel : undefined;
+  if (pin) return [pin];
+  const loaded = enabled.filter(m => isModelLoaded(node, m));
+  if (loaded.length) return loaded;
+  return enabled;
+}
+
 /**
  * Pick one enabled model on an online node.
- * Heavy and medium: largest parameter count. Light: fastest model that is smaller than the largest,
- * so a one-file task can stay on e4b/e2b. Tokens/sec only breaks an equal-size tie.
+ * When any candidate fits fully in GPU at its pinned num_ctx, the rest are dropped.
+ * Heavy/medium: catalog task quality, then active params (largest that fits), then measured eval tok/s.
+ * Planner/reviewer ties break on measured prompt tok/s. Provisional benches are not treated as measured.
+ * Light: the pinned activeModel when it is enabled; a loaded model only when the pin is absent;
+ * otherwise the fastest smaller model.
  */
 export function rankModelsForWeight(
   nodes: EndpointNode[],
-  weight: ConductorFileJob['complexity']
+  weight: ConductorFileJob['complexity'],
+  opts?: RankModelsOptions
 ): RankedModelChoice | undefined {
-  const options: RankedModelChoice[] = [];
+  const role = opts?.role;
+  const gathered: { node: EndpointNode; model: string }[] = [];
   for (const node of nodes) {
     if (!node.online) continue;
-    for (const model of getEnabledModelsForNode(node)) {
-      options.push({
-        node,
-        model,
-        size: endpointModelSizeB(node, model),
-        speed: modelSpeed(node, model).speed
-      });
-    }
+    const models = weight === 'light' ? lightCandidateModels(node) : getEnabledModelsForNode(node);
+    for (const model of models) gathered.push({ node, model });
   }
-  if (!options.length) return undefined;
+  const pool = preferFullGpuFits(gathered);
+  if (!pool.length) return undefined;
+  const anyMeasured = pool.some(o => measuredEvalTokPerSec(o.node, o.model) != null);
+  const options = pool.map(o => ({
+    node: o.node,
+    model: o.model,
+    size: endpointModelSizeB(o.node, o.model),
+    speed: rankingEvalSpeed(o.node, o.model, anyMeasured),
+    quality: catalogQuality(o.model, weight, role),
+    active: routingActiveParamsB(o.node, o.model),
+    prompt: measuredPromptTokPerSec(o.node, o.model) ?? 0
+  }));
   if (weight === 'light') {
+    // Total parameter count, not MoE activeB — a 30B/3B model is not a light-task model.
     const maxSize = Math.max(...options.map(o => o.size));
     const smaller = options.filter(o => o.size < maxSize - 0.05);
-    const pool = smaller.length > 0 ? smaller : options;
-    pool.sort((a, b) => b.speed - a.speed || a.size - b.size);
-    return pool[0];
+    const lightPool = smaller.length > 0 ? smaller : options;
+    lightPool.sort((a, b) => b.speed - a.speed || a.size - b.size);
+    return lightPool[0];
   }
-  options.sort((a, b) => b.size - a.size || b.speed - a.speed);
+  const breakOnPrompt = role === 'planner' || role === 'reviewer';
+  options.sort(
+    (a, b) =>
+      b.quality - a.quality ||
+      b.active - a.active ||
+      b.speed - a.speed ||
+      (breakOnPrompt ? b.prompt - a.prompt : 0)
+  );
   return options[0];
+}
+
+/**
+ * Another node for a failed turn. Same-node retry is the caller's job.
+ * Never falls back to a node that disallows `role`.
+ * Prefers a node where `model` is already loaded and fits; otherwise a node where it fits;
+ * otherwise another enabled model that fits. A spilling copy of `model` is not chosen
+ * while a full fit exists elsewhere.
+ * If nothing fits on any online, enabled, role-allowed node, the best partial fit is
+ * returned so a small rig can still run. Planner/reviewer ranking stays on the largest
+ * capable model that fits (`rankModelsForWeight`).
+ */
+export function pickFailoverTarget(
+  nodes: EndpointNode[],
+  failedNodeId: string,
+  model: string,
+  opts?: { role?: NodeRole; excludeNodeIds?: string[] }
+): FailoverTarget | undefined {
+  const skip = new Set([failedNodeId, ...(opts?.excludeNodeIds || [])]);
+  const pool = nodes.filter(
+    n => n.online && !skip.has(n.id) && getEnabledModelsForNode(n).length > 0
+  );
+  const role = opts?.role;
+  const candidates = role ? pool.filter(n => nodeAllowsRole(n, role)) : pool;
+  if (!candidates.length) return undefined;
+
+  const withModel = candidates.filter(n => getEnabledModelsForNode(n).includes(model));
+  const fitting = withModel.filter(n => modelFullyFits(n, model));
+  if (fitting.length) {
+    const loaded = fitting.filter(n => isModelLoaded(n, model));
+    const modelPool = loaded.length ? loaded : fitting;
+    const ranked = [...modelPool].sort(
+      (a, b) => (measuredEvalTokPerSec(b, model) ?? 0) - (measuredEvalTokPerSec(a, model) ?? 0)
+    );
+    const chosen = ranked[0];
+    if (chosen) return { node: chosen, model };
+  }
+
+  const alt = rankModelsForWeight(candidates, role === 'docs' ? 'light' : 'heavy', { role });
+  if (!alt) return undefined;
+  return { node: alt.node, model: alt.model };
 }
 
 /** Best enabled model on a node. Heavy/medium follow size; light may use a smaller faster model. */
@@ -1257,7 +1677,7 @@ export function findFastestConductor(
   const local = allowed.filter(n => !isFrontierNode(n));
   const usedFrontierBackup = local.length === 0 && allowed.length > 0;
   const pool = local.length > 0 ? local : allowed;
-  const picked = rankModelsForWeight(pool, 'heavy');
+  const picked = rankModelsForWeight(pool, 'heavy', { role: 'planner' });
   if (!picked) return null;
   return {
     node: picked.node,
@@ -1460,7 +1880,9 @@ export function assignJobsToCluster(
     const leastLoadedPool = pool.filter(n => (loadByNodeId.get(n.id) ?? 0) === minLoad);
     const activePool = leastLoadedPool.length > 0 ? leastLoadedPool : pool;
 
-    const picked = rankModelsForWeight(activePool, job.complexity);
+    const picked = rankModelsForWeight(activePool, job.complexity, {
+      role: job.complexity === 'light' ? 'docs' : 'coder'
+    });
     const targetNode = picked?.node || activePool[0];
     const model = picked?.model || pickBestModelForComplexity(targetNode, job.complexity);
     loadByNodeId.set(targetNode.id, (loadByNodeId.get(targetNode.id) ?? 0) + 1);

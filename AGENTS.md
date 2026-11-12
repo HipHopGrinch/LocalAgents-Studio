@@ -4,7 +4,7 @@
 >
 > **Repo:** https://github.com/HipHopGrinch/LocalAgents-Studio  
 > **Wiki / What’s new:** https://github.com/HipHopGrinch/LocalAgents-Studio/wiki  
-> **Latest release (as of this briefing):** **1.2.26**  
+> **Current version (as of this briefing):** **1.3.0** (see [`CHANGELOG.md`](CHANGELOG.md))  
 > **Discord:** https://discord.gg/ZVkmUfXwW
 
 This document is the fast path from zero → productive. It covers *why the product exists*, *what was built in order*, *where the code lives*, *how the reference cluster is supposed to behave*, and *how we ship*.
@@ -39,19 +39,15 @@ Never commit that file. Keys must not appear in logs (see `redactLog` in `electr
 git clone https://github.com/HipHopGrinch/LocalAgents-Studio.git
 cd LocalAgents-Studio
 npm install
-npx tsc --noEmit
+npm run typecheck    # tsc --noEmit
+npm test             # mcp-selftest + scripts/*.selftest.cjs + src/lib/*.selftest.ts
+npm run lint
 npm run dev          # Vite + Electron
 # or packaged:
 npm run dist         # builds into release\ (or use a release-NNN output dir if release\ is locked)
 ```
 
-Useful selftests:
-
-```powershell
-node scripts/mcp-selftest.cjs
-npx tsx src/lib/cursorClass.selftest.ts
-npx tsx src/lib/buildGate.selftest.ts
-```
+`npm test` discovers selftests at runtime (including new `src/lib/*.selftest.ts` files). Stricter indexed-access checking is opt-in: `npm run typecheck:strict`. Electron main-process syntax: `npm run check:electron`.
 
 **Ollama** must be installed separately on each GPU machine. On LAN nodes set `OLLAMA_HOST=0.0.0.0` and open TCP 11434.
 
@@ -160,6 +156,15 @@ From an external pitfalls review (16 items), landed:
 ### Patch (1.2.26)
 Local Ollama **Bench** broke after 1.2.24 dropped the `url` binding used by `/api/generate` and `/api/embed`. Restored in 1.2.26.
 
+### 2026-11 codebase audit (1.3.0)
+An 84-item audit (UX, FLOW, MODEL, CTX, PLAT) plus two independent review passes (28 more fixes). Full list in [`CHANGELOG.md`](CHANGELOG.md).
+
+- **Security:** web console localhost-by-default with TLS-only LAN, first-message WS auth, Origin check, RPC allowlist (shell-type calls need desktop **Allow shell**); `safeStorage` API keys; realpath workspace jail; main-process command denylist + timeouts; hardened in-app git (`electron/gitGuard.cjs`); IPC sender checks; production CSP without `unsafe-eval`; Electron 45.3.0 with ASAR integrity / OnlyLoadAppFromAsar fuses.
+- **Conductor:** `ConductorSession` run tokens + lock (`src/hooks/useConductorSession.ts`, `src/lib/conductor.ts`); explicit Pass/Fail required; bounded heal; truncated writes rejected; verify via project or bundled `tsc` (never `npx`, never auto `npm install`); per-step Skip/Edit/Retry/Undo.
+- **Models & context:** one pinned `num_ctx` per model, role output budgets, `keep_alive` + warm-up, stable system prefix + volatile user block, lean Swarm worker prompts, fit-aware routing/failover, persisted token calibration (`src/components/agent/modelRequest.ts`).
+- **UX:** Hardware modal split into `src/components/hardware/*`, Ctrl+K palette, memoized message list, first-run checklist, Automation drawer, context meter, specific status line, keyboard splitters, inline `ErrorCard`s.
+- **Engineering:** CI, `build-exe.yml` branch exe artifacts, `npm test` selftest runner, ESLint, `npm run release`.
+
 ---
 
 ## 6. Release ladder (recent) — skim this first
@@ -168,13 +173,14 @@ Full notes: [Wiki → What’s new](https://github.com/HipHopGrinch/LocalAgents-
 
 | Ver | Theme |
 |-----|--------|
+| **1.3.0** | 2026-11 audit: security hardening, Conductor run control + gates, pinned context / model efficiency, chat UX, CI + exe builds, Electron 45 |
 | **1.2.26** | Fix local benchmark `url is not defined` |
 | **1.2.25** | Smart Cluster Auto-Configure + Cloud Strategist Pass-1 + wave load-balance |
 | **1.2.24** | Sandbox, web console secrets, MCP framing, terminal isolation, atomic writes |
 | **1.2.23** | Context monitor; blank-page / Tailwind web entry gate |
 | **1.2.22** | Live disable/enable; largest model for heavy work (not speed-first) |
 | **1.2.21** | Web console header + token totals + Node Work mirror; Electron dist after Yay |
-| **1.2.20** | Planner/Reviewer → largest local model; first-run Swarm/Auto toggles on |
+| **1.2.20** | Planner/Reviewer → largest local model; first-run Swarm/Auto toggles on (reverted to off for fresh installs after the 2026-11 audit, UX-3) |
 | **1.2.19** | Finish plans after heal budget; repo map; hunks; git; rules; MCP |
 | **1.2.18** | Heal instead of duplicate Fix stop |
 | **1.2.17** | Frontier / Gemini Studio context default 256k |
@@ -202,7 +208,7 @@ Older architectural narrative: [`HISTORY.md`](HISTORY.md).
 | `src/lib/agentLoop.ts` | Tool execution, destructive filter |
 | `src/lib/plannerPlan.ts` / `verifyGate.ts` / `contextMonitor.ts` / `webEntryGate.ts` | Plan durability, verify, context, blank-page |
 | `src/types.ts` | `NodeSpecialty`, `vramOverheadMode`, settings flags |
-| `src/config/defaults.ts` | Default nodes/settings (`cloudStrategistEnabled` default on) |
+| `src/config/defaults.ts` | Default nodes/settings (fresh installs start with Swarm, Auto-Node, Auto-apply, Auto-review and `cloudStrategistEnabled` off; saved values are kept) |
 
 Project artifacts inside an open workspace:
 
@@ -226,18 +232,25 @@ Project artifacts inside an open workspace:
 
 ## 9. How we ship a release (Windows)
 
-1. Bump `package.json` + first version fields in `package-lock.json`.
-2. `npx tsc --noEmit` + relevant selftests.
-3. Build to a fresh folder if `release\win-unpacked` is locked:
-   ```powershell
-   $env:CSC_IDENTITY_AUTO_DISCOVERY='false'
-   npx vite build
-   npx electron-builder --win --config.directories.output=release-NNN
-   ```
-4. Commit with message like `Release 1.2.xx: <why>.`
-5. Push + `gh release create` with setup + portable + blockmap + `latest.yml`.
-   - `gh auth` token is often stale; use **Git Credential Manager** password as `GH_TOKEN` and push via `https://x-access-token:…@github.com/…` (never print the token; clear env after).
-6. Update wiki `Whats-new.md` in the separate `LocalAgents-Studio.wiki` repo.
+Changes land through pull requests. GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull request, on `windows-latest`: `npm ci`, `npm run typecheck`, `npm run check:electron`, `npm test`, `npm run lint`, `npm audit --omit=dev --audit-level=high`, and `npx vite build`. CI also prints the Electron version and runs a non-blocking Electron advisory audit (`scripts/check-electron-advisories.cjs`).
+
+Packaged builds ship **Electron 45.3.0** with **electron-builder 26**. `asar` stays enabled. `scripts/after-pack-fuses.cjs` (and `build.electronFuses`) turns on cookie encryption, embedded ASAR integrity validation, and `OnlyLoadAppFromAsar`, and turns off `NODE_OPTIONS` and Node inspect arguments. `RunAsNode` stays on so the bundled `tsc` can spawn `process.execPath` with `ELECTRON_RUN_AS_NODE`. `GrantFileProtocolExtraPrivileges` stays at the default because the packaged window loads the Vite ESM bundle via `loadFile`.
+
+To cut a release from a clean git tree (the script only reads `git status --porcelain`):
+
+1. `npm run release -- patch` (or `minor`, `major`, or an explicit `x.y.z`).
+   This bumps `package.json` and the root version fields in `package-lock.json` together, runs typecheck and `npm test`, then builds **unsigned** installers into a fresh `release-<version>\` directory (`CSC_IDENTITY_AUTO_DISCOVERY=false`).
+2. Review the artifacts. Commit the version bump (`Release 1.2.xx: <why>.`) and open a PR. Do not force-push.
+3. Publish only when you mean to: `npm run release -- 1.2.xx --publish` with `GH_TOKEN` set.
+   The script never prints the token. It runs `scripts/publish-github-release.ps1`, which **refuses to replace an existing tag** unless you pass `-Force`.
+   If `gh` reports a stale login, run `gh auth login` again. Do not copy a Git Credential Manager password into `GH_TOKEN`.
+4. Update wiki `Whats-new.md` in the separate `LocalAgents-Studio.wiki` repo.
+
+`build-exe.bat` runs typecheck and tests before `npm run dist` (that path still writes `release\`).
+
+Optional tag workflow: pushing `v<version>` (example `v1.2.27`, matching `package.json`) runs `.github/workflows/release.yml`. It builds the same unsigned installers and uploads setup, portable, blockmap, and `latest.yml` as a **draft** GitHub release. **Code signing is a pending decision (PLAT-10)** — these builds stay unsigned (`signAndEditExecutable: false`, `CSC_IDENTITY_AUTO_DISCOVERY=false`). Drafts are not visible to electron-updater until published. The workflow refuses to clobber a tag that already has a release.
+
+Test builds: every branch push (or a manual run) triggers `.github/workflows/build-exe.yml`, which builds the unsigned setup and portable exe and attaches them to the Actions run as a 14-day artifact. Nothing is published, so electron-updater never offers these builds.
 
 ---
 
@@ -254,8 +267,9 @@ Project artifacts inside an open workspace:
 ## 11. Open / known sharp edges
 
 - `AgentChat.tsx` is a large monolith — prefer extracting helpers over growing it blindly.
-- `typescript` is in production `dependencies` so packaged Studio can `tsc` user projects; it inflates installer size.
-- Auto-updater may run unsigned personal builds (`verifyUpdateCodeSignature = false`) — treat release assets as trust boundary.
+- `typescript` is in production `dependencies` so packaged Studio can `tsc` user projects. The installer keeps `lib/tsc.js`, `lib/_tsc.js` (TS 5.9’s real compiler; `tsc.js` only loads it), and `lib/*.d.ts`, and drops `lib/typescript.js` plus the language-service and locale packs. `_tsc.js` is still several megabytes.
+- CI (`.github/workflows/ci.yml`) typechecks, syntax-checks `electron/*.cjs`, tests, lints, audits production dependencies, and builds the renderer on every push and pull request. `noUncheckedIndexedAccess` stays opt-in (`npm run typecheck:strict`) while it still reports errors.
+- Auto-updater may run unsigned personal builds (`verifyUpdateCodeSignature = false`) — treat release assets as trust boundary. Code signing is still undecided (PLAT-10).
 - Hardware detect prefers `nvidia-smi`, then WMI fallback (AMD/Intel); bandwidth guess still needs good GPU name matching.
 - MCP servers are **one-shot spawn per call** (no long-lived session yet).
 

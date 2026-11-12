@@ -1,38 +1,37 @@
 ---
 name: Bug report
-about: Create a report to help us improve
+about: Report a problem in LocalAgents Studio
 title: ''
 labels: ''
 assignees: ''
 
 ---
 
-**Describe the bug**
-A clear and concise description of what the bug is.
+**Studio version**
+From the app (title bar / About) or `package.json`. Example: 1.2.26
 
-**To Reproduce**
-Steps to reproduce the behavior:
-1. Go to '...'
-2. Click on '....'
-3. Scroll down to '....'
-4. See error
+**Windows version**
+Example: Windows 11 24H2 (build 26100)
 
-**Expected behavior**
-A clear and concise description of what you expected to happen.
+**GPU / nodes**
+For each machine involved: GPU model, VRAM, OS (Windows desktop, headless Linux, or laptop with iGPU display), and whether the node was online.
+
+**Ollama version**
+Output of `ollama --version` on the node that failed.
+
+**Steps to reproduce**
+1.
+2.
+3.
+
+**Expected**
+What you expected to happen.
+
+**What happened**
+What happened instead.
+
+**Redacted log**
+Paste the in-app report / log export. Remove API keys, tokens, and passwords before pasting. Studio's `redactLog` covers many of these; still check the paste.
 
 **Screenshots**
-If applicable, add screenshots to help explain your problem.
-
-**Desktop (please complete the following information):**
- - OS: [e.g. iOS]
- - Browser [e.g. chrome, safari]
- - Version [e.g. 22]
-
-**Smartphone (please complete the following information):**
- - Device: [e.g. iPhone6]
- - OS: [e.g. iOS8.1]
- - Browser [e.g. stock browser, safari]
- - Version [e.g. 22]
-
-**Additional context**
-Add any other context about the problem here.
+Optional.

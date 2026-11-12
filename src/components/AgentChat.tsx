@@ -25,17 +25,20 @@ import {
   Paperclip,
   Zap,
   Cloud,
-  Share2,
   Plus,
   History,
   Trash2,
-  MessageSquarePlus,
   Brain,
   ImagePlus,
   X,
   Shrink,
   SlidersHorizontal
 } from 'lucide-react';
+import { SplitHandle } from './ui/SplitHandle';
+import { AutoConfigConfirm } from './hardware/AutoConfigConfirm';
+import { useStableCallback } from '../hooks/useStableCallback';
+import { useStickToBottom } from '../hooks/useStickToBottom';
+import { useNodeWorkCollapse } from '../hooks/useNodeWorkCollapse';
 import { formatConversationTime } from '../lib/conversations';
 import {
   parseResponse,
@@ -44,13 +47,15 @@ import {
   getEnabledModelsForNode,
   getPreferredModelForNode,
   pickBestModelForComplexity,
+  pickFailoverTarget,
   rankModelsForWeight,
   selectBestEndpointForTask,
-  findFastestConductor,
   isFrontierNode,
   stripThinking,
   looksLikeCreateIntent,
+  continuationClosedWrite,
   hasUnclosedWrite,
+  truncatedWriteToolCall,
   anchorWritePath,
   safeAssistantDisplay,
   annotateAppliedWrites
@@ -61,6 +66,7 @@ import {
   buildLeadArchitectPrompt,
   buildRepairWorkerPrompt,
   buildSwarmWorkerPrompt,
+  buildSwarmWorkerSystemStub,
   fallbackSwarmManifest,
   findLeadArchitect,
   groupTscErrorsByFile,
@@ -100,13 +106,25 @@ import {
   shouldPreserveContract,
   type ProjectBrain
 } from '../lib/projectBrain';
-import { buildRepoMap, formatRepoMap, listSourceFolderFiles, type RepoMap } from '../lib/repoMap';
 import {
+  buildRepoMap,
+  formatRepoMap,
+  invalidateRepoMap,
+  listSourceFolderFiles,
+  relevantFilesForTask,
+  type RepoMap
+} from '../lib/repoMap';
+import {
+  annotateMissingDependencies,
+  beginVerify,
+  DEPENDENCY_RETRY_MESSAGE,
   errorFingerprint,
   filesFromErrors,
   formatErrorsForCoder,
+  localTscPowerShellCommand,
   parseCompilerErrors,
-  resolveVerifyCommand,
+  typesCannotResolve,
+  typescriptVerifyUsesCompiler,
   verifyOutputFailed
 } from '../lib/verifyGate';
 import {
@@ -140,27 +158,45 @@ import {
   toolContinuationLimit
 } from '../lib/agentLoop';
 import { streamChat } from '../lib/ollamaClient';
-import { ToolActionCard } from './agent/ToolActionCard';
-import { PlanOptionsCard } from './agent/PlanOptionsCard';
-import { ReviewPlanCard } from './agent/ReviewPlanCard';
 import { PlannerPlanPanel } from './agent/PlannerPlanPanel';
+import { ErrorCard, clipErrorCause } from './agent/ErrorCard';
 import { NodeWorkPanel } from './agent/NodeWorkPanel';
-import { StepVerdictCard } from './agent/StepVerdictCard';
 import { HelpTip } from './agent/HelpTip';
-import { ActivityIndicator, streamingActivityLabel } from './agent/ActivityIndicator';
-import { modelSupportsThinking, resolveThinkOption, thinkingToggleLabel } from '../lib/thinking';
+import { ActivityIndicator, describeRunStatus } from './agent/ActivityIndicator';
+import { MessageList } from './agent/MessageList';
+import { ContextMeter } from './agent/ContextMeter';
+import { EmptyChatChecklist } from './agent/EmptyChatChecklist';
+import { AutomationDrawer } from './agent/AutomationDrawer';
+import { snapshotNodeConfigs } from './agent/snapshotNodes';
+import { scrubStructuredMarkup } from './agent/messageText';
 import {
-  pickDynamicNumCtx,
-  resolveModelNumCtx,
+  modelSupportsThinking,
+  resolveThinkOption,
+  thinkFalseForSidePaths,
+  thinkingToggleLabel,
+  type ThinkPersona
+} from '../lib/thinking';
+import {
+  capActiveFileForTier,
+  pinnedNumCtx,
   type DynamicCtxRole
 } from '../lib/contextSize';
+import {
+  lastContextMeter,
+  notePromptSample,
+  ollamaOptions,
+  pinnedChatOptions,
+  prependVolatileContext,
+  siblingFile,
+  warmModels
+} from './agent/modelRequest';
 import {
   contextWasExhausted,
   fitPromptToContext,
   shrinkUserPacket
 } from '../lib/contextMonitor';
 import { webEntryVerifyErrors } from '../lib/webEntryGate';
-import { resolveModelFit } from '../lib/clusterInventory';
+import { resolveModelFit, type ModelFitTier } from '../lib/clusterInventory';
 import {
   ASSIST_MAX_PREDICT,
   FREE_TIER_ASSIST_SYSTEM,
@@ -192,10 +228,11 @@ import {
   parseWorkLog,
   rememberAsked,
   renderWorkLog,
+  verifyFingerprintChanged,
   workLogPath,
   type WorkLog
 } from '../lib/workLog';
-import { fileToChatImage, modelSupportsVision, toOllamaBase64 } from '../lib/images';
+import { fileToChatImage, modelSupportsVision, selectImagesForTier, toOllamaBase64 } from '../lib/images';
 import {
   buildApprovedPlan,
   buildPlanSummary,
@@ -215,22 +252,12 @@ import {
   parseReviewDelta,
   parseReviewPlan,
   parseStepVerdict,
-  stripExecutionPlanMarkup,
   stripFixContractMarkup,
   stripPlanOptionMarkup,
   stripReviewDeltaMarkup,
   stripReviewPlanMarkup,
   stripStepVerdictMarkup
 } from '../lib/planOptions';
-
-/** Scrub planner/reviewer structured XML that local models leave in the bubble. */
-function scrubStructuredMarkup(text: string): string {
-  return stripExecutionPlanMarkup(
-    stripStepVerdictMarkup(
-      stripReviewDeltaMarkup(stripReviewPlanMarkup(stripPlanOptionMarkup(text || '')))
-    )
-  );
-}
 import {
   applyReviewDelta,
   createQueueFromReviewPlan,
@@ -246,16 +273,19 @@ import {
   activateNextStep,
   appendPlannerPlan,
   applyStepVerdict,
+  canHealAdvanceOnGreenVerify,
   collectStepFilePaths,
   createPlanFromParsed,
+  editStepTask,
   formatPlanForPanel,
   formatStepForCoders,
   formatStepForReviewer,
   getActiveStep,
+  pickHealStep,
   continuePastFailedStep,
   insertFixStepsAfter,
   isPlanActive,
-  markAllStepTasks,
+  markPlanFinalReview,
   markStepInProgress,
   MAX_HEAL_ATTEMPTS,
   MAX_PLAN_ESCALATIONS,
@@ -263,11 +293,21 @@ import {
   MAX_STEP_REWORKS,
   notesLookLikeVerifyFailure,
   parsePlannerPlanJson,
+  planReadyForRelease,
   plannerPlanFromReviewQueue,
   plannerPlanPath,
-  serializePlannerPlan,
-  stepLooksLikeFixStep
+  retryFailedStep,
+  skipStep,
+  stepLooksLikeFixStep,
+  writePlannerPlan
 } from '../lib/plannerPlan';
+import { transition } from '../lib/conductor';
+import {
+  awaitConductorChat,
+  useConductorSession,
+  type ConductorRun
+} from '../hooks/useConductorSession';
+import { assignSwarmDiagnostics } from './agent/swarmDiagnostics';
 import {
   buildContinuationReviewPrompt,
   buildTouchedFilesContext,
@@ -288,9 +328,13 @@ import {
 import {
   SPECIALTY_META,
   applyClusterAutoConfigPlan,
-  buildClusterAutoConfigPlan
+  buildClusterAutoConfigPlan,
+  type ClusterAutoConfigPlan
 } from '../lib/clusterAdvisor';
 import { normalizeClusterNodes } from '../lib/tools';
+
+const MESSAGE_COLUMN_MIN = 320;
+const NODE_WORK_RAIL = 36;
 
 interface AgentChatProps {
   agents: AgentPersona[];
@@ -358,6 +402,10 @@ interface AgentChatProps {
   maxAgentSteps?: number;
   /** True while a local/frontier agent turn (or stuck ladder) is in flight — blocks update restart. */
   onBusyChange?: (busy: boolean) => void;
+  /** Open Hardware Settings when a run fails. Omitted until App wires it. */
+  onOpenHardware?: () => void;
+  /** Open the project folder picker. Used by the empty-chat checklist. */
+  onOpenFolder?: () => void;
   /** Peer conductor snapshot (from live session) — toggles + Generating indicator. */
   peerConductor?: LiveConductorState | null;
   /** Live messages from the peer for the active conversation (streaming mirror). */
@@ -400,7 +448,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   onToggleModelThinking,
   searxngUrl = '',
   mcpServersJson = '',
-  swarmEnabled = true,
+  swarmEnabled = false,
   autoNodeEnabled = true,
   autoApplyEnabled = true,
   autoReviewEnabled = true,
@@ -409,6 +457,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   onUpdateNodes,
   maxAgentSteps = 12,
   onBusyChange,
+  onOpenHardware,
+  onOpenFolder,
   peerConductor = null,
   peerChatMirror = null,
   onLiveConductorPublish
@@ -465,6 +515,10 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const applyingPeerConductorRef = useRef(false);
   const peerConductorRevAppliedRef = useRef(0);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [assistError, setAssistError] = useState<{ cause: string; node?: string; model?: string } | null>(null);
+  const [autoConfigPlan, setAutoConfigPlan] = useState<ClusterAutoConfigPlan | null>(null);
+  const [autoConfigMode, setAutoConfigMode] = useState<'confirm' | 'applied'>('confirm');
+  const [autoConfigUndo, setAutoConfigUndo] = useState<NodeConfig[] | null>(null);
   /** Mobile fill mode: full-screen Conductor sheet */
   const [mobileControlsOpen, setMobileControlsOpen] = useState(false);
   /** Banner after user picks a plan option — Coder is running the locked plan */
@@ -492,6 +546,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const projectBrainRef = useRef<ProjectBrain>(emptyProjectBrain());
   const projectRulesRef = useRef('');
   const repoMapRef = useRef<RepoMap | null>(null);
+  const repoMapGenRef = useRef(0);
+  /** Fit tier for tool-result caps. Updated when a turn's route is known. */
+  const toolResultTierRef = useRef<ModelFitTier>('standard');
   const finalReviewPlanIdRef = useRef<string | null>(null);
   /** Set after finishVerifiedPlan is created — heal completion runs before that const. */
   const finishVerifiedPlanRef = useRef<(plan: PlannerPlan) => Promise<void>>(async () => {});
@@ -514,9 +571,22 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       commitProjectBrain(next);
     }
   };
-  const chatBottomRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const newChatRef = useRef<() => void>(() => {});
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const activeAbortsRef = useRef<(() => void)[]>([]);
+  const conductor = useConductorSession();
+  const {
+    stopRequestedRef,
+    runRef,
+    heldRef,
+    editProgressRef,
+    isCurrent: runIsCurrent,
+    live: runLive,
+    registerAbort,
+    enter: enterConductorRun,
+    leave: leaveConductorRun,
+    stop: stopConductor
+  } = conductor;
   const messagesRef = useRef<ChatMessage[]>([]);
   const continuationDepthRef = useRef(0);
   const commandFixAttemptsRef = useRef(0);
@@ -531,7 +601,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   );
   /** Auto-review Nay reworks per step id — caps infinite Coder↔Reviewer loops. */
   const stepReworkCountRef = useRef<Record<string, number>>({});
-  const stopRequestedRef = useRef(false);
+  /** Pre-coder file bytes keyed by step id. Capped at 2 MB across the map. */
+  const stepSnapshotsRef = useRef<Map<string, { path: string; content: string }[]>>(new Map());
+  const STEP_SNAPSHOT_CAP = 2 * 1024 * 1024;
   /** True after Stop (or idle) while a durable plan is still active — show Continue. */
   const [planPaused, setPlanPaused] = useState(false);
   /** Live Node Work column (Swarm + single-node workers). */
@@ -571,45 +643,90 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     stepReworkCountRef.current = seeded;
   };
 
-  const commitPlannerPlan = (next: PlannerPlan | null) => {
-    plannerPlanRef.current = next;
-    setPlannerPlanView(next);
-    syncReworkCountsFromPlan(next);
-    onConversationPatch?.({ plannerPlan: next });
-    if (next?.steps?.length) {
-      const todo = next.steps.map(s => ({
-        id: String(s.id),
-        title: s.title,
-        status: s.status
-      }));
-      const brain = projectBrainRef.current;
-      const same =
-        brain.todo.length === todo.length &&
-        brain.todo.every((t, i) => t.id === todo[i].id && t.status === todo[i].status);
-      if (!same) {
-        commitProjectBrain({
-          ...brain,
-          todo,
-          ...(next.delivery ? { delivery: next.delivery } : {}),
-          ...(next.verifyCommand ? { verifyCommand: next.verifyCommand } : {})
-        });
-      }
+  /**
+   * Join `parent` or start a run. Send/Play pass clearStop. Nested calls pass parent
+   * so a second tryLock does not drop the work. Plan writes use the id captured here.
+   */
+  const bindRun = (
+    parent: ConductorRun | undefined | null,
+    clearStop: boolean
+  ): { run: ConductorRun; owned: boolean } | null => {
+    const entered = enterConductorRun(conversationIdRef.current, {
+      clearStop,
+      parent: parent ?? null
+    });
+    if (!entered) return null;
+    if (entered.owned) {
+      toolDepsRef.current = {
+        ...toolDepsRef.current,
+        editProgress: editProgressRef.current
+      };
     }
-    const id = conversationIdRef.current;
-    if (!workspacePath || !id || !window.electronAPI?.writeFile) return;
-    if (next) {
-      void window.electronAPI.writeFile(
-        plannerPlanPath(workspacePath, id),
-        serializePlannerPlan(next)
+    return entered;
+  };
+
+  const savedFileFingerprints = (next?: string | null) => ({
+    previous: plannerPlanRef.current?.lastErrorFingerprint,
+    next: next ?? plannerPlanRef.current?.lastErrorFingerprint
+  });
+
+  const commitPlannerPlan = async (next: PlannerPlan | null, token?: number) => {
+    if (typeof token === 'number' && !runIsCurrent(token)) return;
+    const run = runRef.current;
+    const id =
+      typeof token === 'number' && run && run.token === token && run.conversationId
+        ? run.conversationId
+        : conversationIdRef.current;
+    if (!id) return;
+    const showing = () =>
+      conversationIdRef.current === id && (typeof token !== 'number' || runIsCurrent(token));
+    const publish = (plan: PlannerPlan | null) => {
+      if (!showing()) return;
+      plannerPlanRef.current = plan;
+      setPlannerPlanView(plan);
+      syncReworkCountsFromPlan(plan);
+      onConversationPatch?.({ plannerPlan: plan });
+      if (plan?.steps?.length) {
+        const todo = plan.steps.map(s => ({
+          id: String(s.id),
+          title: s.title,
+          status: s.status
+        }));
+        const brain = projectBrainRef.current;
+        const same =
+          brain.todo.length === todo.length &&
+          brain.todo.every((t, i) => t.id === todo[i].id && t.status === todo[i].status);
+        if (!same) {
+          commitProjectBrain({
+            ...brain,
+            todo,
+            ...(plan.delivery ? { delivery: plan.delivery } : {}),
+            ...(plan.verifyCommand ? { verifyCommand: plan.verifyCommand } : {})
+          });
+        }
+      }
+    };
+    publish(next);
+    if (!next || !workspacePath || !window.electronAPI?.writeFile) return;
+    try {
+      const saved = await writePlannerPlan(workspacePath, id, next, (abs, content) =>
+        window.electronAPI.writeFile(abs, content)
+      );
+      publish(saved);
+    } catch (err) {
+      window.electronAPI?.writeLog?.(
+        'error',
+        `planner plan write failed: ${String((err as Error)?.message || err)}`
       );
     }
   };
 
-  const setPlanResumePhase = (phase: PlannerResumePhase | undefined) => {
+  const setPlanResumePhase = (phase: PlannerResumePhase | undefined, token?: number) => {
     const plan = plannerPlanRef.current;
     if (!plan) return;
     if (plan.resumePhase === phase) return;
-    commitPlannerPlan({ ...plan, resumePhase: phase, updatedAt: Date.now() });
+    if (typeof token === 'number' && !runIsCurrent(token)) return;
+    void commitPlannerPlan({ ...plan, resumePhase: phase, updatedAt: Date.now() }, token);
   };
 
   const commitExecutionQueue = (next: ExecutionQueue | null) => {
@@ -689,8 +806,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   useEffect(() => {
     const nextId = conversation?.id ?? null;
     if (nextId !== conversationIdRef.current) {
-      activeAbortsRef.current.forEach(abort => abort());
-      activeAbortsRef.current = [];
+      stopConductor();
       setIsStreaming(false);
       resetAgentLoopBudget();
       conversationIdRef.current = nextId;
@@ -823,9 +939,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           autoReview,
           includeActiveFile,
           isStreaming,
-          activityLabel: isStreaming
-            ? streamingActivityLabel(latestAssistant)
-            : activityLabelOf(activityStackRef.current) || executingPlanNotice || undefined,
+          activityLabel: describeRunStatus({
+            steps: nodeWorkStepsRef.current,
+            activityLabel: activityLabelOf(activityStackRef.current),
+            notice: executingPlanNotice,
+            message: isStreaming ? latestAssistant : undefined
+          }).text,
           targetNodeId,
           targetModel,
           executingPlanNotice,
@@ -1005,10 +1124,31 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     searxngUrl,
     getOwnedFiles: () => projectBrainRef.current.ownedFiles,
     getRepoMap: () => repoMapRef.current,
-    mcpServersJson
+    mcpServersJson,
+    editProgress: editProgressRef.current,
+    toolResultTier: toolResultTierRef.current
   };
   const toolDepsRef = useRef(toolDeps);
   toolDepsRef.current = toolDeps;
+  const applyToolTier = (tier: ModelFitTier) => {
+    toolResultTierRef.current = tier;
+    toolDepsRef.current = { ...toolDepsRef.current, toolResultTier: tier };
+  };
+  const rebuildRepoMap = () => {
+    repoMapRef.current = invalidateRepoMap(repoMapRef.current);
+    if (!workspacePath) return;
+    const gen = ++repoMapGenRef.current;
+    const root = workspacePath;
+    void buildRepoMap(root).then(map => {
+      if (gen !== repoMapGenRef.current) return;
+      repoMapRef.current = map;
+    });
+  };
+  const noteAppliedWrites = (tools: Array<{ name?: string; status?: string }>) => {
+    if (tools.some(t => (t.name === 'write_file' || t.name === 'edit_file') && t.status === 'done')) {
+      rebuildRepoMap();
+    }
+  };
 
   const inlineEditHandlerRef = useRef<(detail: { path?: string; selection?: string; instruction?: string }) => void>(
     () => {}
@@ -1133,10 +1273,11 @@ ${instruction}`,
         n => n.online && !isFrontierNode(n) && getEnabledModelsForNode(n).length > 0
       );
       const next =
-        rankModelsForWeight(locals, 'heavy') ||
+        rankModelsForWeight(locals, 'heavy', { role: 'planner' }) ||
         rankModelsForWeight(
           live.filter(n => n.online && getEnabledModelsForNode(n).length > 0),
-          'heavy'
+          'heavy',
+          { role: 'planner' }
         );
       if (next && (next.node.id !== targetNodeId || next.model !== targetModel)) {
         setTargetNodeId(next.node.id);
@@ -1154,10 +1295,6 @@ ${instruction}`,
     messagesRef.current = messages;
   }, [messages]);
 
-  useEffect(() => {
-    chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, isStreaming]);
-
   // Persona defaults (qwen2.5-coder:7b, etc.) are only a hint. The label and the
   // request use a model that is actually enabled on the selected node.
   const activeTargetModel = effectiveModels.includes(targetModel)
@@ -1166,7 +1303,7 @@ ${instruction}`,
         ? pickBestModelForComplexity(selectedNode, 'heavy') || effectiveModels[0]
         : effectiveModels[0]) || '';
   const activeTargetMaxCtx = activeTargetModel
-    ? resolveModelNumCtx(selectedNode, activeTargetModel, currentAgent.numCtx)
+    ? pinnedNumCtx(selectedNode, activeTargetModel, currentAgent.numCtx)
     : 0;
 
   const benchmarkStat = selectedNode?.benchmarks?.[activeTargetModel];
@@ -1195,16 +1332,19 @@ ${instruction}`,
     if (!files) return;
     const list = Array.from(files).filter(f => f.type.startsWith('image/'));
     if (!list.length) return;
+    const tier = activeTargetModel
+      ? resolveModelFit(selectedNode, activeTargetModel, 'coder', currentAgent.numCtx).tier
+      : 'standard';
     const encoded: string[] = [];
-    for (const f of list.slice(0, 4)) {
+    for (const f of selectImagesForTier(list, tier)) {
       try {
-        encoded.push(await fileToChatImage(f));
+        encoded.push(await fileToChatImage(f, { tier }));
       } catch (err) {
         console.warn('Failed to attach image', err);
       }
     }
     if (encoded.length) {
-      setPendingImages(prev => [...prev, ...encoded].slice(0, 6));
+      setPendingImages(prev => selectImagesForTier([...prev, ...encoded], tier));
     }
   };
 
@@ -1223,21 +1363,29 @@ ${instruction}`,
     await addImageFiles(imageFiles);
   };
 
-  /** Attach top-level Ollama `think` when the selected model supports it. */
-  const withThink = (body: Record<string, unknown>, node: EndpointNode | undefined, model: string) => {
+  /**
+   * Attach top-level Ollama `think`. Persona picks a level when the model advertises them.
+   * Side paths (assist briefs) send `think: false` instead of this helper.
+   */
+  const withThink = (
+    body: Record<string, unknown>,
+    node: EndpointNode | undefined,
+    model: string,
+    persona?: ThinkPersona
+  ) => {
     const live = node?.models?.find(m => m.name === model);
     const meta = node?.modelMeta?.[model];
     const modelInfo = live || (meta
       ? { name: model, capabilities: meta.capabilities, thinking: meta.thinking }
       : undefined);
-    const think = resolveThinkOption(modelInfo, node?.modelPrefs?.[model]?.think);
+    const think = resolveThinkOption(modelInfo, node?.modelPrefs?.[model]?.think, { persona });
     if (think === undefined) return body;
     return { ...body, think };
   };
 
-  /** User max context ceiling for this model (Hardware Settings). */
+  /** Pinned num_ctx ceiling for this model. Do not vary it per payload. */
   const modelMaxCtx = (node: EndpointNode | undefined, model: string) =>
-    resolveModelNumCtx(node, model, currentAgent.numCtx);
+    pinnedNumCtx(node, model, currentAgent.numCtx);
 
   const roleForDynamicCtx = (handle?: string): DynamicCtxRole => {
     const h = (handle || '').toLowerCase();
@@ -1248,28 +1396,23 @@ ${instruction}`,
     return 'generic';
   };
 
-  /**
-   * Live Ollama num_ctx for this request.
-   * Planner / Reviewer always use the Hardware Settings ceiling so long history
-   * after tight worker packets does not under-size the window.
-   * Coder and other roles keep dynamic sizing from the payload.
-   */
-  const chatNumCtx = (
+  const chatOptions = (
     node: EndpointNode | undefined,
     model: string,
-    messages?: Array<{ role?: string; content?: unknown }>,
-    opts?: { role?: DynamicCtxRole; createIntent?: boolean }
-  ) => {
-    const maxCtx = modelMaxCtx(node, model);
-    if (opts?.role === 'planner' || opts?.role === 'reviewer') return maxCtx;
-    if (!messages?.length) return maxCtx;
-    return pickDynamicNumCtx({
-      messages,
-      maxCtx,
-      role: opts?.role,
-      createIntent: opts?.createIntent
-    });
-  };
+    role: DynamicCtxRole,
+    extra?: { createIntent?: boolean; tier?: ModelFitTier; temperature?: number; fallbackNumCtx?: number }
+  ) =>
+    ollamaOptions(
+      pinnedChatOptions({
+        node,
+        model,
+        role,
+        createIntent: extra?.createIntent,
+        tier: extra?.tier,
+        temperature: extra?.temperature,
+        fallbackNumCtx: extra?.fallbackNumCtx ?? currentAgent.numCtx
+      })
+    );
 
   const freeTierUsageFor = (node: EndpointNode): FreeTierUsage | undefined => {
     const saved = node.freeTierUsage;
@@ -1285,9 +1428,14 @@ ${instruction}`,
     target: { node: EndpointNode; model: string },
     purpose: string,
     payload: string,
-    countFreeTier: boolean
+    countFreeTier: boolean,
+    parent?: ConductorRun
   ): Promise<string | null> => {
-    if (stopRequestedRef.current) return null;
+    const entered = bindRun(parent ?? null, false);
+    if (!entered) return null;
+    const run = entered.run;
+    try {
+    if (!runLive(run)) return null;
 
     const runOnce = async (): Promise<{ content: string; aborted: boolean; stats?: { evalCount?: number; promptEvalCount?: number }; error?: string }> => {
       if (countFreeTier) {
@@ -1299,7 +1447,7 @@ ${instruction}`,
             );
           }
         });
-        if (stopRequestedRef.current) return { content: '', aborted: true };
+        if (!runLive(run)) return { content: '', aborted: true };
         if (waited > 0) {
           window.electronAPI?.writeLog?.(
             'info',
@@ -1307,31 +1455,30 @@ ${instruction}`,
           );
         }
       }
-      const handle = streamChat(
-        target.node.url,
-        withThink(
-          {
-            model: target.model,
-            messages: [
-              { role: 'system', content: FREE_TIER_ASSIST_SYSTEM },
-              { role: 'user', content: `${purpose}\n\n${tailForAssist(payload)}` }
-            ],
-            options: { temperature: 0.1, num_predict: ASSIST_MAX_PREDICT }
-          },
-          target.node,
-          target.model
-        ),
-        () => {},
-        target.node.type,
-        target.node.apiKey
-      );
-      activeAbortsRef.current = [...activeAbortsRef.current, handle.abort];
+      const assistMessages = [
+        { role: 'system', content: FREE_TIER_ASSIST_SYSTEM },
+        { role: 'user', content: `${purpose}\n\n${tailForAssist(payload)}` }
+      ];
+      const body = {
+        model: target.model,
+        messages: assistMessages,
+        think: thinkFalseForSidePaths(),
+        options: {
+          temperature: 0.1,
+          num_predict: ASSIST_MAX_PREDICT,
+          num_ctx: pinnedNumCtx(target.node, target.model, currentAgent.numCtx)
+        }
+      };
       try {
-        const result = await handle.done;
+        const taken = await awaitConductorChat(
+          () => streamChat(target.node.url, body, () => {}, target.node.type, target.node.apiKey),
+          { registerAbort, live: () => runLive(run) }
+        );
+        if (taken.aborted) return { content: '', aborted: true };
         return {
-          content: result.content || '',
-          aborted: result.aborted,
-          stats: result.stats
+          content: taken.result.content || '',
+          aborted: false,
+          stats: taken.result.stats
         };
       } catch (err: any) {
         return { content: '', aborted: false, error: err?.message || String(err) };
@@ -1341,7 +1488,7 @@ ${instruction}`,
     let result = await runOnce();
     // If the stream layer still surfaces a rate-limit error, wait and retry once more.
     for (let attempt = 0; attempt < 2; attempt++) {
-      if (result.aborted || stopRequestedRef.current) return null;
+      if (result.aborted || !runLive(run)) return null;
       if (!isRateLimitError(result.error) && result.content.trim()) break;
       if (!isRateLimitError(result.error) && !result.error) break;
       if (!isRateLimitError(result.error)) break;
@@ -1354,13 +1501,18 @@ ${instruction}`,
         `free-tier rate limit retry in ${backoff}ms: ${result.error}`
       );
       await new Promise<void>(r => setTimeout(r, backoff));
-      if (stopRequestedRef.current) return null;
+      if (!runLive(run)) return null;
       result = await runOnce();
     }
 
-    if (result.aborted || stopRequestedRef.current) return null;
+    if (result.aborted || !runLive(run)) return null;
     if (result.error && !result.content.trim()) {
       window.electronAPI?.writeLog?.('warn', `free-tier assist failed: ${result.error}`);
+      setAssistError({
+        cause: clipErrorCause(result.error, 'Cloud assist failed.'),
+        node: target.node.name,
+        model: target.model
+      });
       return null;
     }
     const brief = (result.content || '').replace(/\s+/g, ' ').trim().slice(0, 1800);
@@ -1372,14 +1524,29 @@ ${instruction}`,
     if (result.stats?.evalCount) {
       onRecordTokens(0, result.stats.evalCount + (result.stats.promptEvalCount || 0));
     }
+    notePromptSample(
+      target.model,
+      [
+        { content: FREE_TIER_ASSIST_SYSTEM },
+        { content: `${purpose}\n\n${tailForAssist(payload)}` }
+      ],
+      result.stats
+    );
     return brief;
+    } finally {
+      leaveConductorRun(entered.owned, entered.run.token);
+    }
   };
 
   /** One short frontier reply when the local window cannot hold the job. Null when no free-tier quota is left. */
-  const requestFreeTierBrief = async (purpose: string, payload: string): Promise<string | null> => {
+  const requestFreeTierBrief = async (
+    purpose: string,
+    payload: string,
+    parent?: ConductorRun
+  ): Promise<string | null> => {
     const assist = pickFreeTierAssist(nodesRef.current, freeTierUsageFor);
     if (!assist) return null;
-    return requestAssistBrief(assist, purpose, payload, true);
+    return requestAssistBrief(assist, purpose, payload, true, parent);
   };
 
   const progressForPrompt = () => (hasWorkLog(progressRef.current) ? renderWorkLog(progressRef.current) : '');
@@ -1392,12 +1559,23 @@ ${instruction}`,
     if (notice) setExecutingPlanNotice(notice);
   };
 
-  const fitContext = (numCtx: number, force = false) => {
+  const fitContext = (numCtx: number, forceOrModel?: boolean | string, modelKey?: string) => {
+    const force = forceOrModel === true;
+    const key = typeof forceOrModel === 'string' ? forceOrModel : modelKey;
     const current = messagesRef.current;
     if (current.length < 6) return;
-    if (!force && !shouldCompact(current, numCtx)) return;
-    const next = compactMessages(current);
-    if (next.length >= current.length && historyTokens(next) >= historyTokens(current) * 0.9) return;
+    if (!force && !shouldCompact(current, numCtx, key)) return;
+    const planSummary = plannerPlanRef.current?.summary
+      ? `${plannerPlanRef.current.status}: ${plannerPlanRef.current.summary}`
+      : approvedPlanRef.current
+        ? formatApprovedPlanBrief(approvedPlanRef.current)
+        : undefined;
+    const next = compactMessages(current, {
+      planSummary,
+      contractPath: projectBrainRef.current.contractFile,
+      workLog: progressForPrompt()
+    });
+    if (next.length >= current.length && historyTokens(next, key) >= historyTokens(current, key) * 0.9) return;
     messagesRef.current = next;
     setMessages(next);
   };
@@ -1407,11 +1585,12 @@ ${instruction}`,
     node: EndpointNode,
     model: string,
     content: string,
-    doneReason?: string,
-    expectedFilePath?: string
+    doneReason: string | undefined,
+    expectedFilePath: string | undefined,
+    token: number
   ): Promise<string> => {
     const open = hasUnclosedWrite(content);
-    if (!open || stopRequestedRef.current) return content;
+    if (!open || !runIsCurrent(token) || stopRequestedRef.current) return content;
     // Local models often report "stop" while forgetting </write_file>. Still continue once
     // when we know the path (assigned swarm file or tagged path).
     const pathKnown = !!(open.path && open.path !== 'file') || !!expectedFilePath;
@@ -1443,19 +1622,19 @@ ${instruction}`,
       {
         model,
         messages: continueMsgs,
-        options: {
-          temperature: 0.2,
-          num_ctx: chatNumCtx(node, model, continueMsgs, { role: 'coder', createIntent: true })
-        }
+        options: chatOptions(node, model, 'coder', { createIntent: true, temperature: 0.2 })
       },
       node,
-      model
+      model,
+      'coder'
     );
     try {
-      const handle = streamChat(node.url, body, () => {}, node.type, node.apiKey);
-      activeAbortsRef.current.push(handle.abort);
-      const res = await handle.done;
-      const extra = (res.content || '').trim();
+      const taken = await awaitConductorChat(
+        () => streamChat(node.url, body, () => {}, node.type, node.apiKey),
+        { registerAbort, live: () => runIsCurrent(token) && !stopRequestedRef.current }
+      );
+      if (taken.aborted || !runIsCurrent(token)) return content;
+      const extra = (taken.result.content || '').trim();
       if (!extra) return content;
       return content + (content.endsWith('\n') ? '' : '\n') + extra;
     } catch (err: any) {
@@ -1468,8 +1647,17 @@ ${instruction}`,
   // UNIFIED TOOL EXECUTION & AGENTIC LOOP
   // ==========================================
   const runSingleTool = async (tool: ToolCall): Promise<ToolCall> => {
+    const owner = runRef.current;
+    const captured = owner
+      ? { token: owner.token, conversationId: owner.conversationId }
+      : null;
+    const conversationAtStart = conversationIdRef.current;
     const updated = await executeTool(tool, toolDepsRef.current);
-    updateProgress(log => noteSavedFiles(log, [updated]));
+    const sameConversation =
+      conversationIdRef.current === (captured ? captured.conversationId : conversationAtStart);
+    if (!sameConversation) return updated;
+    if (captured && !runIsCurrent(captured.token)) return updated;
+    updateProgress(log => noteSavedFiles(log, [updated], savedFileFingerprints()));
     let hostMsg: ChatMessage | undefined;
     setMessages(prev =>
       prev.map(m => {
@@ -1510,6 +1698,7 @@ ${instruction}`,
       reviewMode?: boolean;
       /** Cleared-context worker continue (only this turn + tool feedback). */
       freshContext?: boolean;
+      run?: ConductorRun;
     }
   ) => {
     const budget = opts?.budget;
@@ -1615,13 +1804,28 @@ ${instruction}`,
       toolCalls: []
     };
 
+    const entered = bindRun(opts?.run ?? null, false);
+    if (!entered) return;
+    const run = entered.run;
+    if (!runLive(run)) {
+      leaveConductorRun(entered.owned, entered.run.token);
+      return;
+    }
     setMessages(prev => [...prev, followUpMsg]);
     setIsStreaming(true);
 
     try {
+      const continueTier = resolveModelFit(
+        routeNode,
+        routeModel,
+        roleForDynamicCtx(continueAgent.handle),
+        continueAgent.numCtx
+      ).tier;
+      applyToolTier(continueTier);
       let continuationPrompt = buildContinuationUserPrompt(feedbackTools, {
         // True only on a 2nd+ command-fix continue (when MAX_COMMAND_FIX_ATTEMPTS > 1)
-        finalCommandAttempt: priorFixAttempts > 0
+        finalCommandAttempt: priorFixAttempts > 0,
+        tier: continueTier
       });
       const emptyTerminalNoFail =
         feedbackTools.some(
@@ -1638,20 +1842,15 @@ ${instruction}`,
         planModeContinue || reviewModeContinue || lockPlanContinue;
       const stepVerdictContinue = !!opts?.stepVerdictMode || originMsg.stepVerdict != null;
       const freshContinue = !!(opts?.freshContext || ephemeralWorkerRef.current);
-      if (!freshContinue) fitContext(modelMaxCtx(routeNode, routeModel));
+      if (!freshContinue) fitContext(modelMaxCtx(routeNode, routeModel), routeModel);
+      const continueRole = roleForDynamicCtx(continueAgent.handle);
       const systemPrompt = buildSystemPrompt(continueAgent, workspacePath, workspaceOverview, {
+        stablePrefix: true,
         planMode: planModeContinue,
         reviewMode: reviewModeContinue,
         lockPlanMode: lockPlanContinue && !reviewModeContinue,
         stepVerdictMode: stepVerdictContinue || (planLocked && reviewModeContinue),
-        approvedPlan:
-          planModeContinue || reviewModeContinue || lockPlanContinue
-            ? null
-            : approvedPlanRef.current,
-        progressLog: progressForPrompt(),
-        projectContext: projectContextForPrompt(),
-        nodes: nodesRef.current,
-        inferenceNodeId: routeNode.id,
+        projectContext: projectContextForPrompt(rulesCapFor(continueTier)),
         inferenceModel: routeModel
       });
       // Ephemeral workers: only this turn + tool feedback. Planner keeps full chat memory.
@@ -1670,31 +1869,44 @@ ${instruction}`,
         },
         {
           role: 'user',
-          content: planModeContinue
-            ? `${continuationPrompt}\n\n[PLANNER DIRECTIVE: After using exploration results, produce the plan and end with a <plan_options> block. Do NOT write deliverable files.]`
-            : lockPlanContinue && !reviewModeContinue
-              ? `${continuationPrompt}\n\n[PLANNER DIRECTIVE: Finish the <execution_plan> steps/tasks for the chosen option. Do NOT emit <plan_options>. Do NOT write deliverable files.]`
-            : reviewModeContinue
-              ? stepVerdictContinue || planLocked
-                ? `${continuationPrompt}\n\n[REVIEWER DIRECTIVE: STOP reading. Emit <step_verdict> yay or nay for the active step only. Do NOT emit <plan_options> or <review_plan>. Do NOT write files.]`
-                : `${continuationPrompt}\n\n[REVIEWER DIRECTIVE: STOP reading more files. Report findings and end with a <review_plan> that has <task> items for Planner→Coder. Do NOT write/edit/Apply files yourself.]`
-              : continuationPrompt
+          content: prependVolatileContext(
+            planModeContinue
+              ? `${continuationPrompt}\n\n[PLANNER DIRECTIVE: After using exploration results, produce the plan and end with a <plan_options> block. Do NOT write deliverable files.]`
+              : lockPlanContinue && !reviewModeContinue
+                ? `${continuationPrompt}\n\n[PLANNER DIRECTIVE: Finish the <execution_plan> steps/tasks for the chosen option. Do NOT emit <plan_options>. Do NOT write deliverable files.]`
+                : reviewModeContinue
+                  ? stepVerdictContinue || planLocked
+                    ? `${continuationPrompt}\n\n[REVIEWER DIRECTIVE: STOP reading. Emit <step_verdict> yay or nay for the active step only. Do NOT emit <plan_options> or <review_plan>. Do NOT write files.]`
+                    : `${continuationPrompt}\n\n[REVIEWER DIRECTIVE: STOP reading more files. Report findings and end with a <review_plan> that has <task> items for Planner→Coder. Do NOT write/edit/Apply files yourself.]`
+                  : continuationPrompt,
+            {
+              nodes: nodesRef.current,
+              inferenceNodeId: routeNode.id,
+              includeInventory: planModeContinue || lockPlanContinue,
+              fallbackNumCtx: modelMaxCtx(routeNode, routeModel),
+              progressLog: progressForPrompt(),
+              overview: workspaceOverview,
+              approvedPlan:
+                planModeContinue || reviewModeContinue || lockPlanContinue
+                  ? null
+                  : approvedPlanRef.current
+            }
+          )
         }
       ];
 
       const body = withThink({
         model: routeModel,
         messages: conversationPayload,
-        options: {
+        options: chatOptions(routeNode, routeModel, continueRole, {
+          createIntent: !readOnlyContinue,
+          tier: continueTier,
           temperature: continueAgent.temperature,
-          num_ctx: chatNumCtx(routeNode, routeModel, conversationPayload, {
-            role: roleForDynamicCtx(continueAgent.handle),
-            createIntent: !readOnlyContinue
-          })
-        }
-      }, routeNode, routeModel);
+          fallbackNumCtx: continueAgent.numCtx
+        })
+      }, routeNode, routeModel, continueRole);
 
-      const handle = streamChat(
+      const openContinue = () => streamChat(
         routeNode.url,
         body,
         (content, thinking) => {
@@ -1713,6 +1925,7 @@ ${instruction}`,
           });
           displayLive = scrubStructuredMarkup(displayLive);
           if (liveVerdict || liveReview || parseExecutionPlan(content)) displayLive = '';
+          if (!runLive(run)) return;
           setMessages(prev => prev.map(m => {
             if (m.id === followUpId) {
               return {
@@ -1752,9 +1965,13 @@ ${instruction}`,
         routeNode.type,
         routeNode.apiKey
       );
-
-      activeAbortsRef.current = [handle.abort];
-      const result = await handle.done;
+      const taken = await awaitConductorChat(openContinue, {
+        registerAbort,
+        live: () => runLive(run)
+      });
+      if (taken.aborted || !runLive(run)) return;
+      const result = taken.result;
+      notePromptSample(routeModel, conversationPayload, result.stats);
       const finished = readOnlyContinue
         ? result.content
         : await finishTruncatedWrites(
@@ -1762,28 +1979,43 @@ ${instruction}`,
             routeModel,
             result.content,
             result.stats?.doneReason,
-            opts?.expectedFilePath
+            opts?.expectedFilePath,
+            run.token
           );
-      let finalParsed = parseResponse(finished, followUpId, false, {
+      if (!runLive(run)) return;
+      const finalParsed = parseResponse(finished, followUpId, false, {
         expectedFilePath: opts?.expectedFilePath,
-        createIntent: readOnlyContinue ? false : (opts?.createIntent ?? true)
+        createIntent: readOnlyContinue ? false : (opts?.createIntent ?? true),
+        allowUnclosedSalvage: false
       });
 
       let tools = collapseDuplicateReadTools(finalParsed.toolCalls);
+      if (
+        !readOnlyContinue &&
+        !continuationClosedWrite(result.content, finished) &&
+        hasUnclosedWrite(finished)
+      ) {
+        const truncated = truncatedWriteToolCall(finished, followUpId, opts?.expectedFilePath);
+        if (truncated) tools = [...tools, truncated];
+      }
       if (readOnlyContinue) {
         tools = tools.filter(t =>
           ['read_file', 'list_dir', 'search', 'read_terminal'].includes(t.name)
         );
       }
+      if (!runLive(run)) return;
       const readPass = await runReadOnlyTools(tools, toolDepsRef.current);
       tools = readPass.tools;
+      if (!runLive(run)) return;
 
       if (!readOnlyContinue && autoApplyWritesRef.current) {
         tools = await autoApplyWritableTools(tools, toolDepsRef.current);
+        if (!runLive(run)) return;
         tools = await runAuxTools(tools, toolDepsRef.current);
         const cmdPass = await runCommandTools(tools, toolDepsRef.current);
         tools = cmdPass.tools;
-        updateProgress(log => noteSavedFiles(log, tools));
+        updateProgress(log => noteSavedFiles(log, tools, savedFileFingerprints()));
+        noteAppliedWrites(tools);
       }
 
       const stillFailing =
@@ -1834,23 +2066,27 @@ ${instruction}`,
 
       setMessages(prev => prev.map(m => (m.id === followUpId ? followUpMsgFinal : m)));
 
-      if (shouldContinueFromTools(tools, continueDecisionOpts(budget))) {
-        await continueWithToolResults(followUpMsgFinal, opts);
+      if (runLive(run) && shouldContinueFromTools(tools, continueDecisionOpts(budget))) {
+        await continueWithToolResults(followUpMsgFinal, { ...opts, run });
       }
     } catch (err: any) {
       window.electronAPI?.writeLog?.('error', `code generation: ${err?.message || err}`);
-      setMessages(prev => prev.map(m => {
-        if (m.id === followUpId) {
-          return {
-            ...m,
-            display: m.display + `\n\n⚠️ Error during code generation: ${err.message}`
-          };
-        }
-        return m;
-      }));
+      if (runLive(run)) {
+        setMessages(prev => prev.map(m => {
+          if (m.id === followUpId) {
+            return {
+              ...m,
+              error: err?.message || String(err),
+              endpointName: m.endpointName || routeNode.name,
+              model: m.model || routeModel
+            };
+          }
+          return m;
+        }));
+      }
     } finally {
       setIsStreaming(false);
-      activeAbortsRef.current = [];
+      leaveConductorRun(entered.owned, entered.run.token);
     }
   };
 
@@ -1860,10 +2096,21 @@ ${instruction}`,
   const handleSendPipelineMessage = async (
     userText: string,
     fullPrompt: string,
-    opts?: { approvedPlan?: ApprovedPlan | null; skipUserAppend?: boolean }
+    opts?: {
+      approvedPlan?: ApprovedPlan | null;
+      skipUserAppend?: boolean;
+      run?: ConductorRun;
+      /** Active plan step: skip Pass-1 and fan one worker per file. */
+      stepDispatch?: { files: string[]; brief: string };
+    }
   ) => {
+    const entered = bindRun(opts?.run ?? null, false);
+    if (!entered) return;
+    const run = entered.run;
+    try {
+    void fullPrompt;
     resetAgentLoopBudget();
-    fitContext(modelMaxCtx(selectedNode, activeTargetModel));
+    fitContext(modelMaxCtx(selectedNode, activeTargetModel), activeTargetModel);
     const lockedPlan = opts?.approvedPlan ?? approvedPlanRef.current;
     const userMsg: ChatMessage = {
       id: `msg-${Date.now()}`,
@@ -1880,6 +2127,7 @@ ${instruction}`,
     const patchPipelineMsg = (
       patch: Partial<ChatMessage> | ((m: ChatMessage) => ChatMessage)
     ) => {
+      if (!runLive(run)) return;
       setMessages(prev =>
         prev.map(m => {
           if (m.id !== agentMsgId) return m;
@@ -1902,26 +2150,23 @@ ${instruction}`,
     const loadExistingSnippets = async (): Promise<string> => {
       if (!window.electronAPI || !workspacePath) return '';
       const sep = workspacePath.includes('\\') ? '\\' : '/';
-      const rels = new Set<string>();
+      const ranked = relevantFilesForTask(repoMapRef.current, userText, 8);
+      const rels = new Set<string>(ranked.map(rel => rel.replace(/\\/g, '/')));
       const contract = projectBrainRef.current.contractFile;
-      if (contract) rels.add(contract.replace(/\\/g, '/'));
-      for (const owned of projectBrainRef.current.ownedFiles) rels.add(owned.replace(/\\/g, '/'));
-      for (const f of workspaceFiles || []) {
-        if (f.isDirectory) continue;
-        if (!/\.(ts|tsx|js|jsx|py|html|css)$/i.test(f.name)) continue;
-        const rel = f.path.startsWith(workspacePath)
-          ? f.path.slice(workspacePath.length).replace(/^[\\/]/, '').replace(/\\/g, '/')
-          : f.name;
-        rels.add(rel);
-        if (rels.size >= 14) break;
+      if (contract && rels.size < 8) rels.add(contract.replace(/\\/g, '/'));
+      if (rels.size < 4) {
+        for (const owned of projectBrainRef.current.ownedFiles) {
+          rels.add(owned.replace(/\\/g, '/'));
+          if (rels.size >= 8) break;
+        }
       }
       const chunks: string[] = [];
-      for (const rel of [...rels].slice(0, 12)) {
+      for (const rel of [...rels].slice(0, 8)) {
         try {
           const abs = `${workspacePath.replace(/[\\/]+$/, '')}${sep}${rel.replace(/\//g, sep)}`;
           const res = await window.electronAPI.readFile(abs);
           if (res.content != null) {
-            chunks.push(`### ${rel}\n\`\`\`\n${res.content.slice(0, 2200)}\n\`\`\``);
+            chunks.push(`### ${rel}\n\`\`\`\n${res.content.slice(0, 1200)}\n\`\`\``);
           }
         } catch {
           /* skip */
@@ -1930,7 +2175,12 @@ ${instruction}`,
       return chunks.join('\n\n');
     };
 
-    const recordTok = (node: EndpointNode, stats?: { evalCount?: number; promptEvalCount?: number }) => {
+    const recordTok = (
+      node: EndpointNode,
+      stats?: { evalCount?: number; promptEvalCount?: number },
+      sample?: { model: string; messages: Array<{ content?: unknown }> }
+    ) => {
+      if (sample) notePromptSample(sample.model, sample.messages, stats);
       if (!stats?.evalCount) return;
       const tok = stats.evalCount + (stats.promptEvalCount || 0);
       if (isFrontierNode(node)) onRecordTokens(0, tok);
@@ -1943,23 +2193,33 @@ ${instruction}`,
       userPrompt: string;
       expectedFilePath: string;
       stepLabel?: string;
+      stack?: string;
       retriedFrom?: string;
       retargeted?: boolean;
-    }) => {
+      /** Same-node retry already used. The next failure failsover. */
+      retriedSame?: boolean;
+    }): Promise<boolean> => {
+      if (!runLive(run)) return false;
       const { idx, assignment, userPrompt, expectedFilePath } = opts;
       let { node, model, skippedReason } = assignment;
       if (!opts.retargeted) {
         const liveNode = nodesRef.current.find(n => n.id === node.id);
         const stillLive = !!liveNode?.online && getEnabledModelsForNode(liveNode).includes(model);
         if (!stillLive) {
-          const next = assignSwarmTasksToCluster([assignment.task], nodesRef.current)[0];
-          const nextOk =
-            !!next &&
-            next.node.online &&
-            getEnabledModelsForNode(next.node).includes(next.model);
-          if (nextOk && (next.node.id !== node.id || next.model !== model)) {
-            await runWorkerTurn({ ...opts, assignment: next, retargeted: true });
-            return;
+          const fail = opts.retriedFrom
+            ? undefined
+            : pickFailoverTarget(nodesRef.current, node.id, model, { role: 'coder' });
+          if (
+            fail &&
+            fail.node.online &&
+            getEnabledModelsForNode(fail.node).includes(fail.model)
+          ) {
+            return runWorkerTurn({
+              ...opts,
+              assignment: { ...assignment, node: fail.node, model: fail.model },
+              retargeted: true,
+              retriedFrom: node.id
+            });
           }
           patchPipelineMsg(m => {
             if (!m.pipelineSteps) return m;
@@ -1973,7 +2233,7 @@ ${instruction}`,
             }
             return { ...m, pipelineSteps: updatedSteps };
           });
-          return;
+          return false;
         }
         node = liveNode!;
       }
@@ -1990,51 +2250,51 @@ ${instruction}`,
           }
           return { ...m, pipelineSteps: updatedSteps };
         });
-        return;
+        return false;
       }
 
+      if (!runLive(run)) return false;
       const workerFit = resolveModelFit(node, model, 'coder', coderAgent.numCtx);
-      const workerMap = formatRepoMap(repoMapRef.current, workerFit.tier, userPrompt);
-      const workerSystemPrompt = buildSystemPrompt(coderAgent, workspacePath, workspaceOverview, {
-        planMode: false,
-        reviewMode: false,
-        contractMode: false,
-        lockPlanMode: false,
-        stepVerdictMode: false,
-        progressLog: progressForPrompt(),
-        projectContext: projectContextForPrompt(rulesCapFor(workerFit.tier)),
-        nodes: nodesRef.current,
-        inferenceNodeId: node.id,
-        inferenceModel: model
+      applyToolTier(workerFit.tier);
+      const workerSystemPrompt = buildSwarmWorkerSystemStub(
+        expectedFilePath,
+        opts.stack || projectBrainRef.current.stack
+      );
+      const workerReq = pinnedChatOptions({
+        node,
+        model,
+        role: 'coder',
+        createIntent: true,
+        tier: workerFit.tier,
+        temperature: coderAgent.temperature,
+        fallbackNumCtx: coderAgent.numCtx
       });
-      const fittedWorkerPrompt = `${workerFit.section}\n\n${workerMap ? `${workerMap}\n\n` : ''}${userPrompt}${
-        workerFit.packingLine ? `\n\n${workerFit.packingLine}` : ''
-      }`;
       const workerFitPrompt = fitPromptToContext({
         system: workerSystemPrompt,
-        userContent: fittedWorkerPrompt,
+        userContent: userPrompt,
         history: [],
-        maxCtx: modelMaxCtx(node, model),
-        frontier: isFrontierNode(node)
+        maxCtx: workerReq.pinnedCtx,
+        frontier: isFrontierNode(node),
+        modelKey: model,
+        promptBudget: workerReq.promptBudget
       });
       if (workerFitPrompt.note) {
         setExecutingPlanNotice(workerFitPrompt.note);
       }
-      const workerMsgs = [
+      const workerOptions = ollamaOptions(workerReq);
+      let sentWorkerMsgs: Array<{ role: string; content: string }> = [
         { role: 'system', content: workerSystemPrompt },
         { role: 'user', content: workerFitPrompt.userContent }
       ];
       const body = withThink(
         {
           model,
-          messages: workerMsgs,
-          options: {
-            temperature: coderAgent.temperature,
-            num_ctx: chatNumCtx(node, model, workerMsgs, { role: 'coder', createIntent: true })
-          }
+          messages: sentWorkerMsgs,
+          options: workerOptions
         },
         node,
-        model
+        model,
+        'coder'
       );
 
       try {
@@ -2052,84 +2312,99 @@ ${instruction}`,
           },
           idx
         );
-        const handle = streamChat(
-          node.url,
-          body,
-          () => {
-            const statusLine = `Writing \`${expectedFilePath}\`…`;
-            patchPipelineMsg(m => {
-              if (!m.pipelineSteps) return m;
-              const updatedSteps = [...m.pipelineSteps];
-              if (updatedSteps[idx]) {
-                updatedSteps[idx] = {
-                  ...updatedSteps[idx],
+        const openWorker = (payload: Record<string, unknown>) =>
+          streamChat(
+            node.url,
+            payload,
+            () => {
+              const statusLine = `Writing \`${expectedFilePath}\`…`;
+              patchPipelineMsg(m => {
+                if (!m.pipelineSteps) return m;
+                const updatedSteps = [...m.pipelineSteps];
+                if (updatedSteps[idx]) {
+                  updatedSteps[idx] = {
+                    ...updatedSteps[idx],
+                    status: 'running',
+                    content: statusLine
+                  };
+                }
+                return { ...m, pipelineSteps: updatedSteps };
+              });
+              upsertNodeWorkStep(
+                {
+                  nodeId: node.id,
+                  nodeName: node.name,
+                  modelName: model,
+                  targetFile: expectedFilePath,
+                  agentHandle: 'coder',
+                  role: `${model} (local)`,
                   status: 'running',
-                  content: statusLine
-                };
-              }
-              return { ...m, pipelineSteps: updatedSteps };
-            });
-            upsertNodeWorkStep(
-              {
-                nodeId: node.id,
-                nodeName: node.name,
-                modelName: model,
-                targetFile: expectedFilePath,
-                agentHandle: 'coder',
-                role: `${model} (local)`,
-                status: 'running',
-                content: statusLine,
-                toolCalls: []
-              },
-              idx
-            );
-          },
-          node.type,
-          node.apiKey
-        );
-        activeAbortsRef.current.push(handle.abort);
-        let res = await handle.done;
+                  content: statusLine,
+                  toolCalls: []
+                },
+                idx
+              );
+            },
+            node.type,
+            node.apiKey
+          );
+        const taken = await awaitConductorChat(() => openWorker(body), {
+          registerAbort,
+          live: () => runLive(run)
+        });
+        if (taken.aborted || !runLive(run)) return false;
+        let res = taken.result;
         if (
           !isFrontierNode(node) &&
           workerFitPrompt.shrinks < 2 &&
-          contextWasExhausted(res.stats, modelMaxCtx(node, model))
+          contextWasExhausted(res.stats, workerReq.pinnedCtx, workerOptions.num_ctx)
         ) {
           const smaller = shrinkUserPacket(workerFitPrompt.userContent, 2);
+          sentWorkerMsgs = [
+            { role: 'system', content: workerSystemPrompt },
+            { role: 'user', content: smaller }
+          ];
           const retryBody = withThink(
             {
               model,
-              messages: [
-                { role: 'system', content: workerSystemPrompt },
-                { role: 'user', content: smaller }
-              ],
-              options: {
-                temperature: coderAgent.temperature,
-                num_ctx: chatNumCtx(node, model, workerMsgs, { role: 'coder', createIntent: true })
-              }
+              messages: sentWorkerMsgs,
+              options: workerOptions
             },
             node,
-            model
+            model,
+            'coder'
           );
-          const retry = streamChat(node.url, retryBody, () => {}, node.type, node.apiKey);
-          activeAbortsRef.current.push(retry.abort);
-          res = await retry.done;
+          const retried = await awaitConductorChat(
+            () => streamChat(node.url, retryBody, () => {}, node.type, node.apiKey),
+            { registerAbort, live: () => runLive(run) }
+          );
+          if (retried.aborted || !runLive(run)) return false;
+          res = retried.result;
           setExecutingPlanNotice(
             `Context monitor: ${model} filled its window. Resent \`${expectedFilePath}\` with a smaller packet.`
           );
         }
-        recordTok(node, res.stats);
+        if (!runLive(run)) return false;
+        recordTok(node, res.stats, { model, messages: sentWorkerMsgs });
         const finished = await finishTruncatedWrites(
           node,
           model,
           res.content,
           res.stats?.doneReason,
-          expectedFilePath
+          expectedFilePath,
+          run.token
         );
+        if (!runLive(run)) return false;
 
         let tools = parseResponse(finished, `${agentMsgId}-${idx}`, false, {
           expectedFilePath,
-          createIntent: true
+          createIntent: true,
+          allowUnclosedSalvage: false
         }).toolCalls.map(t => anchorWritePath(t, expectedFilePath));
+        if (!continuationClosedWrite(res.content, finished) && hasUnclosedWrite(finished)) {
+          const truncated = truncatedWriteToolCall(finished, `${agentMsgId}-${idx}`, expectedFilePath);
+          if (truncated) tools = [...tools, anchorWritePath(truncated, expectedFilePath)];
+        }
 
         tools = tools.map(t => {
           if (
@@ -2158,13 +2433,17 @@ ${instruction}`,
           return t;
         });
 
+        if (!runLive(run)) return false;
         const readPass = await runReadOnlyTools(tools, toolDepsRef.current);
         tools = readPass.tools;
+        if (!runLive(run)) return false;
 
         // Node results are the files. Always save them, including when this turn
         // started under the planner (Auto-apply still off in that closure).
         tools = await autoApplyWritableTools(tools, toolDepsRef.current);
-        updateProgress(log => noteSavedFiles(log, tools));
+        if (!runLive(run)) return false;
+        updateProgress(log => noteSavedFiles(log, tools, savedFileFingerprints()));
+        noteAppliedWrites(tools);
         if (autoApplyWritesRef.current) {
           tools = await runAuxTools(tools, toolDepsRef.current);
           const cmdPass = await runCommandTools(tools, toolDepsRef.current);
@@ -2195,7 +2474,8 @@ ${instruction}`,
             node,
             model,
             budget: workerBudget,
-            role: 'coder'
+            role: 'coder',
+            run
           });
         }
 
@@ -2253,24 +2533,40 @@ ${instruction}`,
           },
           idx
         );
+        return writeErrors.length === 0;
       } catch (workerErr: any) {
         const errText = String(workerErr?.message || workerErr || '');
-        const networkish =
-          /timeout|abort|network|fetch|ECONN|ENOTFOUND|ECONNRESET|CUDA|out of memory|oom/i.test(errText);
-        const fallback = networkish && !opts.retriedFrom
-          ? rankModelsForWeight(
-              nodesRef.current.filter(
-                n =>
-                  n.id !== node.id &&
-                  n.online &&
-                  !isFrontierNode(n) &&
-                  getEnabledModelsForNode(n).length > 0
-              ),
-              'heavy'
-            )
-          : undefined;
-        if (fallback) {
-          const fallbackModel = fallback.model;
+        if (!runLive(run)) return false;
+        if (!opts.retriedSame) {
+          window.electronAPI?.writeLog?.(
+            'warn',
+            `swarm: ${node.name} failed (${errText.slice(0, 120)}); retrying ${expectedFilePath} once`
+          );
+          patchPipelineMsg(m => {
+            if (!m.pipelineSteps) return m;
+            const updatedSteps = [...m.pipelineSteps];
+            if (updatedSteps[idx]) {
+              updatedSteps[idx] = {
+                ...updatedSteps[idx],
+                status: 'running',
+                content: `Retrying ${expectedFilePath} on ${node.name}…`
+              };
+            }
+            return { ...m, pipelineSteps: updatedSteps };
+          });
+          await new Promise(r => setTimeout(r, 400));
+          if (!runLive(run)) return false;
+          return runWorkerTurn({ ...opts, retriedSame: true });
+        }
+        const fallback = opts.retriedFrom
+          ? undefined
+          : pickFailoverTarget(nodesRef.current, node.id, model, { role: 'coder' });
+        if (
+          fallback &&
+          fallback.node.online &&
+          getEnabledModelsForNode(fallback.node).includes(fallback.model) &&
+          (fallback.node.id !== node.id || fallback.model !== model)
+        ) {
           window.electronAPI?.writeLog?.(
             'warn',
             `swarm: ${node.name} failed (${errText.slice(0, 120)}); rerouting ${expectedFilePath} to ${fallback.node.name}`
@@ -2283,19 +2579,19 @@ ${instruction}`,
                 ...updatedSteps[idx],
                 nodeId: fallback.node.id,
                 nodeName: fallback.node.name,
-                modelName: fallbackModel,
+                modelName: fallback.model,
                 status: 'running',
                 content: `Rerouted from ${node.name}: ${errText.slice(0, 160)}`
               };
             }
             return { ...m, pipelineSteps: updatedSteps };
           });
-          await runWorkerTurn({
+          return runWorkerTurn({
             ...opts,
-            assignment: { ...assignment, node: fallback.node, model: fallbackModel },
-            retriedFrom: node.id
+            assignment: { ...assignment, node: fallback.node, model: fallback.model },
+            retriedFrom: node.id,
+            retriedSame: true
           });
-          return;
         }
         patchPipelineMsg(m => {
           if (!m.pipelineSteps) return m;
@@ -2304,11 +2600,18 @@ ${instruction}`,
             updatedSteps[idx] = {
               ...updatedSteps[idx],
               status: 'failed',
-              content: `Failed on ${node.name}: ${errText}`
+              content: `Failed on ${node.name}`
             };
           }
-          return { ...m, pipelineSteps: updatedSteps };
+          return {
+            ...m,
+            pipelineSteps: updatedSteps,
+            error: errText,
+            endpointName: node.name,
+            model
+          };
         });
+        return false;
       }
     };
 
@@ -2320,22 +2623,33 @@ ${instruction}`,
         ? `⚡ Pass 1 — Lead Architect (${architect.node.name} • ${architect.model}, largest model for this contract${
             architect.usedFrontierBackup ? ' · frontier backup' : ''
           }) is locking the shared TypeScript contract...`
-        : '⚠️ No endpoints configured. Open Hardware Settings and add an Ollama node first.',
+        : '',
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       pipelineSteps: [],
-      toolCalls: []
+      toolCalls: [],
+      ...(architect
+        ? {}
+        : { error: 'No endpoints configured. Add an Ollama node in Hardware.' })
     };
 
+    if (!runLive(run)) return;
     setMessages(prev =>
       opts?.skipUserAppend ? [...prev, initialAgentMsg] : [...prev, userMsg, initialAgentMsg]
     );
     setIsStreaming(true);
 
     try {
-      if (!architect || !architect.node?.online) {
+      const stepFiles = (opts?.stepDispatch?.files || [])
+        .map(file => file.replace(/\\/g, '/').trim())
+        .filter(file => !!file && !file.includes('..'));
+      const skipPass1 = stepFiles.length > 0;
+      const anyOnline = nodesRef.current.some(
+        n => n.online && getEnabledModelsForNode(n).length > 0
+      );
+      if (skipPass1 ? !anyOnline : !architect || !architect.node?.online) {
         patchPipelineMsg({
-          display:
-            '⚠️ No online cluster nodes with enabled models. Open Hardware Settings, enable models on a local Ollama node (frontier APIs are backup only).'
+          display: 'No online computers with a model enabled.',
+          error: 'No online computers with a model enabled. Open Hardware and enable a model.'
         });
         return;
       }
@@ -2346,7 +2660,7 @@ ${instruction}`,
       const scaffoldStack =
         deliveryToStack(lockedDelivery) ||
         (/\breact|typescript|vite|r3f|three\b/i.test(userText) ? 'typescript' : null);
-      if (scaffoldStack && workspacePath && window.electronAPI?.writeFile) {
+      if (!skipPass1 && scaffoldStack && workspacePath && window.electronAPI?.writeFile) {
         beginActivity('install', 'Scaffolding project', scaffoldStack);
         try {
           const files = scaffoldFilesForStack(scaffoldStack);
@@ -2384,14 +2698,47 @@ ${instruction}`,
         }
       }
 
-      // ── Pass 1: Generate Shared Contract & Manifest ──
+      // ── Pass 1: Generate Shared Contract & Manifest (skipped for an active plan step) ──
+      const swarmTaskText = lockedPlan
+        ? `${userText}\n\n${formatApprovedPlanForSwarm(lockedPlan)}`
+        : userText;
+      let manifest: SwarmManifest = fallbackSwarmManifest(swarmTaskText);
+      if (skipPass1) {
+        const contractRel = projectBrainRef.current.contractFile || 'SWARM.md';
+        const existingContract = await readWorkspaceRel(contractRel);
+        const stack =
+          projectBrainRef.current.stack ||
+          deliveryToStack(lockedDelivery) ||
+          'typescript';
+        manifest = {
+          contractFile: contractRel,
+          contractCode: existingContract || '',
+          stack,
+          verifyCommand:
+            projectBrainRef.current.verifyCommand || verifyCommandForStack(stack) || null,
+          tasks: stepFiles.map(filePath => ({
+            filePath,
+            complexity: 'medium' as const,
+            preferredRole: '@coder' as const,
+            requiredExports: [],
+            requiredImports: [],
+            instructions: (opts?.stepDispatch?.brief || swarmTaskText).slice(0, 4000),
+            role: 'Coder'
+          }))
+        };
+        patchPipelineMsg({
+          display: `Swarm step — ${manifest.tasks.length} file${
+            manifest.tasks.length === 1 ? '' : 's'
+          } (Pass 1 skipped).`
+        });
+      } else {
       architect = findLeadArchitect(nodesRef.current, {
         preferCloudStrategist: cloudStrategistRef.current
       });
       if (!architect?.node?.online || !getEnabledModelsForNode(architect.node).includes(architect.model)) {
         patchPipelineMsg({
-          display:
-            '⚠️ No online cluster nodes with enabled models. Open Hardware Settings, enable models on a local Ollama node (frontier APIs are backup only).'
+          display: 'No online computers with a model enabled.',
+          error: 'No online computers with a model enabled. Open Hardware and enable a model.'
         });
         return;
       }
@@ -2400,10 +2747,6 @@ ${instruction}`,
         architect.usedCloudStrategist ? 'Pass 1 — Cloud Strategist' : 'Pass 1 — Lead Architect',
         architect.node.name
       );
-      const swarmTaskText = lockedPlan
-        ? `${userText}\n\n${formatApprovedPlanForSwarm(lockedPlan)}`
-        : userText;
-      let manifest: SwarmManifest = fallbackSwarmManifest(swarmTaskText);
       try {
         const snippets = await loadExistingSnippets();
         const swarmDevHost = buildDevHostPromptSection(nodesRef.current, architect.node.id);
@@ -2422,48 +2765,78 @@ ${instruction}`,
           lockedPlan ? formatApprovedPlanForSwarm(lockedPlan) : null,
           progressForPrompt() || null,
           swarmDevHost,
-          nodesRef.current
+          nodesRef.current,
+          { cloudStrategist: !!architect.usedCloudStrategist }
         );
+        const passTier = resolveModelFit(
+          architect.node,
+          architect.model,
+          'planner',
+          plannerAgent.numCtx
+        ).tier;
+        const architectSystem =
+          'You are the Lead Architect (@coder). Respond ONLY with a valid JSON object for the Swarm manifest. No markdown outside JSON. Workspace/installs/run_command target the Dev PC where Studio is open — not necessarily this inference host.';
+        let architectUser = `${architectPrompt}\n${projectContextForPrompt()}${contractLockNote}`;
+        const passOpts = pinnedChatOptions({
+          node: architect.node,
+          model: architect.model,
+          role: 'pass1',
+          createIntent: false,
+          tier: passTier,
+          temperature: 0.1,
+          fallbackNumCtx: plannerAgent.numCtx
+        });
+        if (!isFrontierNode(architect.node)) {
+          const fittedPass = fitPromptToContext({
+            system: architectSystem,
+            userContent: architectUser,
+            history: [],
+            maxCtx: passOpts.pinnedCtx,
+            frontier: false,
+            modelKey: architect.model,
+            promptBudget: passOpts.promptBudget
+          });
+          architectUser = fittedPass.userContent;
+          if (fittedPass.note) setExecutingPlanNotice(fittedPass.note);
+        }
         const architectMsgs = [
-          {
-            role: 'system',
-            content:
-              'You are the Lead Architect (@coder). Respond ONLY with a valid JSON object for the Swarm manifest. No markdown outside JSON. Workspace/installs/run_command target the Dev PC where Studio is open — not necessarily this inference host.'
-          },
-          {
-            role: 'user',
-            content: `${architectPrompt}\n${projectContextForPrompt()}${contractLockNote}`
-          }
+          { role: 'system', content: architectSystem },
+          { role: 'user', content: architectUser }
         ];
         const architectBody: Record<string, unknown> = {
           model: architect.model,
           messages: architectMsgs,
-          options: {
-            temperature: 0.1,
-            num_ctx: chatNumCtx(architect.node, architect.model, architectMsgs, {
-              role: 'coder',
-              createIntent: true
-            })
-          }
+          format: 'json',
+          options: ollamaOptions(passOpts)
         };
-        if (!isFrontierNode(architect.node)) architectBody.format = 'json';
-        const decompHandle = streamChat(
-          architect.node.url,
-          withThink(architectBody, architect.node, architect.model),
-          () => {},
-          architect.node.type,
-          architect.node.apiKey
+        if (!architect || !runLive(run)) return;
+        const lead = architect;
+        await warmModels([{ node: lead.node, model: lead.model }], plannerAgent.numCtx);
+        if (!runLive(run)) return;
+        const decompTaken = await awaitConductorChat(
+          () =>
+            streamChat(
+              lead.node.url,
+              withThink(architectBody, lead.node, lead.model, 'planner'),
+              () => {},
+              lead.node.type,
+              lead.node.apiKey
+            ),
+          { registerAbort, live: () => runLive(run) }
         );
-        activeAbortsRef.current.push(decompHandle.abort);
-        const decompRes = await decompHandle.done;
-        recordTok(architect.node, decompRes.stats);
+        if (decompTaken.aborted || !runLive(run)) return;
+        const decompRes = decompTaken.result;
+        recordTok(architect.node, decompRes.stats, { model: architect.model, messages: architectMsgs });
         const parsed = parseSwarmManifest(decompRes.content, swarmTaskText);
         if (parsed) manifest = parsed;
         else console.warn('Pass 1 JSON parse failed — using fallback manifest');
       } catch (decompErr) {
         console.warn('Pass 1 Lead Architect failed — using fallback:', decompErr);
       }
+      }
 
+      if (!skipPass1) {
+      if (!architect) return;
       // ── Stage 2: Write Contract & Verify Syntax ──
       patchPipelineMsg({
         display: `📝 Writing shared contract \`${manifest.contractFile}\` (${manifest.tasks.length} worker file${
@@ -2492,11 +2865,19 @@ ${instruction}`,
           projectBrainRef.current.verifyCommand
       });
       if (writeOk) {
-        updateProgress(log => noteSavedFiles(log, [{ name: 'write_file', status: 'done', args: { path: manifest.contractFile } }]));
+        updateProgress(log =>
+          noteSavedFiles(
+            log,
+            [{ name: 'write_file', status: 'done', args: { path: manifest.contractFile } }],
+            savedFileFingerprints()
+          )
+        );
+        rebuildRepoMap();
       }
       if (!writeOk) {
         patchPipelineMsg({
-          display: `⚠️ Failed to write contract file \`${manifest.contractFile}\`. Aborting swarm.`
+          display: `Couldn't write the contract file \`${manifest.contractFile}\`.`,
+          error: `Couldn't write ${manifest.contractFile}.`
         });
         return;
       }
@@ -2509,57 +2890,21 @@ ${instruction}`,
         workspacePath
       ) {
         contractVerified = false;
-        // Ensure project typescript exists before contract tsc (packaged Studio cannot rely on npx).
-        try {
-          const pkgProbe = await window.electronAPI.execTool(workspacePath, 'exists', {
-            path: 'package.json'
-          });
-          const tsProbe = await window.electronAPI.execTool(workspacePath, 'exists', {
-            path: 'node_modules/typescript/package.json'
-          });
-          if (pkgProbe.exists && !tsProbe.exists && window.electronAPI.installWorkspaceDeps) {
-            beginActivity('install', 'npm install', 'before contract typecheck');
-            let inst: { ok?: boolean; output?: string; error?: string; rewritten?: string[] } = {
-              ok: false
-            };
-            try {
-              patchPipelineMsg({
-                display: `📦 Installing npm dependencies before contract typecheck…`
-              });
-              inst = await window.electronAPI.installWorkspaceDeps(workspacePath, {
-                timeoutMs: 300000
-              });
-            } finally {
-              endActivity();
-            }
-            if (!inst.ok) {
-              patchPipelineMsg({
-                display: `⚠️ npm install failed before contract check — continuing with Studio TypeScript if available.\n\`\`\`\n${(
-                  inst.output ||
-                  inst.error ||
-                  ''
-                ).slice(0, 1200)}\n\`\`\``
-              });
-            } else {
-              const rewriteNote = inst.rewritten?.length
-                ? `\nRewrote: ${inst.rewritten.join('; ')}`
-                : '';
-              patchPipelineMsg({
-                display: `✅ Dependencies installed.${rewriteNote}\n📝 Typechecking shared contract \`${manifest.contractFile}\`…`
-              });
-            }
-          }
-        } catch (instErr) {
-          console.warn('Pre-contract npm install skipped:', instErr);
-        }
-
         let check = await window.electronAPI.typecheckWorkspace(workspacePath, {
           mode: 'contract',
           file: manifest.contractFile,
           timeoutMs: 45000
         });
-
-        if (!check.ok) {
+        const checkText = `${check.output || ''}\n${check.error || ''}`;
+        if (!check.ok && typesCannotResolve(checkText)) {
+          const failText = annotateMissingDependencies(checkText);
+          patchPipelineMsg({
+            display: `Contract typecheck failed. ${DEPENDENCY_RETRY_MESSAGE}\n\`\`\`\n${failText.slice(0, 1500)}\n\`\`\``,
+            error: DEPENDENCY_RETRY_MESSAGE,
+            endpointName: architect.node.name,
+            model: architect.model
+          });
+        } else if (!check.ok) {
           patchPipelineMsg({
             display: `🔧 Contract failed tsc — Lead Architect self-correcting before waking workers…\n\`\`\`\n${(
               check.output ||
@@ -2568,10 +2913,17 @@ ${instruction}`,
             ).slice(0, 1200)}\n\`\`\``
           });
           try {
+            const repairTier = resolveModelFit(
+              architect.node,
+              architect.model,
+              'planner',
+              plannerAgent.numCtx
+            ).tier;
             const repairPrompt = buildContractRepairPrompt(
               swarmTaskText,
               manifest,
-              check.output || check.error || 'unknown tsc error'
+              check.output || check.error || 'unknown tsc error',
+              { tier: repairTier }
             );
             const repairMsgs = [
               {
@@ -2583,25 +2935,33 @@ ${instruction}`,
             const repairBody: Record<string, unknown> = {
               model: architect.model,
               messages: repairMsgs,
-              options: {
+              format: 'json',
+              options: chatOptions(architect.node, architect.model, 'pass1', {
+                createIntent: false,
+                tier: repairTier,
                 temperature: 0.1,
-                num_ctx: chatNumCtx(architect.node, architect.model, repairMsgs, {
-                  role: 'coder',
-                  createIntent: true
-                })
-              }
+                fallbackNumCtx: plannerAgent.numCtx
+              })
             };
-            if (!isFrontierNode(architect.node)) repairBody.format = 'json';
-            const repairHandle = streamChat(
-              architect.node.url,
-              withThink(repairBody, architect.node, architect.model),
-              () => {},
-              architect.node.type,
-              architect.node.apiKey
+            if (!architect || !runLive(run)) return;
+            const repairLead = architect;
+            const repairTaken = await awaitConductorChat(
+              () =>
+                streamChat(
+                  repairLead.node.url,
+                  withThink(repairBody, repairLead.node, repairLead.model, 'planner'),
+                  () => {},
+                  repairLead.node.type,
+                  repairLead.node.apiKey
+                ),
+              { registerAbort, live: () => runLive(run) }
             );
-            activeAbortsRef.current.push(repairHandle.abort);
-            const repairRes = await repairHandle.done;
-            recordTok(architect.node, repairRes.stats);
+            if (repairTaken.aborted || !runLive(run)) return;
+            const repairRes = repairTaken.result;
+            recordTok(architect.node, repairRes.stats, {
+              model: architect.model,
+              messages: repairMsgs
+            });
             const repaired = parseSwarmManifest(repairRes.content, swarmTaskText);
             if (repaired) {
               const keep = await readWorkspaceRel(repaired.contractFile || manifest.contractFile);
@@ -2612,8 +2972,13 @@ ${instruction}`,
               const repairedOk = await onApplyFileWrite(manifest.contractFile, manifest.contractCode);
               if (repairedOk) {
                 updateProgress(log =>
-                  noteSavedFiles(log, [{ name: 'write_file', status: 'done', args: { path: manifest.contractFile } }])
+                  noteSavedFiles(
+                    log,
+                    [{ name: 'write_file', status: 'done', args: { path: manifest.contractFile } }],
+                    savedFileFingerprints()
+                  )
                 );
+                rebuildRepoMap();
               }
               check = await window.electronAPI.typecheckWorkspace(workspacePath, {
                 mode: 'contract',
@@ -2626,12 +2991,12 @@ ${instruction}`,
           }
 
           if (!check.ok) {
+            const failText = check.output || check.error || 'Contract typecheck failed.';
             patchPipelineMsg({
-              display: `⚠️ Contract still fails tsc after repair — continuing with best-effort workers.\n\`\`\`\n${(
-                check.output ||
-                check.error ||
-                ''
-              ).slice(0, 1500)}\n\`\`\``
+              display: `Contract typecheck failed. Stopped in Pass 1 — workers were not started.\n\`\`\`\n${failText.slice(0, 1500)}\n\`\`\``,
+              error: failText.slice(0, 500),
+              endpointName: architect.node.name,
+              model: architect.model
             });
           } else {
             contractVerified = true;
@@ -2653,10 +3018,14 @@ ${instruction}`,
           contractFile: manifest.contractFile,
           contractLocked: true
         });
+      } else {
+        endActivity();
+        return;
       }
 
       endActivity(); // Pass 1 done
-      beginActivity('pass2', 'Pass 2 — file workers');
+      }
+      beginActivity('pass2', skipPass1 ? 'Step workers' : 'Pass 2 — file workers');
 
       // ── Pass 2: Fan out by dependency waves (parallel within a wave) ──
       const taskWaves = partitionSwarmTasksIntoWaves(manifest.tasks);
@@ -2671,7 +3040,8 @@ ${instruction}`,
       });
       if (!assignments.length) {
         patchPipelineMsg({
-          display: '⚠️ No worker assignments produced. Check Hardware Settings for online nodes.'
+          display: 'No workers were assigned.',
+          error: 'No workers were assigned. Open Hardware and check that a computer is online.'
         });
         return;
       }
@@ -2683,16 +3053,21 @@ ${instruction}`,
           ? ` · ${taskWaves.length} dependency waves (foundation files first)`
           : '';
 
+      const leadLabel = architect?.node;
       const initialSteps: PipelineStep[] = [
         {
-          nodeId: architect.node.id,
-          nodeName: `${architect.node.name} → ${manifest.contractFile}`,
-          modelName: architect.model,
+          nodeId: leadLabel?.id || assignments[0]?.node.id || 'swarm',
+          nodeName: `${leadLabel?.name || 'Swarm'} → ${manifest.contractFile}`,
+          modelName: architect?.model || assignments[0]?.model || '',
           targetFile: manifest.contractFile,
           agentHandle: 'coder',
-          role: `Lead Architect · contract${architect.usedFrontierBackup ? ' (frontier)' : ' (local)'}`,
+          role: skipPass1
+            ? 'Step dispatch'
+            : `Lead Architect · contract${architect?.usedFrontierBackup ? ' (frontier)' : ' (local)'}`,
           status: 'completed',
-          content: `Locked shared contract (${manifest.tasks.length} tasks${waveLabel})`,
+          content: skipPass1
+            ? `Pass 1 skipped (${manifest.tasks.length} files${waveLabel})`
+            : `Locked shared contract (${manifest.tasks.length} tasks${waveLabel})`,
           toolCalls: []
         },
         ...assignments.map(({ task, node, model, skippedReason }, i) => {
@@ -2734,6 +3109,7 @@ ${instruction}`,
       const completedPaths: string[] = [];
       let flatOffset = 0;
       for (let wi = 0; wi < taskWaves.length; wi++) {
+        if (!runLive(run)) return;
         const waveAssign = assignments.slice(flatOffset, flatOffset + taskWaves[wi].length);
         flatOffset += taskWaves[wi].length;
         const waveItems = waveAssign.map((assignment, j) => {
@@ -2741,32 +3117,6 @@ ${instruction}`,
           const stepIdx = assignments.indexOf(assignment) + 1;
           return { assignment, stepIdx, j };
         });
-
-        const priorSnippets: string[] = [];
-        for (const p of completedPaths.slice(-8)) {
-          const body = await readWorkspaceRel(p);
-          if (body != null) {
-            priorSnippets.push(
-              `### ${p} (already written)\n\`\`\`\n${body.slice(0, 3500)}\n\`\`\``
-            );
-          }
-        }
-        const planSibling = waveAssign
-          .map(
-            a =>
-              `- ${a.task.filePath} (wave ${wi + 1}${
-                a.task.dependsOn?.length ? `, needs ${a.task.dependsOn.join(', ')}` : ''
-              }): ${a.task.instructions.slice(0, 120)}`
-          )
-          .join('\n');
-        const siblingSummary = [
-          priorSnippets.length
-            ? `## Already written (do not rewrite)\n${priorSnippets.join('\n\n')}`
-            : '',
-          `## This wave\n${planSibling}`
-        ]
-          .filter(Boolean)
-          .join('\n\n');
 
         for (const { assignment, stepIdx } of waveItems) {
           patchPipelineMsg(m => {
@@ -2797,9 +3147,17 @@ ${instruction}`,
           })
         );
 
+        await warmModels(
+          waveAssign.map(a => ({ node: a.node, model: a.model })),
+          coderAgent.numCtx
+        );
+        if (!runLive(run)) return;
+
+        const waveDone: string[] = [];
         await Promise.allSettled(
           queuesWithIdx.map(async queue => {
             for (let n = 0; n < queue.length; n++) {
+              if (!runLive(run)) return;
               const { assignment, stepIdx } = queue[n];
               if (n > 0) {
                 patchPipelineMsg(m => {
@@ -2814,34 +3172,61 @@ ${instruction}`,
                   return { ...m, pipelineSteps: updatedSteps };
                 });
               }
+              const norm = (p: string) => p.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
               const current = await readWorkspaceRel(assignment.task.filePath);
-              const workerLog = progressForPrompt();
-              const workerOverall = lockedPlan
-                ? formatApprovedPlanBrief(lockedPlan)
-                : userText;
-              const workerPrompt = `${buildSwarmWorkerPrompt({
+              const workerTier = resolveModelFit(
+                assignment.node,
+                assignment.model,
+                'coder',
+                coderAgent.numCtx
+              ).tier;
+              const siblings = [];
+              for (const p of completedPaths.slice(-8)) {
+                if (norm(p) === norm(assignment.task.filePath)) continue;
+                const body = await readWorkspaceRel(p);
+                const inline = (assignment.task.dependsOn || []).some(d => norm(d) === norm(p));
+                siblings.push(siblingFile(p, { content: body, inline }));
+              }
+              for (const other of manifest.tasks) {
+                if (norm(other.filePath) === norm(assignment.task.filePath)) continue;
+                if (siblings.some(s => norm(s.path) === norm(other.filePath))) continue;
+                const inline = (assignment.task.dependsOn || []).some(
+                  d => norm(d) === norm(other.filePath)
+                );
+                const body = inline ? await readWorkspaceRel(other.filePath) : undefined;
+                siblings.push(
+                  siblingFile(other.filePath, {
+                    content: body,
+                    exports: other.requiredExports,
+                    inline
+                  })
+                );
+              }
+              const workerOverall = lockedPlan ? formatApprovedPlanBrief(lockedPlan) : userText;
+              const workerPrompt = buildSwarmWorkerPrompt({
                 task: assignment.task,
                 contractFile: manifest.contractFile,
                 contractCode: manifest.contractCode,
-                siblingSummary,
+                siblingSummary: '',
+                siblingFiles: siblings,
                 currentFileContent: current,
                 userPrompt: workerOverall,
                 stack: manifest.stack,
-                devHostSection: buildDevHostPromptSection(nodesRef.current, assignment.node.id)
-              })}${workerLog ? `\n\nWork log (do not redo Done steps or re-ask Already asked):\n${workerLog}` : ''}`;
-              await runWorkerTurn({
+                tier: workerTier
+              });
+              const wrote = await runWorkerTurn({
                 idx: stepIdx,
                 assignment,
                 userPrompt: workerPrompt,
-                expectedFilePath: assignment.task.filePath
+                expectedFilePath: assignment.task.filePath,
+                stack: manifest.stack
               });
+              if (wrote) waveDone.push(assignment.task.filePath);
             }
           })
         );
 
-        for (const a of waveAssign) {
-          completedPaths.push(a.task.filePath);
-        }
+        completedPaths.push(...waveDone);
       }
 
       // ── Stage 4: Verify (tsc only for TypeScript stacks) ──
@@ -2855,8 +3240,9 @@ ${instruction}`,
         patchPipelineMsg(m => ({
           ...m,
           display: failed
-            ? `⚠️ Conductor Swarm finished ${assignments.length} file(s). Verify failed:\n\`\`\`\n${output.slice(0, 2000)}\n\`\`\``
-            : `✅ Conductor Swarm finished ${assignments.length} file(s). ${manifest.stack} check passed.`
+            ? `Swarm finished ${assignments.length} file(s). The project check failed:\n\`\`\`\n${output.slice(0, 2000)}\n\`\`\``
+            : `✅ Conductor Swarm finished ${assignments.length} file(s). ${manifest.stack} check passed.`,
+          ...(failed ? { error: clipErrorCause(output, 'The project check failed.') } : {})
         }));
       } else if (manifest.stack === 'typescript' && window.electronAPI?.typecheckWorkspace && workspacePath) {
         patchPipelineMsg(m => ({
@@ -2881,36 +3267,29 @@ ${instruction}`,
             display: `✅ Conductor Swarm finished ${assignments.length} worker file(s). Workspace typecheck passed.`
           }));
         } else {
-          const byFile = groupTscErrorsByFile(wsCheck.output || '', workspacePath);
-          const repairJobs: { idx: number; assignment: SwarmAssignment; errors: string }[] = [];
-
-          assignments.forEach((assignment, i) => {
-            const key = assignment.task.filePath.replace(/\\/g, '/').toLowerCase();
-            let errors = '';
-            for (const [file, err] of byFile.entries()) {
-              if (file.toLowerCase().replace(/\\/g, '/').endsWith(key) || file.toLowerCase() === key) {
-                errors = err;
-                break;
-              }
+          const fpBefore = errorFingerprint(parseCompilerErrors(wsCheck.output || ''));
+          const jobsForOutput = async (output: string) => {
+            const byFile = groupTscErrorsByFile(output, workspacePath);
+            const bodies = new Map<string, string>();
+            for (const assignment of assignments) {
+              const body = await readWorkspaceRel(assignment.task.filePath);
+              if (body != null) bodies.set(assignment.task.filePath, body);
             }
-            if (errors) {
-              repairJobs.push({ idx: i + 1, assignment, errors });
-            }
-          });
-
-          if (!repairJobs.length) {
-            patchPipelineMsg(m => ({
-              ...m,
-              display: `⚠️ Workspace tsc reported errors, but none mapped to swarm-owned files.\n\`\`\`\n${(
-                wsCheck.output || ''
-              ).slice(0, 2000)}\n\`\`\``
-            }));
-          } else {
-            patchPipelineMsg(m => ({
-              ...m,
-              display: `🔧 Targeted repair — re-prompting ${repairJobs.length} GPU owner(s) with tsc stderr…`
-            }));
-
+            const mapped = assignSwarmDiagnostics(
+              byFile,
+              assignments.map(a => a.task.filePath),
+              bodies
+            );
+            const repairJobs: { idx: number; assignment: SwarmAssignment; errors: string }[] = [];
+            assignments.forEach((assignment, i) => {
+              const errors = mapped.owned.get(assignment.task.filePath);
+              if (errors) repairJobs.push({ idx: i + 1, assignment, errors });
+            });
+            return { repairJobs, unmatched: mapped.unmatched };
+          };
+          const runRepairPass = async (
+            repairJobs: { idx: number; assignment: SwarmAssignment; errors: string }[]
+          ) => {
             const repairQueues = new Map<string, typeof repairJobs>();
             for (const job of repairJobs) {
               const key = endpointQueueKey(job.assignment.node);
@@ -2918,10 +3297,10 @@ ${instruction}`,
               queue.push(job);
               repairQueues.set(key, queue);
             }
-
             await Promise.allSettled(
               [...repairQueues.values()].map(async queue => {
                 for (const { idx, assignment, errors } of queue) {
+                  if (!runLive(run)) return;
                   patchPipelineMsg(m => {
                     if (!m.pipelineSteps?.[idx]) return m;
                     const updatedSteps = [...m.pipelineSteps];
@@ -2932,41 +3311,102 @@ ${instruction}`,
                     };
                     return { ...m, pipelineSteps: updatedSteps };
                   });
-
                   const current =
                     (await readWorkspaceRel(assignment.task.filePath)) ||
                     '(file missing after Pass 2)';
+                  const repairTier = resolveModelFit(
+                    assignment.node,
+                    assignment.model,
+                    'coder',
+                    coderAgent.numCtx
+                  ).tier;
                   const repairPrompt = buildRepairWorkerPrompt({
                     task: assignment.task,
                     contractFile: manifest.contractFile,
                     contractCode: manifest.contractCode,
                     currentFileContent: current,
                     tscErrors: errors,
-                    devHostSection: buildDevHostPromptSection(nodesRef.current, assignment.node.id)
+                    tier: repairTier
                   });
+                  await warmModels(
+                    [{ node: assignment.node, model: assignment.model }],
+                    coderAgent.numCtx
+                  );
                   await runWorkerTurn({
                     idx,
                     assignment,
                     userPrompt: repairPrompt,
                     expectedFilePath: assignment.task.filePath,
-                    stepLabel: `Repaired ${assignment.task.filePath}`
+                    stepLabel: `Repaired ${assignment.task.filePath}`,
+                    stack: manifest.stack
                   });
                 }
               })
             );
+          };
 
+          const first = await jobsForOutput(wsCheck.output || '');
+          if (!first.repairJobs.length) {
+            patchPipelineMsg(m => ({
+              ...m,
+              display: `Workspace tsc reported errors, and none mapped to swarm-owned files or their importers.\n\`\`\`\n${(
+                wsCheck.output || ''
+              ).slice(0, 2000)}\n\`\`\``,
+              error: (wsCheck.output || 'Workspace typecheck failed.').slice(0, 500)
+            }));
+          } else {
+            patchPipelineMsg(m => ({
+              ...m,
+              display: `Targeted repair — re-prompting ${first.repairJobs.length} file owner(s) with tsc stderr…`
+            }));
+            await runRepairPass(first.repairJobs);
+            if (!runLive(run)) return;
             const recheck = await window.electronAPI.typecheckWorkspace(workspacePath, {
               mode: 'workspace',
               timeoutMs: 90000
             });
-            patchPipelineMsg(m => ({
-              ...m,
-              display: recheck.ok
-                ? `✅ Conductor Swarm finished — workspace typecheck passed after targeted repair.`
-                : `⚠️ Conductor Swarm finished with remaining type errors after repair.\n\`\`\`\n${(
+            if (recheck.ok) {
+              patchPipelineMsg(m => ({
+                ...m,
+                display: `Conductor Swarm finished — workspace typecheck passed after targeted repair.`
+              }));
+            } else if (runLive(run)) {
+              const fpAfter = errorFingerprint(parseCompilerErrors(recheck.output || ''));
+              if (verifyFingerprintChanged(fpBefore, fpAfter)) {
+                const second = await jobsForOutput(recheck.output || '');
+                if (second.repairJobs.length && runLive(run)) {
+                  patchPipelineMsg(m => ({
+                    ...m,
+                    display: `Error fingerprint changed — one more repair on ${second.repairJobs.length} file(s)…`
+                  }));
+                  await runRepairPass(second.repairJobs);
+                  if (!runLive(run)) return;
+                  const recheck2 = await window.electronAPI.typecheckWorkspace(workspacePath, {
+                    mode: 'workspace',
+                    timeoutMs: 90000
+                  });
+                  patchPipelineMsg(m => ({
+                    ...m,
+                    display: recheck2.ok
+                      ? `Conductor Swarm finished — workspace typecheck passed after the second repair.`
+                      : `Conductor Swarm finished with remaining type errors after two repairs.\n\`\`\`\n${(
+                          recheck2.output || ''
+                        ).slice(0, 2000)}\n\`\`\``,
+                    ...(recheck2.ok
+                      ? {}
+                      : { error: (recheck2.output || 'Typecheck still failing.').slice(0, 500) })
+                  }));
+                }
+              } else {
+                patchPipelineMsg(m => ({
+                  ...m,
+                  display: `Conductor Swarm finished with the same type errors after repair. A second repair was skipped because the fingerprint did not change.\n\`\`\`\n${(
                     recheck.output || ''
-                  ).slice(0, 2000)}\n\`\`\``
-            }));
+                  ).slice(0, 2000)}\n\`\`\``,
+                  error: (recheck.output || 'Typecheck still failing.').slice(0, 500)
+                }));
+              }
+            }
           }
         }
       } else {
@@ -2979,13 +3419,18 @@ ${instruction}`,
       console.error('Pipeline error:', err);
       window.electronAPI?.writeLog?.('error', `swarm: ${err?.message || err}`);
       patchPipelineMsg({
-        display: `⚠️ Conductor Swarm error: ${err?.message || err}`
+        display: 'Conductor Swarm stopped because of an error.',
+        error: err?.message || String(err),
+        endpointName: architect?.node?.name,
+        model: architect?.model
       });
     } finally {
       activityStackRef.current = [];
       setActivityStack([]);
       setIsStreaming(false);
-      activeAbortsRef.current = [];
+    }
+    } finally {
+      leaveConductorRun(entered.owned, entered.run.token);
     }
   };
 
@@ -3025,7 +3470,9 @@ ${instruction}`,
         n => n.online && !isFrontierNode(n) && getEnabledModelsForNode(n).length > 0
       );
       routedNode =
-        rankModelsForWeight(locals, fitRole === 'docs' ? 'medium' : 'heavy')?.node ||
+        rankModelsForWeight(locals, fitRole === 'docs' ? 'medium' : 'heavy', {
+          role: fitRole || 'coder'
+        })?.node ||
         live.find(n => n.online && getEnabledModelsForNode(n).length > 0);
     }
     if (!routedNode) return null;
@@ -3073,6 +3520,13 @@ ${instruction}`,
      * Use for Coder/Reviewer workers under Planner control.
      */
     freshContext?: boolean;
+    /** One file for a fresh coder step. Uses the short swarm worker stub. */
+    primaryFile?: string;
+    /** Same-node retry already used. */
+    retriedSame?: boolean;
+    /** Failover to another node already used. */
+    failedOver?: boolean;
+    run?: ConductorRun;
   }): Promise<ChatMessage | undefined> => {
     const {
       userText,
@@ -3131,8 +3585,8 @@ ${instruction}`,
           id: `agent-${Date.now()}`,
           role: 'assistant' as const,
           raw: '',
-          display:
-            '⚠️ No endpoints configured. Open Hardware Settings and add an Ollama node (e.g. http://127.0.0.1:11434).',
+          display: '',
+          error: 'No endpoints configured. Add an Ollama node in Hardware.',
           timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
           toolCalls: []
         }
@@ -3171,6 +3625,13 @@ ${instruction}`,
       ...(notice ? { notice } : {})
     };
 
+    const entered = bindRun(opts.run ?? null, false);
+    if (!entered) return;
+    const run = entered.run;
+    if (!runLive(run)) {
+      leaveConductorRun(entered.owned, entered.run.token);
+      return;
+    }
     setMessages(prev => (skipUserAppend ? [...prev, initialAgentMsg] : [...prev, userMsg, initialAgentMsg]));
     setIsStreaming(true);
 
@@ -3195,27 +3656,29 @@ ${instruction}`,
     let originOut: ChatMessage | undefined;
     try {
       const routedMaxCtx = modelMaxCtx(routedNode, routedModel);
-      if (!useFreshContext) fitContext(routedMaxCtx);
+      if (!useFreshContext) fitContext(routedMaxCtx, routedModel);
       const fitRole = stepVerdictMode || reviewMode
         ? 'reviewer'
         : planMode || lockPlanMode || contractMode
           ? 'planner'
           : 'coder';
       const turnFit = resolveModelFit(routedNode, routedModel, fitRole, agent.numCtx);
-      const turnMap = formatRepoMap(repoMapRef.current, turnFit.tier, fullPrompt);
-      const systemPrompt = buildSystemPrompt(agent, workspacePath, workspaceOverview, {
-        planMode: !!planMode,
-        reviewMode: !!reviewMode,
-        contractMode: !!contractMode,
-        lockPlanMode: !!lockPlanMode,
-        stepVerdictMode: !!stepVerdictMode,
-        approvedPlan: readOnlyMode || contractMode || lockPlanMode ? null : approvedPlan,
-        progressLog: progressForPrompt(),
-        projectContext: projectContextForPrompt(rulesCapFor(turnFit.tier)),
-        nodes: nodesRef.current,
-        inferenceNodeId: routedNode.id,
-        inferenceModel: routedModel
-      });
+      applyToolTier(turnFit.tier);
+      const coderStep = useFreshContext && !readOnlyMode && !contractMode && !lockPlanMode;
+      const turnMap = useFreshContext ? '' : formatRepoMap(repoMapRef.current, turnFit.tier, fullPrompt);
+      const systemPrompt =
+        coderStep && opts.primaryFile
+          ? buildSwarmWorkerSystemStub(opts.primaryFile, projectBrainRef.current.stack)
+          : buildSystemPrompt(agent, workspacePath, workspaceOverview, {
+              stablePrefix: true,
+              planMode: !!planMode,
+              reviewMode: !!reviewMode,
+              contractMode: !!contractMode,
+              lockPlanMode: !!lockPlanMode,
+              stepVerdictMode: !!stepVerdictMode,
+              projectContext: projectContextForPrompt(rulesCapFor(turnFit.tier)),
+              inferenceModel: routedModel
+            });
       const withModelFit = (body: string) => {
         const packing =
           !planMode && !lockPlanMode && !contractMode && turnFit.packingLine
@@ -3224,33 +3687,67 @@ ${instruction}`,
         const map = turnMap ? `${turnMap}\n\n` : '';
         return `${turnFit.section}\n\n${map}${body}${packing}`;
       };
-      const actionableUserPrompt = withModelFit(
-        lockPlanMode
-          ? `${fullPrompt}\n\n[PLANNER LOCK DIRECTIVE: Break the chosen option into ordered steps with coder tasks. End with <execution_plan>. Do NOT write deliverable files. Do NOT emit <plan_options>.]`
-          : stepVerdictMode
-            ? `${fullPrompt}\n\n[REVIEWER STEP DIRECTIVE: Verify ONLY the active plan step. End with <step_verdict> yay or nay. Do NOT write files or invent a new plan.]`
-            : planMode
-              ? `${fullPrompt}\n\n[PLANNER DIRECTIVE: Analyze intent, propose a concrete plan, and end with 2–4 options in a <plan_options> block. Do NOT write deliverable files yet.]`
-              : reviewMode
-                ? finalSourceReview
-                  ? `${fullPrompt}\n\n[FINAL SOURCE REVIEW: Compare the source folder to the finished plan. A compile that succeeds is not a pass. Use issues when index.html would open as a blank white page, when Tailwind classes are not in the CSS, or when the app is unwired. Do NOT write or edit files. End with <final_review><result>pass</result> or <result>issues</result> and <notes>.</final_review>.]`
-                  : `${fullPrompt}\n\n[REVIEWER DIRECTIVE: Report findings and end with a <review_plan> block (tasks if fixes are needed, summary-only if clean). Do NOT write or edit files.]`
-                : contractMode
-                  ? `${fullPrompt}\n\n[PLANNER CONTRACT DIRECTIVE: Lock a fix contract for the review tasks. You may write a shared contract file. End with <fix_contract>. Do NOT emit <plan_options>. Do not implement the full fix list — Coder runs next.]`
-                  : pinRoute
-                    ? `${fullPrompt}\n\n[EXECUTION DIRECTIVE: Fix the existing files with <edit_file path="..."> search/replace blocks. Do not rewrite a whole file when a search/replace will do. Do not add a new feature.]`
-                    : `${fullPrompt}\n\n[EXECUTION DIRECTIVE: If this request asks to create, build, or modify an application, script, or file, you MUST emit <write_file path="filename.ext">...complete code...</write_file> tags so the files are written directly to the user's computer. Do NOT just reply with conversational instructions.]`
-      );
-      const ollamaImages = attachedImages.map(toOllamaBase64);
+      const directiveBody = useFreshContext
+        ? fullPrompt
+        : withModelFit(
+            lockPlanMode
+              ? `${fullPrompt}\n\n[PLANNER LOCK DIRECTIVE: Break the chosen option into ordered steps with coder tasks. End with <execution_plan>. Do NOT write deliverable files. Do NOT emit <plan_options>.]`
+              : stepVerdictMode
+                ? `${fullPrompt}\n\n[REVIEWER STEP DIRECTIVE: Verify ONLY the active plan step. End with <step_verdict> yay or nay. Do NOT write files or invent a new plan.]`
+                : planMode
+                  ? `${fullPrompt}\n\n[PLANNER DIRECTIVE: Analyze intent, propose a concrete plan, and end with 2–4 options in a <plan_options> block. Do NOT write deliverable files yet.]`
+                  : reviewMode
+                    ? finalSourceReview
+                      ? `${fullPrompt}\n\n[FINAL SOURCE REVIEW: Compare the source folder to the finished plan. A compile that succeeds is not a pass. Use issues when index.html would open as a blank white page, when Tailwind classes are not in the CSS, or when the app is unwired. Do NOT write or edit files. End with <final_review><result>pass</result> or <result>issues</result> and <notes>.</final_review>.]`
+                      : `${fullPrompt}\n\n[REVIEWER DIRECTIVE: Report findings and end with a <review_plan> block (tasks if fixes are needed, summary-only if clean). Do NOT write or edit files.]`
+                    : contractMode
+                      ? `${fullPrompt}\n\n[PLANNER CONTRACT DIRECTIVE: Lock a fix contract for the review tasks. You may write a shared contract file. End with <fix_contract>. Do NOT emit <plan_options>. Do not implement the full fix list — Coder runs next.]`
+                      : pinRoute
+                        ? `${fullPrompt}\n\n[EXECUTION DIRECTIVE: Fix the existing files with <edit_file path="..."> search/replace blocks. Do not rewrite a whole file when a search/replace will do. Do not add a new feature.]`
+                        : `${fullPrompt}\n\n[EXECUTION DIRECTIVE: If this request asks to create, build, or modify an application, script, or file, you MUST emit <write_file path="filename.ext">...complete code...</write_file> tags so the files are written directly to the user's computer. Do NOT just reply with conversational instructions.]`
+          );
+      const actionableUserPrompt = prependVolatileContext(directiveBody, {
+        nodes: nodesRef.current,
+        inferenceNodeId: routedNode.id,
+        includeInventory: !!(planMode || lockPlanMode || contractMode),
+        fallbackNumCtx: routedMaxCtx,
+        progressLog: progressForPrompt(),
+        overview: useFreshContext ? undefined : workspaceOverview,
+        approvedPlan:
+          readOnlyMode || contractMode || lockPlanMode || useFreshContext ? null : approvedPlan
+      });
+      const tierImages = selectImagesForTier(attachedImages, turnFit.tier);
 
       // Cleared worker context: do not send the Planner brainstorm / prior turns.
       const history = useFreshContext ? [] : historyForModel(messagesRef.current, stripThinking);
+      const turnReq = pinnedChatOptions({
+        node: routedNode,
+        model: routedModel,
+        role: roleForDynamicCtx(
+          stepVerdictMode || reviewMode
+            ? 'reviewer'
+            : planMode || lockPlanMode || contractMode
+              ? 'planner'
+              : agent.handle
+        ),
+        createIntent: !readOnlyMode,
+        tier: turnFit.tier,
+        temperature: agent.temperature,
+        fallbackNumCtx: agent.numCtx
+      });
       const fittedPrompt = fitPromptToContext({
         system: systemPrompt,
         userContent: actionableUserPrompt,
-        history: history.map(m => ({ role: m.role, content: m.content })),
-        maxCtx: routedMaxCtx,
-        frontier: routedIsFrontier
+        history: history.map(m => ({
+          role: m.role,
+          content: m.content,
+          ...(m.images?.length ? { images: selectImagesForTier(m.images, turnFit.tier) } : {})
+        })),
+        maxCtx: turnReq.pinnedCtx,
+        frontier: routedIsFrontier,
+        modelKey: routedModel,
+        images: tierImages,
+        promptBudget: turnReq.promptBudget
       });
       let userContent = fittedPrompt.userContent;
       let historySent = fittedPrompt.history;
@@ -3267,32 +3764,41 @@ ${instruction}`,
             ? 'planner'
             : agent.handle
       );
-      const conversationPayload = [
+      const sentImages = (fittedPrompt.images || [])
+        .map(img => (typeof img === 'string' ? toOllamaBase64(img) : ''))
+        .filter(Boolean);
+      let conversationPayload: Array<{ role: string; content: string; images?: string[] }> = [
         { role: 'system', content: systemPrompt },
-        ...historySent,
+        ...historySent.map(h => ({
+          role: h.role,
+          content: h.content,
+          ...(h.images?.length
+            ? {
+                images: h.images
+                  .map(img => (typeof img === 'string' ? toOllamaBase64(img) : ''))
+                  .filter(Boolean)
+              }
+            : {})
+        })),
         {
           role: 'user',
           content: userContent,
-          ...(ollamaImages.length ? { images: ollamaImages } : {})
+          ...(sentImages.length ? { images: sentImages } : {})
         }
       ];
+      const turnOptions = ollamaOptions(turnReq);
       const body = withThink(
         {
           model: routedModel,
           messages: conversationPayload,
-          options: {
-            temperature: agent.temperature,
-            num_ctx: chatNumCtx(routedNode, routedModel, conversationPayload, {
-              role: turnRole,
-              createIntent: !readOnlyMode
-            })
-          }
+          options: turnOptions
         },
         routedNode,
-        routedModel
+        routedModel,
+        turnRole
       );
 
-      const handle = streamChat(
+      const openTurn = () => streamChat(
         routedNode.url,
         body,
         (content, thinking) => {
@@ -3327,6 +3833,7 @@ ${instruction}`,
           if (liveVerdict || liveReview || lockPlanMode || parseExecutionPlan(content)) {
             displayBase = '';
           }
+          if (!runLive(run)) return;
           setMessages(prev =>
             prev.map(m => {
               if (m.id !== agentMsgId) return m;
@@ -3357,59 +3864,73 @@ ${instruction}`,
         routedNode.type,
         routedNode.apiKey
       );
-
-      activeAbortsRef.current = [handle.abort];
-      let result = await handle.done;
+      const taken = await awaitConductorChat(openTurn, {
+        registerAbort,
+        live: () => runLive(run)
+      });
+      if (taken.aborted || !runLive(run)) return;
+      let result = taken.result;
       if (
         !routedIsFrontier &&
         fittedPrompt.shrinks < 2 &&
-        contextWasExhausted(result.stats, routedMaxCtx)
+        contextWasExhausted(result.stats, turnReq.pinnedCtx, turnOptions.num_ctx)
       ) {
-        const note = `Context monitor: ${routedModel} filled ${routedMaxCtx} tokens. Resubmitting a smaller packet.`;
+        const note = `Context monitor: ${routedModel} filled ${turnOptions.num_ctx} tokens. Resubmitting a smaller packet.`;
         setExecutingPlanNotice(note);
         window.electronAPI?.writeLog?.('info', note);
         userContent = shrinkUserPacket(userContent, 2);
         historySent = [];
-        const retryPayload = [
+        conversationPayload = [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userContent }
         ];
         const retryBody = withThink(
           {
             model: routedModel,
-            messages: retryPayload,
-            options: {
-              temperature: agent.temperature,
-              num_ctx: chatNumCtx(routedNode, routedModel, retryPayload, {
-                role: turnRole,
-                createIntent: !readOnlyMode
-              })
-            }
+            messages: conversationPayload,
+            options: turnOptions
           },
           routedNode,
-          routedModel
+          routedModel,
+          turnRole
         );
-        const retry = streamChat(
-          routedNode.url,
-          retryBody,
-          () => {},
-          routedNode.type,
-          routedNode.apiKey
+        const retried = await awaitConductorChat(
+          () =>
+            streamChat(
+              routedNode.url,
+              retryBody,
+              () => {},
+              routedNode.type,
+              routedNode.apiKey
+            ),
+          { registerAbort, live: () => runLive(run) }
         );
-        activeAbortsRef.current = [retry.abort];
-        result = await retry.done;
+        if (retried.aborted || !runLive(run)) return;
+        result = retried.result;
       }
+      if (!runLive(run)) return;
+      notePromptSample(routedModel, conversationPayload, result.stats);
       const finished = readOnlyMode
         ? result.content
         : await finishTruncatedWrites(
             routedNode,
             routedModel,
             result.content,
-            result.stats?.doneReason
+            result.stats?.doneReason,
+            undefined,
+            run.token
           );
-      const finalParsed = parseResponse(finished, agentMsgId, false, { createIntent });
+      if (!runLive(run)) return;
+      const finalParsed = parseResponse(finished, agentMsgId, false, {
+        createIntent,
+        allowUnclosedSalvage: false
+      });
 
       let tools = collapseDuplicateReadTools(finalParsed.toolCalls);
+      if (!readOnlyMode && !continuationClosedWrite(result.content, finished) && hasUnclosedWrite(finished)) {
+        const truncated = truncatedWriteToolCall(finished, agentMsgId);
+        if (truncated) tools = [...tools, truncated];
+      }
       if (readOnlyMode) {
         // Planner / Reviewer: explore only — drop accidental write/edit/run tools
         tools = tools.filter(t =>
@@ -3417,15 +3938,19 @@ ${instruction}`,
         );
       }
 
+      if (!runLive(run)) return;
       const readPass = await runReadOnlyTools(tools, toolDepsRef.current);
       tools = readPass.tools;
+      if (!runLive(run)) return;
 
       if (!readOnlyMode && autoApplyWritesRef.current) {
         tools = await autoApplyWritableTools(tools, toolDepsRef.current);
+        if (!runLive(run)) return;
         tools = await runAuxTools(tools, toolDepsRef.current);
         const cmdPass = await runCommandTools(tools, toolDepsRef.current);
         tools = cmdPass.tools;
-        updateProgress(log => noteSavedFiles(log, tools));
+        updateProgress(log => noteSavedFiles(log, tools, savedFileFingerprints()));
+        noteAppliedWrites(tools);
       }
 
       let stats = undefined;
@@ -3574,6 +4099,7 @@ ${instruction}`,
           : reviewMode || stepVerdictMode
             ? 'reviewer'
             : 'coder');
+      if (!runLive(run)) return;
       if (!readOnlyMode && shouldContinueFromTools(tools, turnContinueOpts)) {
         await continueWithToolResults(origin, {
           createIntent,
@@ -3583,7 +4109,8 @@ ${instruction}`,
           lockPlanMode: !!lockPlanMode,
           reviewMode: !!reviewMode || !!stepVerdictMode,
           stepVerdictMode: !!stepVerdictMode,
-          freshContext: useFreshContext
+          freshContext: useFreshContext,
+          run
         });
       } else if (readOnlyMode && shouldContinueFromTools(tools, turnContinueOpts)) {
         // Planner/Reviewer: bounded explore continues, then they must emit the plan
@@ -3595,7 +4122,8 @@ ${instruction}`,
           lockPlanMode: !!lockPlanMode,
           reviewMode: !!reviewMode || !!stepVerdictMode,
           stepVerdictMode: !!stepVerdictMode,
-          freshContext: useFreshContext
+          freshContext: useFreshContext,
+          run
         });
         // After tool continuations, refresh reviewPlan from latest follow-up if reviewer
         if (reviewMode && !stepVerdictMode) {
@@ -3618,21 +4146,68 @@ ${instruction}`,
         }
       }
     } catch (err: any) {
-      window.electronAPI?.writeLog?.('error', `single-node ${routedNode?.name || ''}: ${err?.message || err}`);
-      setMessages(prev =>
-        prev.map(m => {
-          if (m.id === agentMsgId) {
-            return {
-              ...m,
-              display: m.display + `\n\n⚠️ Error on ${routedNode.name}: ${err.message}`
-            };
-          }
-          return m;
-        })
-      );
+      const errText = String(err?.message || err || '');
+      window.electronAPI?.writeLog?.('error', `single-node ${routedNode?.name || ''}: ${errText}`);
+      if (runLive(run) && !opts.retriedSame) {
+        setMessages(prev =>
+          prev.map(m =>
+            m.id === agentMsgId ? { ...m, display: `Retrying ${routedNode.name}…`, error: undefined } : m
+          )
+        );
+        await new Promise(r => setTimeout(r, 400));
+        if (!runLive(run)) return originOut;
+        return runSingleNodeTurn({
+          ...opts,
+          run,
+          skipUserAppend: true,
+          retriedSame: true,
+          pinRoute: { node: routedNode, model: routedModel }
+        });
+      }
+      if (runLive(run) && !opts.failedOver) {
+        const fail = pickFailoverTarget(nodesRef.current, routedNode.id, routedModel, { role: pinRole });
+        if (
+          fail &&
+          fail.node.online &&
+          getEnabledModelsForNode(fail.node).includes(fail.model) &&
+          (fail.node.id !== routedNode.id || fail.model !== routedModel)
+        ) {
+          setMessages(prev =>
+            prev.map(m =>
+              m.id === agentMsgId
+                ? { ...m, display: `Rerouting to ${fail.node.name}…`, error: undefined }
+                : m
+            )
+          );
+          return runSingleNodeTurn({
+            ...opts,
+            run,
+            skipUserAppend: true,
+            retriedSame: true,
+            failedOver: true,
+            pinRoute: { node: fail.node, model: fail.model },
+            notice: `Rerouted to ${fail.node.name}`
+          });
+        }
+      }
+      if (runLive(run)) {
+        setMessages(prev =>
+          prev.map(m => {
+            if (m.id === agentMsgId) {
+              return {
+                ...m,
+                error: errText,
+                endpointName: routedNode.name,
+                model: routedModel
+              };
+            }
+            return m;
+          })
+        );
+      }
     } finally {
       setIsStreaming(false);
-      activeAbortsRef.current = [];
+      leaveConductorRun(entered.owned, entered.run.token);
     }
     return originOut;
   };
@@ -3797,13 +4372,21 @@ ${instruction}`,
    * After a clean Reviewer pass (or user Continue), decide continue / ask / done.
    * Does not write files — Reviewer → Planner → Coder owns fixes.
    */
-  const decideNextStepAndAdvance = async (depth: number, previousTask = ''): Promise<void> => {
-    if (stopRequestedRef.current) return;
+  const decideNextStepAndAdvance = async (
+    depth: number,
+    previousTask = '',
+    parent?: ConductorRun | null
+  ): Promise<void> => {
+    const entered = bindRun(parent ?? null, false);
+    if (!entered) return;
+    const run = entered.run;
+    try {
+    if (!runLive(run)) return;
 
     // Planner-owned plan is the sole controller — never invent next steps while active.
     if (isPlanActive(plannerPlanRef.current)) {
       const step = getActiveStep(plannerPlanRef.current);
-      if (step && (step.status === 'in_progress' || step.status === 'failed')) {
+      if (step && (step.status === 'in_progress' || step.status === 'pending')) {
         await dispatchActiveStep();
       } else if (plannerPlanRef.current?.status === 'completed') {
         setExecutingPlanNotice('Planner plan complete — ask Planner for the next feature if needed.');
@@ -3835,12 +4418,40 @@ ${instruction}`,
     const planText = approvedPlanRef.current
       ? formatApprovedPlanContext(approvedPlanRef.current)
       : '';
+    const contTier = resolveModelFit(node, model, 'reviewer', reviewerAgent.numCtx).tier;
+    setIsStreaming(true);
+    const preloadedFiles: { path: string; content: string }[] = [];
+    if (workspacePath && window.electronAPI?.readFile) {
+      const sep = workspacePath.includes('\\') ? '\\' : '/';
+      const root = workspacePath.replace(/[\\/]+$/, '');
+      for (const rel of touchedPaths) {
+        if (preloadedFiles.length >= 8) break;
+        const norm = (rel || '').replace(/\\/g, '/').trim();
+        if (!norm) continue;
+        try {
+          const abs =
+            /^[a-zA-Z]:[\\/]/.test(norm) || norm.startsWith('/')
+              ? norm
+              : `${root}${sep}${norm.replace(/\//g, sep)}`;
+          const res = await window.electronAPI.readFile(abs);
+          if (typeof res?.content === 'string') preloadedFiles.push({ path: norm, content: res.content });
+        } catch {
+          /* file already gone */
+        }
+      }
+    }
+    if (!runLive(run)) {
+      setIsStreaming(false);
+      return;
+    }
     const userContent = buildContinuationReviewPrompt({
       approvedPlanText: planText,
       recentTranscript: transcript,
       workspaceOverview,
       workLog: progressForPrompt(),
-      writtenPaths: touchedPaths,
+      writtenPaths: preloadedFiles.length ? undefined : touchedPaths,
+      preloadedFiles,
+      tier: contTier,
       capped
     });
 
@@ -3887,73 +4498,68 @@ ${instruction}`,
           {
             model,
             messages: askMsgs,
-            options: {
+            options: chatOptions(node, model, 'reviewer', {
+              createIntent: false,
+              tier: contTier,
               temperature: 0.2,
-              num_ctx: chatNumCtx(node, model, askMsgs, { role: 'planner', createIntent: false })
-            }
+              fallbackNumCtx: reviewerAgent.numCtx
+            })
           },
           node,
-          model
+          model,
+          'reviewer'
         );
-        const handle = streamChat(
-          node.url,
-          body,
-          (chunk, thinking) => {
-            const shown = stripNextStepMarkup(stripPlanOptionMarkup(stripThinking(chunk)));
-            setMessages(prev =>
-              prev.map(m =>
-                m.id === agentMsgId
-                  ? { ...m, raw: chunk, display: shown, thinking: thinking || m.thinking }
-                  : m
-              )
-            );
-          },
-          node.type,
-          node.apiKey
+        const taken = await awaitConductorChat(
+          () =>
+            streamChat(
+              node.url,
+              body,
+              (chunk, thinking) => {
+                if (!runLive(run)) return;
+                const shown = stripNextStepMarkup(stripPlanOptionMarkup(stripThinking(chunk)));
+                setMessages(prev =>
+                  prev.map(m =>
+                    m.id === agentMsgId
+                      ? { ...m, raw: chunk, display: shown, thinking: thinking || m.thinking }
+                      : m
+                  )
+                );
+              },
+              node.type,
+              node.apiKey
+            ),
+          {
+            registerAbort,
+            live: () => runLive(run)
+          }
         );
-        activeAbortsRef.current = [handle.abort];
-        return handle.done;
+        if (taken.aborted) {
+          return { content: '', thinking: '', aborted: true, stats: {} };
+        }
+        return taken.result;
       };
 
       const first = await askModel(
         `${userContent}\n\nReviewer already cleared this step (no open fix tasks). Decide <next_step> only — do not edit files.`,
         []
       );
-      if (first.aborted || stopRequestedRef.current) return;
+      if (first.aborted || !runLive(run)) return;
       if (first.stats?.evalCount) {
         const tokens = first.stats.evalCount + (first.stats.promptEvalCount || 0);
         if (node.type === 'openai' || node.apiKey) onRecordTokens(0, tokens);
         else onRecordTokens(tokens, 0);
       }
-
-      let content = first.content;
-      let readTools: ToolCall[] = [];
-      const firstReads = parseResponse(content, agentMsgId, false).toolCalls.filter(t =>
-        ['read_file', 'list_dir', 'search'].includes(t.name)
+      notePromptSample(
+        model,
+        [
+          { content: CONTINUATION_REVIEW_SYSTEM },
+          { content: userContent }
+        ],
+        first.stats
       );
-      if (firstReads.length && !stopRequestedRef.current) {
-        const ran = await runReadOnlyTools(firstReads, toolDepsRef.current);
-        readTools = ran.tools;
-        setMessages(prev =>
-          prev.map(m => (m.id === agentMsgId ? { ...m, toolCalls: ran.tools } : m))
-        );
-        const follow = `Tool results:\n${ran.tools
-          .map(t => `${t.name} ${t.args.path || t.args.query || ''}: ${(t.result || '').slice(0, 1200)}`)
-          .join('\n\n')}\n\nDo not edit files. End with exactly one <next_step> block.`;
-        const second = await askModel(follow, [
-          { role: 'user', content: userContent },
-          { role: 'assistant', content: content }
-        ]);
-        if (second.aborted || stopRequestedRef.current) return;
-        if (second.content.trim()) content = second.content;
-        if (second.stats?.evalCount) {
-          const tokens = second.stats.evalCount + (second.stats.promptEvalCount || 0);
-          if (node.type === 'openai' || node.apiKey) onRecordTokens(0, tokens);
-          else onRecordTokens(tokens, 0);
-        }
-      }
 
-      const reviewTools = readTools;
+      const content = first.content;
+      const reviewTools: ToolCall[] = [];
       const parsedDecision = parseNextStep(content);
       const durableFallback = (progressRef.current.bug || progressRef.current.next || '').trim();
       const filteredDecision = parsedDecision
@@ -4162,11 +4768,16 @@ ${instruction}`,
         setExecutingPlanNotice(null);
       }
     } catch (err: any) {
+      if (!runLive(run)) return;
       window.electronAPI?.writeLog?.('error', `continuation check: ${err?.message || err}`);
       setMessages(prev =>
         prev.map(m =>
           m.id === agentMsgId
-            ? { ...m, display: (m.display || '') + `\n\n⚠️ Could not check the next step: ${err.message}` }
+            ? {
+                ...m,
+                display: (m.display || '') + `\n\nCouldn't check the next step.`,
+                error: err?.message || 'Could not check the next step.'
+              }
             : m
         )
       );
@@ -4174,11 +4785,10 @@ ${instruction}`,
     } finally {
       if (!handoff) {
         setIsStreaming(false);
-        activeAbortsRef.current = [];
       }
     }
 
-    if (!handoff || stopRequestedRef.current) return;
+    if (!handoff || !runLive(run)) return;
 
     const stuckTarget = pinStuck;
     setExecutingPlanNotice(
@@ -4206,14 +4816,18 @@ ${instruction}`,
           ? `Fixing on ${node.name} — ${nextTask.slice(0, 120)}`
           : `Continuing automatically — ${nextTask.slice(0, 140)}`,
       freshContext: true,
+      run,
       ...(stuckTarget ? { pinRoute: stuckTarget } : pinFix ? { pinRoute: { node, model } } : {})
     });
-    if (stopRequestedRef.current) {
+    if (!runLive(run)) {
       restorePlannerControl('Stopped — talk to Planner about what to do next.');
       return;
     }
-    await reviewAndAdvance(depth + 1, nextTask);
+    await reviewAndAdvance(depth + 1, nextTask, run);
     restorePlannerControl();
+    } finally {
+      leaveConductorRun(entered.owned, run.token);
+    }
   };
 
   /**
@@ -4221,11 +4835,19 @@ ${instruction}`,
    * - Active PlannerPlan → step Yay/Nay (reviewActiveStep).
    * - Legacy flat queue → review_delta / seed review_plan.
    */
-  const reviewAndAdvance = async (depth: number, previousTask = ''): Promise<void> => {
-    if (stopRequestedRef.current) return;
+  const reviewAndAdvance = async (
+    depth: number,
+    previousTask = '',
+    parent?: ConductorRun | null
+  ): Promise<void> => {
+    const entered = bindRun(parent ?? null, false);
+    if (!entered) return;
+    const run = entered.run;
+    try {
+    if (!runLive(run)) return;
 
     if (isPlanActive(plannerPlanRef.current)) {
-      await reviewActiveStep();
+      await reviewActiveStep(run);
       return;
     }
 
@@ -4249,7 +4871,7 @@ ${instruction}`,
 
     const target = pickCapableReviewTarget(nodesRef.current);
     if (!target) {
-      if (autoReviewRef.current) await decideNextStepAndAdvance(depth, previousTask);
+      if (autoReviewRef.current) await decideNextStepAndAdvance(depth, previousTask, run);
       return;
     }
 
@@ -4269,11 +4891,16 @@ ${instruction}`,
     const filesHint = touchedPaths.length
       ? `Files just written/edited:\n${touchedPaths.slice(0, 12).join('\n')}`
       : 'No write/edit paths recorded — review the latest coding step from chat context.';
+    setIsStreaming(true);
     const filesBody = await buildTouchedFilesContext(workspacePath, touchedPaths, {
       maxFiles: 8,
       maxCharsPerFile: 5000,
       maxTotalChars: 20000
     });
+    if (!runLive(run)) {
+      setIsStreaming(false);
+      return;
+    }
 
     const existingQueue = executionQueueRef.current;
     const activeTask = getActiveTask(existingQueue);
@@ -4331,10 +4958,11 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
       skipUserAppend: true,
       notice: `Reviewer checking on ${target.node.name}`,
       pinRoute: target,
-      freshContext: true
+      freshContext: true,
+      run
     });
 
-    if (stopRequestedRef.current) {
+    if (!runLive(run)) {
       restorePlannerControl('Stopped — talk to Planner about what to do next.');
       return;
     }
@@ -4444,7 +5072,7 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
           setExecutingPlanNotice('All review tasks done — click Looks good / Continue');
           return;
         }
-        await decideNextStepAndAdvance(depth, previousTask);
+        await decideNextStepAndAdvance(depth, previousTask, run);
         return;
       }
     }
@@ -4512,41 +5140,93 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
       return;
     }
 
-    await decideNextStepAndAdvance(depth, previousTask);
+    await decideNextStepAndAdvance(depth, previousTask, run);
+    } finally {
+      leaveConductorRun(entered.owned, run.token);
+    }
+  };
+
+  const coderWriteTools = (): ToolCall[] => {
+    const msg = [...messagesRef.current].reverse().find(
+      m =>
+        m.role === 'assistant' &&
+        (m.toolCalls || []).some(t => t.name === 'write_file' || t.name === 'edit_file')
+    );
+    return (msg?.toolCalls || []).filter(t => t.name === 'write_file' || t.name === 'edit_file');
+  };
+
+  const writesUnresolved = (tools: ToolCall[]) =>
+    tools.length > 0 && tools.every(t => t.status !== 'done');
+
+  const snapshotStepFiles = async (stepId: string, rels: string[]) => {
+    if (!workspacePath || !window.electronAPI?.readFile) return;
+    const sep = workspacePath.includes('\\') ? '\\' : '/';
+    const root = workspacePath.replace(/[\\/]+$/, '');
+    let used = 0;
+    for (const [id, files] of stepSnapshotsRef.current) {
+      if (id === String(stepId)) continue;
+      for (const file of files) used += file.content.length;
+    }
+    const next: { path: string; content: string }[] = [];
+    for (const rel of rels) {
+      const norm = rel.replace(/\\/g, '/').replace(/^\.\//, '');
+      if (!norm || norm.split('/').includes('..')) continue;
+      const room = STEP_SNAPSHOT_CAP - used;
+      if (room <= 0) break;
+      try {
+        const abs = `${root}${sep}${norm.replace(/\//g, sep)}`;
+        const res = await window.electronAPI.readFile(abs);
+        if (typeof res?.content !== 'string') continue;
+        if (res.content.length > room) break;
+        next.push({ path: norm, content: res.content });
+        used += res.content.length;
+      } catch {
+        /* missing file — nothing to restore */
+      }
+    }
+    stepSnapshotsRef.current.set(String(stepId), next);
   };
 
   /** Dispatch the active Planner step to Coders (sequential single-node or Swarm for the step). */
   const dispatchActiveStep = async (): Promise<void> => {
-    if (stopRequestedRef.current) return;
+    const entered = bindRun(null, false);
+    if (!entered) return;
+    const run = entered.run;
+    try {
+    if (!runLive(run)) return;
     let plan = plannerPlanRef.current;
     if (!plan || plan.status !== 'active') return;
 
     let step = getActiveStep(plan);
-    if (!step || step.status === 'completed') {
+    if (!step || step.status === 'completed' || step.status === 'failed' || step.status === 'abandoned') {
       plan = activateNextStep(plan);
-      commitPlannerPlan(plan);
+      await commitPlannerPlan(plan, run.token);
+      if (!runLive(run)) return;
       if (plan.status === 'completed') {
         setExecutingPlanNotice('Planner plan complete.');
         return;
       }
       step = getActiveStep(plan);
     }
-    if (!step) return;
+    if (!step || step.status === 'failed' || step.status === 'abandoned') return;
 
     plan = markStepInProgress(plan, step.id);
-    commitPlannerPlan({ ...plan, resumePhase: 'coder', updatedAt: Date.now() });
+    await commitPlannerPlan({ ...plan, resumePhase: 'coder', updatedAt: Date.now() }, run.token);
+    if (!runLive(run)) return;
     step = getActiveStep(plannerPlanRef.current)!;
+    if (!step) return;
 
     ephemeralWorkerRef.current = true;
     onSelectAgent(coderAgent.id);
     onConversationPatch?.({ agentId: coderAgent.id });
 
     resetAgentLoopBudget();
-    stopRequestedRef.current = false;
 
     // Cleared-context Coders need the named file bodies (e.g. app.js) in the packet —
     // titles alone caused incomplete edits → Reviewer Nay → infinite rework loops.
     const stepFiles = collectStepFilePaths(step);
+    await snapshotStepFiles(String(step.id), stepFiles);
+    if (!runLive(run)) return;
     const recentWrites = collectWrittenPaths(messagesRef.current);
     const coderRoute = resolveRoute(`Implement plan step #${step.id}: ${step.title}`, coderAgent);
     const coderFit = coderRoute
@@ -4566,6 +5246,7 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
         maxTotalChars: 48000
       }
     );
+    if (!runLive(run)) return;
     const packing = coderFit?.packingLine ? `\n\n${coderFit.packingLine}` : '';
     const coderPrompt = `${formatStepForCoders(plan, step)}${packing}
 
@@ -4583,22 +5264,15 @@ ${progressForPrompt() || '(empty)'}`;
     );
 
     try {
-      if (isPipelineMode) {
-        const synthetic: ApprovedPlan = {
-          summary: `${plan.summary} — step ${step.id}`,
-          chosenOptionId: plan.chosenOptionId || 'plan-step',
-          chosenOptionTitle: step.title,
-          chosenOptionDescription: step.tasks.map(t => `${t.id}. ${t.title}: ${t.description}`).join('\n'),
-          allOptions: [],
-          originalUserRequest: `Plan step #${step.id}: ${step.title}`,
-          approvedAt: Date.now(),
-          planMarkdown: coderPrompt
-        };
-        approvedPlanRef.current = synthetic;
-        onConversationPatch?.({ approvedPlan: synthetic });
+      if (isPipelineMode && stepFiles.length > 0) {
         await handleSendPipelineMessage(`Plan step #${step.id}: ${step.title}`, coderPrompt, {
-          approvedPlan: synthetic,
-          skipUserAppend: true
+          approvedPlan: approvedPlanRef.current,
+          skipUserAppend: true,
+          run,
+          stepDispatch: {
+            files: stepFiles,
+            brief: formatStepForCoders(plan, step)
+          }
         });
       } else {
         await runSingleNodeTurn({
@@ -4609,39 +5283,54 @@ ${progressForPrompt() || '(empty)'}`;
           approvedPlan: approvedPlanRef.current,
           skipUserAppend: true,
           notice: `Coder implementing step #${step.id}`,
-          freshContext: true
+          freshContext: true,
+          primaryFile: stepFiles.length === 1 ? stepFiles[0] : undefined,
+          run
         });
       }
 
-      if (stopRequestedRef.current) {
+      if (!runLive(run)) {
         setPlanPaused(true);
-        setPlanResumePhase('coder');
+        setPlanResumePhase('coder', run.token);
         restorePlannerControl(
           `Paused during Coder on step #${step.id} — press Play to resume.`
         );
         return;
       }
 
-      // Mark step tasks done for coder pass; Reviewer Yay/Nay is the real gate.
+      if (writesUnresolved(coderWriteTools())) {
+        setPlanResumePhase('coder', run.token);
+        setPlanPaused(true);
+        restorePlannerControl(
+          `Coder writes failed or are still pending on step #${step.id}. Press Play to run the Coder again.`
+        );
+        return;
+      }
+
+      // Tasks stay pending until a parsed Yay. Review is the gate.
       plan = plannerPlanRef.current;
       if (plan && step) {
-        plan = markAllStepTasks(plan, step.id, 'completed');
-        commitPlannerPlan({ ...plan, resumePhase: 'review', updatedAt: Date.now() });
+        await commitPlannerPlan({ ...plan, resumePhase: 'review', updatedAt: Date.now() }, run.token);
       } else {
-        setPlanResumePhase('review');
+        setPlanResumePhase('review', run.token);
       }
-      await reviewActiveStep();
+      if (!runLive(run)) return;
+      await reviewActiveStep(run);
     } catch (err: any) {
       setPlanPaused(true);
-      setPlanResumePhase('coder');
+      setPlanResumePhase('coder', run.token);
       restorePlannerControl(`Coder step failed: ${err?.message || err}`);
       throw err;
     }
+    } finally {
+      leaveConductorRun(entered.owned, entered.run.token);
+    }
   };
 
-  /** Reviewer Yay/Nay on the active Planner step. */
-  const reviewActiveStep = async (): Promise<void> => {
-    if (stopRequestedRef.current) return;
+  /** Reviewer Yay/Nay on the active Planner step. `parent` is the conductor run that owns this review. */
+  const reviewActiveStep = async (parent?: ConductorRun | null): Promise<void> => {
+    if (parent && !runLive(parent)) return;
+    if (!parent && stopRequestedRef.current) return;
     const plan = plannerPlanRef.current;
     const step = getActiveStep(plan);
     if (!plan || !step) {
@@ -4666,6 +5355,7 @@ ${progressForPrompt() || '(empty)'}`;
       : 'Review from chat context and the step task list.';
     beginActivity('review', `Reviewer on step #${step.id}`, step.title);
     const reviewFit = resolveModelFit(target.node, target.model, 'reviewer', reviewerAgent.numCtx);
+    setIsStreaming(true);
     const filesBody = await buildTouchedFilesContext(
       workspacePath,
       reviewPaths,
@@ -4673,6 +5363,11 @@ ${progressForPrompt() || '(empty)'}`;
         ? reviewFit.caps
         : { maxFiles: 16, maxCharsPerFile: 10000, maxTotalChars: 64000 }
     );
+    if ((parent && !runLive(parent)) || (!parent && stopRequestedRef.current)) {
+      setIsStreaming(false);
+      endActivity();
+      return;
+    }
 
     // Soft pre-check: placeholder / planner prose in touched files → force Nay notes
     const placeholderHits: string[] = [];
@@ -4717,10 +5412,11 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       skipUserAppend: true,
       notice: `Reviewer on ${target.node.name} — step #${step.id}`,
       pinRoute: target,
-      freshContext: true
+      freshContext: true,
+      ...(parent ? { run: parent } : {})
     });
 
-    if (stopRequestedRef.current) {
+    if ((parent && !runLive(parent)) || (!parent && stopRequestedRef.current)) {
       endActivity();
       setPlanPaused(true);
       setPlanResumePhase('review');
@@ -4737,27 +5433,54 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
         m => m.role === 'assistant' && (m.stepVerdict || m.personaHandle === 'reviewer')
       );
 
-    let verdict = latest?.stepVerdict
+    const parsedVerdict = latest?.stepVerdict
       ? {
           stepId: latest.stepVerdict.stepId,
-          result: latest.stepVerdict.result,
+          result: latest.stepVerdict.result as 'yay' | 'nay' | 'missing',
           notes: latest.stepVerdict.notes
         }
-      : parseStepVerdict(latest?.raw || '');
+      : parseStepVerdict(latest?.raw || '', { allowMissing: true });
 
-    if (!verdict) {
-      // Infer from prose when markup missing
-      const blob = `${latest?.display || ''}\n${latest?.raw || ''}`;
-      const dirty =
-        /\b(bug|issue|missing|broken|incorrect|fail|wrong|incomplete)\b/i.test(blob) &&
-        !/\b(no (blocking )?issues|looks correct|all good)\b/i.test(blob);
-      verdict = {
-        stepId: step.id,
-        result: dirty ? 'nay' : 'yay',
-        notes: (latest?.display || '').slice(0, 400) || (dirty ? 'Needs refining.' : 'Looks good.')
-      };
+    if (!parsedVerdict || parsedVerdict.result === 'missing') {
+      const planNow = plannerPlanRef.current;
+      if (planNow) {
+        const held = transition(planNow, {
+          type: 'VERDICT',
+          result: 'missing',
+          stepId: step.id,
+          notes: parsedVerdict?.notes
+        });
+        await commitPlannerPlan(held.plan, parent?.token);
+      }
+      if ((parent && !runLive(parent)) || (!parent && stopRequestedRef.current)) return;
+      if (latest) {
+        setMessages(prev => {
+          const next = prev.map(m =>
+            m.id === latest.id
+              ? {
+                  ...m,
+                  display:
+                    'The reviewer did not give an explicit Pass or Fail. Send a yay or nay, or press Play to ask again. Accept applies a verdict card once one is shown; otherwise send fixes.',
+                  notice: 'Explicit Pass/Fail required'
+                }
+              : m
+          );
+          messagesRef.current = next;
+          return next;
+        });
+      }
+      setPlanPaused(true);
+      restorePlannerControl(
+        `Step #${step.id} needs an explicit Pass or Fail. Accept the verdict card, or send fixes.`
+      );
+      return;
     }
 
+    const verdict: { stepId: string; result: 'yay' | 'nay'; notes: string } = {
+      stepId: parsedVerdict.stepId,
+      result: parsedVerdict.result === 'nay' ? 'nay' : 'yay',
+      notes: parsedVerdict.notes
+    };
     const packed = {
       stepId: verdict.stepId || step.id,
       stepTitle: step.title,
@@ -4793,6 +5516,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       return;
     }
 
+    if (parent && !runLive(parent)) return;
     await applyStepVerdictAndContinue(
       latest ? { ...latest, stepVerdict: packed } : null,
       packed
@@ -4861,6 +5585,13 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     const reworkCount = effectiveStepReworkCount(String(stuck.id), stuck.reworkCount);
     const escalations = plan.escalationCount || 0;
     // Cap, or step is already a Fix pass → compiler heal (no redundant Fix: steps).
+    if (stuck.blockerKind === 'review' && plan.lastVerifyOk) {
+      setPlanPaused(true);
+      restorePlannerControl(
+        `Step #${stuck.id} failed review. Verify is green, so the step stays failed — Retry it or send fixes.`
+      );
+      return;
+    }
     if (
       escalations >= MAX_PLAN_ESCALATIONS ||
       plan.steps.length >= MAX_PLAN_STEPS ||
@@ -5020,56 +5751,90 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     });
   };
 
-  /** Always run the stack verify command — never fake a mid-plan green. */
-  const runProjectVerify = async (): Promise<{
+  /**
+   * Project tsc without `npx`. Use the workspace compiler when it is installed,
+   * otherwise Studio's bundled tsc. Missing modules fail with an install hint.
+   */
+  const runTypescriptVerify = async (): Promise<string> => {
+    const bins = ['node_modules/.bin/tsc.cmd', 'node_modules/.bin/tsc', 'node_modules/typescript/bin/tsc'];
+    let bin = '';
+    if (workspacePath && window.electronAPI?.execTool) {
+      for (const rel of bins) {
+        try {
+          const probe = await window.electronAPI.execTool(workspacePath, 'exists', { path: rel });
+          if (probe?.exists) {
+            bin = rel;
+            break;
+          }
+        } catch {
+          /* try the next shim */
+        }
+      }
+    }
+    if (bin) return executeTrackedCommand(localTscPowerShellCommand(bin));
+    if (!workspacePath || !window.electronAPI?.typecheckWorkspace) {
+      return `Exit code: 1\n${DEPENDENCY_RETRY_MESSAGE}`;
+    }
+    const check = await window.electronAPI.typecheckWorkspace(workspacePath, {
+      mode: 'workspace',
+      timeoutMs: 90000
+    });
+    const body = annotateMissingDependencies(check.output || check.error || '');
+    if (check.skipped) return body || 'No tsconfig.json in workspace — skipped full project typecheck';
+    if (check.ok) return body ? `Exit code: 0\n${body}` : 'Exit code: 0';
+    const withCode = /Exit code:/i.test(body) ? body : `Exit code: ${check.code ?? 1}\n${body}`;
+    return annotateMissingDependencies(withCode);
+  };
+
+  /** One stack verify command. Missing workspace or command is a failure, not a pass. */
+  const runProjectVerify = async (
+    token?: number
+  ): Promise<{
     ok: boolean;
     output: string;
     fingerprint: string;
   }> => {
-    if (!workspacePath) return { ok: true, output: '', fingerprint: 'none' };
+    if (typeof token === 'number' && !runIsCurrent(token)) {
+      return { ok: false, output: 'Stopped.', fingerprint: 'aborted' };
+    }
+    const brain = projectBrainRef.current;
+    const stack =
+      brain.stack ||
+      deliveryToStack(brain.delivery || plannerPlanRef.current?.delivery) ||
+      'typescript';
+    const begun = beginVerify({
+      workspacePath,
+      stack,
+      preferred: brain.verifyCommand || plannerPlanRef.current?.verifyCommand
+    });
+    if ('failure' in begun) {
+      const failure = begun.failure;
+      commitProjectBrain({
+        ...projectBrainRef.current,
+        lastVerifyOk: false,
+        lastVerifyNote: failure.output.slice(0, 800)
+      });
+      if (plannerPlanRef.current) {
+        await commitPlannerPlan(
+          {
+            ...plannerPlanRef.current,
+            lastVerifyOk: false,
+            lastErrorFingerprint: failure.fingerprint,
+            updatedAt: Date.now()
+          },
+          token
+        );
+      }
+      return { ok: false, output: failure.output, fingerprint: failure.fingerprint };
+    }
     beginActivity('verify', 'Project verify');
     try {
-      const brain = projectBrainRef.current;
-      const stack =
-        brain.stack ||
-        deliveryToStack(brain.delivery || plannerPlanRef.current?.delivery) ||
-        'typescript';
-      const cmd = resolveVerifyCommand(stack, brain.verifyCommand || plannerPlanRef.current?.verifyCommand);
-
-      if (
-        (stack === 'typescript' || stack === 'node') &&
-        window.electronAPI?.typecheckWorkspace
-      ) {
-        const r = await window.electronAPI.typecheckWorkspace(workspacePath, {
-          mode: 'workspace',
-          timeoutMs: 90000
-        });
-        const tscOut = r.output || r.error || '';
-        if (r.skipped || !r.ok) {
-          const note = r.skipped
-            ? tscOut || 'Typecheck skipped (no tsconfig) — not a pass.'
-            : tscOut;
-          const errors = parseCompilerErrors(note);
-          const fingerprint = errorFingerprint(errors);
-          commitProjectBrain({
-            ...projectBrainRef.current,
-            lastVerifyOk: false,
-            lastVerifyNote: note.slice(0, 800)
-          });
-          return { ok: false, output: note, fingerprint };
-        }
+      const out = typescriptVerifyUsesCompiler(begun.command)
+        ? await runTypescriptVerify()
+        : await executeTrackedCommand(begun.command);
+      if (typeof token === 'number' && !runIsCurrent(token)) {
+        return { ok: false, output: 'Stopped.', fingerprint: 'aborted' };
       }
-
-      if (!cmd) {
-        commitProjectBrain({
-          ...projectBrainRef.current,
-          lastVerifyOk: true,
-          lastVerifyNote: 'no verify command for stack'
-        });
-        return { ok: true, output: '', fingerprint: 'none' };
-      }
-
-      const out = await executeTrackedCommand(cmd);
       const visual = verifyOutputFailed(out) ? '' : await readWebEntryBlocker();
       const combined = visual ? `${out || ''}\n${visual}` : out || '';
       const failed = verifyOutputFailed(combined);
@@ -5077,18 +5842,21 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       const fingerprint = errorFingerprint(errors);
       commitProjectBrain({
         ...projectBrainRef.current,
-        verifyCommand: cmd,
+        verifyCommand: begun.command,
         lastVerifyOk: !failed,
         lastVerifyNote: combined.slice(-800)
       });
       if (plannerPlanRef.current) {
-        commitPlannerPlan({
-          ...plannerPlanRef.current,
-          verifyCommand: cmd,
-          lastVerifyOk: !failed,
-          lastErrorFingerprint: fingerprint,
-          updatedAt: Date.now()
-        });
+        await commitPlannerPlan(
+          {
+            ...plannerPlanRef.current,
+            verifyCommand: begun.command,
+            lastVerifyOk: !failed,
+            lastErrorFingerprint: fingerprint,
+            updatedAt: Date.now()
+          },
+          token
+        );
       }
       return { ok: !failed, output: combined, fingerprint };
     } catch (err: any) {
@@ -5114,19 +5882,36 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
   const advanceAfterHealVerify = async (stepId: string, fingerprint: string, note: string) => {
     let plan = plannerPlanRef.current;
     if (!plan) return;
-    plan = applyStepVerdict(plan, {
+    if (!canHealAdvanceOnGreenVerify(plan, stepId)) {
+      const held = transition(plan, {
+        type: 'VERIFY',
+        ok: true,
+        fingerprint,
+        stepId,
+        note
+      });
+      await commitPlannerPlan(held.plan);
+      setPlanPaused(true);
+      restorePlannerControl(
+        'Verify passed, but this step failed review. It stays failed — Retry the step or send fixes.'
+      );
+      return;
+    }
+    const moved = transition(plan, {
+      type: 'VERIFY',
+      ok: true,
+      fingerprint,
       stepId,
-      result: 'yay',
-      notes: note
+      note
     });
-    commitPlannerPlan({
-      ...plan,
-      blockedReason: undefined,
-      healAttempts: 0,
-      lastErrorFingerprint: fingerprint,
-      updatedAt: Date.now()
-    });
-    if (plan.status === 'completed') {
+    await commitPlannerPlan(moved.plan);
+    if (moved.effect !== 'verify-advanced') {
+      setPlanPaused(true);
+      restorePlannerControl('Verify passed, but this step was not advanced.');
+      return;
+    }
+    plan = moved.plan;
+    if (plan.resumePhase === 'final-review' || plan.status === 'completed') {
       setPlanPaused(false);
       await finishVerifiedPlanRef.current(plan);
       return;
@@ -5173,18 +5958,23 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
    * Compiler-driven heal when blocked / escalation would no-op.
    * Does not append steps or bump escalationCount. Max MAX_HEAL_ATTEMPTS per plan.
    */
+  const frontierBriefUsed = (plan: PlannerPlan | null | undefined) =>
+    !!(plan as (PlannerPlan & { frontierHealBriefUsed?: boolean }) | null | undefined)
+      ?.frontierHealBriefUsed;
+
   const healBlockedPlan = async (): Promise<void> => {
-    if (isStreaming) return;
+    const entered = bindRun(null, false);
+    if (!entered) return;
+    const run = entered.run;
+    try {
+    if (!runLive(run)) return;
     let plan = plannerPlanRef.current;
     if (!plan || !isPlanActive(plan)) {
       setExecutingPlanNotice('No active plan to heal.');
       return;
     }
 
-    const stuck =
-      getActiveStep(plan) ||
-      plan.steps.find(s => s.status === 'failed') ||
-      plan.steps.find(s => s.status === 'in_progress');
+    const stuck = pickHealStep(plan);
     if (!stuck) {
       restorePlannerControl('Nothing to heal — no stuck step.');
       return;
@@ -5199,17 +5989,20 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       return;
     }
 
-    stopRequestedRef.current = false;
     setPlanPaused(false);
     resetAgentLoopBudget();
-    commitPlannerPlan({
-      ...plan,
-      blockedReason: undefined,
-      healAttempts: attempts + 1,
-      resumePhase: 'coder',
-      activeStepId: stuck.id,
-      updatedAt: Date.now()
-    });
+    await commitPlannerPlan(
+      {
+        ...plan,
+        blockedReason: undefined,
+        healAttempts: attempts + 1,
+        resumePhase: 'coder',
+        activeStepId: stuck.id,
+        updatedAt: Date.now()
+      },
+      run.token
+    );
+    if (!runLive(run)) return;
     beginActivity(
       'heal',
       `Heal step #${stuck.id}`,
@@ -5220,8 +6013,8 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     );
 
     try {
-      let verify = await runProjectVerify();
-      if (stopRequestedRef.current) {
+      let verify = await runProjectVerify(run.token);
+      if (!runLive(run)) {
         setPlanPaused(true);
         endActivity();
         restorePlannerControl('Paused during Heal verify — press Heal and continue to retry.');
@@ -5264,6 +6057,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
             maxTotalChars: 48000
           }
         );
+        if (!runLive(run)) return;
         const healPrompt = `### Heal pass (compiler-driven)
 You are fixing compile/verify errors for plan step #${stuck.id}: ${stuck.title}.
 ${stuck.reviewNote ? `Reviewer note: ${stuck.reviewNote}` : ''}
@@ -5297,10 +6091,19 @@ ${progressForPrompt() || '(empty)'}`;
           skipUserAppend: true,
           notice,
           freshContext: true,
+          run,
           ...(pin ? { pinRoute: pin } : {})
         });
       };
 
+      const fingerprintBeforeLocal = fingerprint;
+      await snapshotStepFiles(String(stuck.id), allowedFiles);
+      if (!runLive(run)) {
+        setPlanPaused(true);
+        endActivity();
+        restorePlannerControl('Paused during Heal — press Play to resume.');
+        return;
+      }
       // Skip another local coder if this fingerprint already survived a prior heal attempt.
       const skipLocal = !!prevFp && prevFp === fingerprint && attempts >= 1;
 
@@ -5318,13 +6121,13 @@ ${progressForPrompt() || '(empty)'}`;
             : `Heal: local Coder on ${errorFiles.length || allowedFiles.length || '?'} error file(s)…`,
           frontierPin
         );
-        if (stopRequestedRef.current) {
+        if (!runLive(run)) {
           setPlanPaused(true);
           endActivity();
           restorePlannerControl('Paused during Heal Coder — press Heal and continue to retry.');
           return;
         }
-        verify = await runProjectVerify();
+        verify = await runProjectVerify(run.token);
         if (verify.ok) {
           endActivity();
           await advanceAfterHealVerify(
@@ -5336,78 +6139,82 @@ ${progressForPrompt() || '(empty)'}`;
         }
         errors = parseCompilerErrors(verify.output);
         const afterLocalFp = verify.fingerprint || errorFingerprint(errors);
-        // Unchanged fingerprint → do not retry local; go frontier once.
-        if (afterLocalFp === fingerprint) {
-          setExecutingPlanNotice('Heal: same errors after local Coder — trying frontier brief…');
-        }
         fingerprint = afterLocalFp;
+        if (!verifyFingerprintChanged(fingerprintBeforeLocal, afterLocalFp)) {
+          setExecutingPlanNotice('Heal: error fingerprint unchanged after the local Coder.');
+        }
       } else {
-        setExecutingPlanNotice('Heal: same error fingerprint as last attempt — skipping local, trying frontier…');
+        setExecutingPlanNotice('Heal: same error fingerprint as the last attempt — skipping another local Coder.');
       }
 
-      // One frontier Planner→Coder bind (free-tier brief → local apply), else largest local with fresh approach.
-      const stuckPayload = `${errorBlock}\n\nFingerprint: ${fingerprint}\nStep: #${stuck.id} ${stuck.title}`;
-      let brief: string | null = null;
-      try {
-        brief = await requestFreeTierBrief(
-          'Local heal did not clear these compile errors. Give one short concrete fix plan naming files and edits. Do not rewrite whole files.',
-          stuckPayload
-        );
-      } catch (err: any) {
-        window.electronAPI?.writeLog?.('warn', `heal frontier: ${err?.message || err}`);
-      }
-
-      const big = pickLargestLocalTarget(nodesRef.current);
-      if (brief && big) {
-        await runHealCoder(
-          `### Frontier heal brief\nApply this solution. Do not repeat the failed approach.\n\n${brief}`,
-          `Heal: applying frontier brief on ${big.node.name} · ${big.model}…`,
-          big
-        );
-      } else if (big) {
-        await runHealCoder(
-          'Previous local attempt failed. Use a different concrete approach; edit only the listed error files.',
-          `Heal: retry differently on ${big.node.name} · ${big.model}…`,
-          big
-        );
-      } else {
-        const reason = `Heal failed on step #${stuck.id}: no local model online to apply fixes.\n${(verify.output || '').slice(-600)}`;
-        commitPlannerPlan({
+      const unchanged = !verifyFingerprintChanged(fingerprintBeforeLocal, fingerprint);
+      const briefAlreadyUsed = frontierBriefUsed(plannerPlanRef.current);
+      if (unchanged && !briefAlreadyUsed && runLive(run)) {
+        const marked = {
           ...(plannerPlanRef.current || plan),
-          blockedReason: reason,
-          lastErrorFingerprint: fingerprint,
-          updatedAt: Date.now()
-        });
-        setPlanPaused(true);
+          frontierHealBriefUsed: true
+        } as PlannerPlan;
+        await commitPlannerPlan(marked, run.token);
+        const stuckPayload = `${errorBlock}\n\nFingerprint: ${fingerprint}\nStep: #${stuck.id} ${stuck.title}`;
+        let brief: string | null = null;
+        try {
+          brief = await requestFreeTierBrief(
+            'Local heal did not clear these compile errors. Give one short concrete fix plan naming files and edits. Do not rewrite whole files.',
+            stuckPayload,
+            run
+          );
+        } catch (err: any) {
+          window.electronAPI?.writeLog?.('warn', `heal frontier: ${err?.message || err}`);
+        }
+        const big = pickLargestLocalTarget(nodesRef.current);
+        if (brief && big && runLive(run)) {
+          await runHealCoder(
+            `### Frontier heal brief\nApply this solution. Do not repeat the failed approach.\n\n${brief}`,
+            `Heal: applying the one frontier brief on ${big.node.name} · ${big.model}…`,
+            big
+          );
+          if (!runLive(run)) {
+            setPlanPaused(true);
+            endActivity();
+            return;
+          }
+          verify = await runProjectVerify(run.token);
+          if (verify.ok) {
+            endActivity();
+            await advanceAfterHealVerify(
+              String(stuck.id),
+              verify.fingerprint,
+              'Heal: frontier brief cleared verify — advancing.'
+            );
+            return;
+          }
+        }
         endActivity();
-        restorePlannerControl(reason);
+        setPlanPaused(true);
+        restorePlannerControl(
+          'Heal stopped: the error fingerprint did not change. This plan already used its frontier brief.'
+        );
         return;
       }
-
-      if (stopRequestedRef.current) {
+      if (unchanged) {
+        endActivity();
         setPlanPaused(true);
-        endActivity();
-        restorePlannerControl('Paused during Heal frontier pass — press Heal and continue to retry.');
-        return;
-      }
-
-      verify = await runProjectVerify();
-      if (verify.ok) {
-        endActivity();
-        await advanceAfterHealVerify(
-          String(stuck.id),
-          verify.fingerprint,
-          'Heal: frontier pass cleared verify — advancing.'
+        restorePlannerControl(
+          briefAlreadyUsed
+            ? 'Heal stopped: the error fingerprint is unchanged and the frontier brief was already used.'
+            : 'Heal stopped: the error fingerprint did not change after the local Coder.'
         );
         return;
       }
 
-      errors = parseCompilerErrors(verify.output);
-      fingerprint = verify.fingerprint || errorFingerprint(errors);
       const snippet = (verify.output || '').slice(-700);
-      const used = (plannerPlanRef.current?.healAttempts || attempts + 1);
+      const used = plannerPlanRef.current?.healAttempts || attempts + 1;
       endActivity();
-      if (used >= MAX_HEAL_ATTEMPTS) {
+      if (used >= MAX_HEAL_ATTEMPTS || !runLive(run)) {
+        if (!runLive(run)) {
+          setPlanPaused(true);
+          return;
+        }
         await deferFailedStepAndContinue(
           String(stuck.id),
           `Heal failed on step #${stuck.id} after ${used} attempts.\n${snippet}`
@@ -5415,7 +6222,7 @@ ${progressForPrompt() || '(empty)'}`;
         return;
       }
       setExecutingPlanNotice(
-        `Heal attempt ${used}/${MAX_HEAL_ATTEMPTS} left errors on step #${stuck.id} — retrying the next attempt…`
+        `Heal attempt ${used}/${MAX_HEAL_ATTEMPTS} changed the errors on step #${stuck.id} — retrying…`
       );
       await healBlockedPlan();
     } catch (err: any) {
@@ -5436,6 +6243,9 @@ ${progressForPrompt() || '(empty)'}`;
         String(stuck.id),
         `Heal error on step #${stuck.id}: ${msg.slice(0, 500)}`
       );
+    }
+    } finally {
+      leaveConductorRun(entered.owned, entered.run.token);
     }
   };
 
@@ -5649,15 +6459,17 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
 
   /** Final source review, then the Electron installer when verify already passed. */
   const finishVerifiedPlan = async (plan: PlannerPlan) => {
-    if (!plan.steps.length || plan.steps.some(s => s.status !== 'completed')) {
+    if (!planReadyForRelease(plan)) {
       restorePlannerControl(
-        'Plan finished with compiler debt on earlier steps — see the project todo.'
+        'Plan is not ready to release — unfinished, failed, or abandoned steps stay off the final review and Electron dist.'
       );
       return;
     }
-    const review = await reviewFinishedSource(plan);
+    const shipping = markPlanFinalReview(plan);
+    await commitPlannerPlan(shipping);
+    const review = await reviewFinishedSource(shipping);
     if (stopRequestedRef.current) return;
-    const distNote = await packageElectronDist(plan);
+    const distNote = await packageElectronDist(shipping);
     if (!distNote) return;
     const prefix =
       review.ran && review.passed
@@ -5684,6 +6496,14 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
     let result = v.result;
     let notes = v.notes;
     if (result === 'yay') {
+      if (writesUnresolved(coderWriteTools())) {
+        setPlanResumePhase('coder');
+        setPlanPaused(true);
+        restorePlannerControl(
+          'Writes for this step failed or are still pending. Press Play to run the Coder again before accepting Pass.'
+        );
+        return;
+      }
       const gate = await verifyBeforeYay();
       if (!gate.ok) {
         result = 'nay';
@@ -5796,7 +6616,7 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
 
     const confirmDisplay = confirmationText.trim() || `Option ${option.id}: ${option.title}`;
     updateProgress(log => noteUserTurn(log, `${option.title}. ${option.description}`));
-    fitContext(modelMaxCtx(selectedNode, activeTargetModel));
+    fitContext(modelMaxCtx(selectedNode, activeTargetModel), activeTargetModel);
     const userConfirm: ChatMessage = {
       id: `msg-${Date.now()}`,
       role: 'user',
@@ -6001,26 +6821,40 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
     void executeChosenPlan(option, planMsg, `Option ${option.id}: ${option.title}`);
   };
 
-  const handleSendMessage = async (e?: React.FormEvent) => {
+  const handleSendMessage = async (e?: React.FormEvent, overrideText?: string) => {
     if (e) e.preventDefault();
-    const hasImages = pendingImages.length > 0;
-    if ((!input.trim() && !hasImages) || isStreaming) return;
+    const hasImages = !overrideText && pendingImages.length > 0;
+    const typed = (overrideText ?? input).trim();
+    if ((!typed && !hasImages) || isStreaming || heldRef.current) return;
+    setAssistError(null);
 
-    const attachedImages = [...pendingImages];
+    const sendTier = activeTargetModel
+      ? resolveModelFit(
+          selectedNode,
+          activeTargetModel,
+          roleForDynamicCtx(currentAgent.handle),
+          currentAgent.numCtx
+        ).tier
+      : 'standard';
+    const attachedImages = selectImagesForTier(overrideText ? [] : [...pendingImages], sendTier);
     const userText =
-      input.trim() ||
+      typed ||
       (hasImages
         ? 'Look at this screenshot and explain what you see. Identify any errors, UI issues, or what I might need help with.'
         : '');
-    setInput('');
-    setPendingImages([]);
+    if (!overrideText) {
+      setInput('');
+      setPendingImages([]);
+    }
     if (!projectBrainRef.current.brief) {
       commitProjectBrain({ ...projectBrainRef.current, brief: userText.slice(0, 1200) });
     }
     updateProgress(log => noteUserTurn(log, userText));
-    fitContext(modelMaxCtx(selectedNode, activeTargetModel));
+    fitContext(modelMaxCtx(selectedNode, activeTargetModel), activeTargetModel);
     resetAgentLoopBudget();
-    stopRequestedRef.current = false;
+    const enteredSend = bindRun(null, true);
+    if (!enteredSend) return;
+    try {
     stuckRef.current = { key: '', stage: 'none' };
     ephemeralWorkerRef.current = false;
 
@@ -6043,18 +6877,21 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       }
       if (chunks.length) pinnedBlock = `${chunks.join('\n\n')}\n\n`;
     }
+    if (!runLive(enteredSend.run)) return;
 
-    let fullPrompt = `${pinnedBlock}User Task / Request:\n${userText}`;
+    let fileBlock = '';
     if (includeActiveFile && activeTab) {
-      fullPrompt = `[Active File: ${activeTab.name}]\n\`\`\`${activeTab.language}\n${activeTab.content}\n\`\`\`\n\n${fullPrompt}`;
+      const capped = capActiveFileForTier(activeTab.content || '', sendTier, activeTab.cursorLine);
+      fileBlock = `[Active File: ${activeTab.name}]\n\`\`\`${activeTab.language}\n${capped}\n\`\`\`\n\n`;
     }
+    const fullPrompt = `${fileBlock}${pinnedBlock}User Task / Request:\n${userText}`;
 
     // Match "option 1" / "1" / title against the last pending Planner options
     const pendingPlan = findPendingPlanMessage(messagesRef.current);
     if (pendingPlan?.planOptions?.length) {
       const matched = matchPlanOption(userText, pendingPlan.planOptions);
       if (matched) {
-        return executeChosenPlan(matched, pendingPlan, userText, attachedImages);
+        return await executeChosenPlan(matched, pendingPlan, userText, attachedImages);
       }
     }
 
@@ -6071,12 +6908,13 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       const planHint = step
         ? `\n\n[ACTIVE PLAN — step #${step.id}: ${step.title}. Advise the user, clarify, or replan only if they ask. Do not emit a fresh <plan_options> unless they want to replan. Do not implement files — Coders are dispatched automatically.]`
         : `\n\n[ACTIVE PLAN IN PROGRESS. Advise the user or replan only if they ask. Do not implement files yourself.]`;
-      return runSingleNodeTurn({
+      return await runSingleNodeTurn({
         userText,
         fullPrompt: `${fullPrompt}${planHint}`,
         attachedImages,
         agent: plannerAgent,
-        planMode: false
+        planMode: false,
+        run: enteredSend.run
       });
     }
 
@@ -6101,12 +6939,13 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         messagesRef.current = next;
         return next;
       });
-      return runSingleNodeTurn({
+      return await runSingleNodeTurn({
         userText,
         fullPrompt,
         attachedImages,
         agent: currentAgent,
-        planMode: true
+        planMode: true,
+        run: enteredSend.run
       });
     }
 
@@ -6114,20 +6953,22 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
     if (isReviewerSelected) {
       setExecutingPlanNotice(null);
       ephemeralWorkerRef.current = true;
-      return runSingleNodeTurn({
+      return await runSingleNodeTurn({
         userText,
         fullPrompt,
         attachedImages,
         agent: currentAgent,
         reviewMode: true,
-        freshContext: true
+        freshContext: true,
+        run: enteredSend.run
       });
     }
 
     // Explicit Coder / Docs (power-user shortcuts)
     if (isPipelineMode && !hasImages) {
       await handleSendPipelineMessage(userText, fullPrompt, {
-        approvedPlan: approvedPlanRef.current
+        approvedPlan: approvedPlanRef.current,
+        run: enteredSend.run
       });
     } else {
       await runSingleNodeTurn({
@@ -6136,18 +6977,22 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         attachedImages,
         agent: currentAgent,
         planMode: false,
-        approvedPlan: approvedPlanRef.current
+        approvedPlan: approvedPlanRef.current,
+        run: enteredSend.run
       });
     }
-    if (!stopRequestedRef.current && autoReviewRef.current) await reviewAndAdvance(0);
+    if (runLive(enteredSend.run) && autoReviewRef.current) {
+      await reviewAndAdvance(0, '', enteredSend.run);
+    }
+    } finally {
+      leaveConductorRun(enteredSend.owned, enteredSend.run.token);
+    }
   };
 
   const handleStop = () => {
-    stopRequestedRef.current = true;
+    stopConductor();
     pendingReviewResumeRef.current = null;
     ephemeralWorkerRef.current = false;
-    activeAbortsRef.current.forEach(abort => abort());
-    activeAbortsRef.current = [];
     setIsStreaming(false);
     if (isPlanActive(plannerPlanRef.current)) {
       setPlanPaused(true);
@@ -6187,17 +7032,35 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
 
   /** Resume from the saved checkpoint (coder / review / verdict) — not a blind step restart. */
   const resumeActivePlan = async () => {
-    if (isStreaming) return;
+    if (heldRef.current) return;
     const activePlan = plannerPlanRef.current;
+    if (activePlan?.resumePhase === 'final-review') {
+      if (!planReadyForRelease(activePlan)) {
+        setExecutingPlanNotice('Final review is saved, but the plan is not ready to release.');
+        return;
+      }
+      finalReviewPlanIdRef.current = null;
+      const ship = bindRun(null, true);
+      if (!ship) return;
+      try {
+        setPlanPaused(false);
+        await finishVerifiedPlan(activePlan);
+      } finally {
+        leaveConductorRun(ship.owned, ship.run.token);
+      }
+      return;
+    }
     if (!isPlanActive(activePlan) || !activePlan) {
       setPlanPaused(false);
       setExecutingPlanNotice('No active plan to continue.');
       return;
     }
+    const ship = bindRun(null, true);
+    if (!ship) return;
     const plan = activePlan;
-    stopRequestedRef.current = false;
     setPlanPaused(false);
     resetAgentLoopBudget();
+    try {
 
     const step = getActiveStep(plan);
     const stepId = step?.id;
@@ -6287,7 +7150,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
           : 'Resuming Review…'
       );
       setPlanResumePhase('review');
-      await reviewActiveStep();
+      await reviewActiveStep(ship.run);
       return;
     }
 
@@ -6311,9 +7174,15 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         tools = await runAuxTools(tools, toolDepsRef.current);
         const cmdPass = await runCommandTools(tools, toolDepsRef.current);
         tools = cmdPass.tools;
-        updateProgress(log => noteSavedFiles(log, tools));
+        updateProgress(log => noteSavedFiles(log, tools, savedFileFingerprints()));
+        noteAppliedWrites(tools);
       }
       const updatedMsg = { ...lastCoderMsg, toolCalls: tools };
+      if (!runLive(ship.run)) {
+        setIsStreaming(false);
+        setPlanPaused(true);
+        return;
+      }
       setMessages(prev => {
         const next = prev.map(m => (m.id === lastCoderMsg.id ? updatedMsg : m));
         messagesRef.current = next;
@@ -6336,18 +7205,19 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         setPlanResumePhase('coder');
         return;
       }
-      // Coder progress exists — advance to Review rather than re-implementing.
+      if (writesUnresolved(coderWriteTools())) {
+        setExecutingPlanNotice('Resuming Coder — previous writes did not succeed.');
+        await dispatchActiveStep();
+        return;
+      }
       if (step) {
-        let p = plannerPlanRef.current;
-        if (p) {
-          p = markAllStepTasks(p, step.id, 'completed');
-          commitPlannerPlan({ ...p, resumePhase: 'review', updatedAt: Date.now() });
-        }
+        const p = plannerPlanRef.current;
+        if (p) await commitPlannerPlan({ ...p, resumePhase: 'review', updatedAt: Date.now() });
       }
       setExecutingPlanNotice(
         step ? `Resuming Review on step #${step.id}…` : 'Resuming Review…'
       );
-      await reviewActiveStep();
+      await reviewActiveStep(ship.run);
       return;
     }
 
@@ -6361,13 +7231,23 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       step.tasks.length > 0 &&
       step.tasks.every(t => t.status === 'completed');
 
+    if (writesUnresolved(coderWriteTools())) {
+      setExecutingPlanNotice(
+        step
+          ? `Resuming Coder on step #${step.id} — writes did not succeed.`
+          : 'Resuming Coder — writes did not succeed.'
+      );
+      await dispatchActiveStep();
+      return;
+    }
+
     if (wroteSomething || tasksAlreadyDone) {
-      // Seamless: skip re-coding; pick up at Review.
-      if (step && !tasksAlreadyDone) {
-        let p = plannerPlanRef.current;
-        if (p) {
-          p = markAllStepTasks(p, step.id, 'completed');
-          commitPlannerPlan({ ...p, resumePhase: 'review', updatedAt: Date.now() });
+      if (step) {
+        const p = plannerPlanRef.current;
+        if (p && p.resumePhase !== 'review') {
+          await commitPlannerPlan({ ...p, resumePhase: 'review', updatedAt: Date.now() });
+        } else {
+          setPlanResumePhase('review');
         }
       } else {
         setPlanResumePhase('review');
@@ -6377,7 +7257,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
           ? `Resuming Review on step #${step.id}: ${step.title}…`
           : 'Resuming Review…'
       );
-      await reviewActiveStep();
+      await reviewActiveStep(ship.run);
       return;
     }
 
@@ -6387,6 +7267,9 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         : 'Resuming Coder…'
     );
     await dispatchActiveStep();
+    } finally {
+      leaveConductorRun(ship.owned, ship.run.token);
+    }
   };
 
   const handleApplyAllTools = async (msg: ChatMessage) => {
@@ -6403,7 +7286,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       updated.push(await executeTool(tool, toolDepsRef.current));
     }
 
-    updateProgress(log => noteSavedFiles(log, updated));
+    updateProgress(log => noteSavedFiles(log, updated, savedFileFingerprints()));
     const nextMsg: ChatMessage = { ...msg, toolCalls: updated };
     setMessages(prev => prev.map(m => (m.id === msg.id ? nextMsg : m)));
     setIsStreaming(false);
@@ -6413,26 +7296,30 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
     }
   };
 
-  const conductorInfo = findLeadArchitect(nodesRef.current) || findFastestConductor(nodesRef.current);
   const latestAssistant = [...messages].reverse().find(m => m.role === 'assistant');
   const peerStreaming = !!(peerConductor?.isStreaming && !isStreaming);
   const localActivityLabel = activityLabelOf(activityStack);
   const showStreamingUi =
     isStreaming || peerStreaming || !!localActivityLabel || !!executingPlanNotice;
-  const activityLabel = isStreaming
-    ? streamingActivityLabel(latestAssistant)
-    : localActivityLabel ||
-      peerConductor?.activityLabel ||
-      executingPlanNotice ||
-      'Working';
+  const runStatus = describeRunStatus({
+    steps: nodeWorkSteps,
+    activityLabel: localActivityLabel,
+    notice: executingPlanNotice,
+    message: isStreaming ? latestAssistant : undefined,
+    peerLabel: peerStreaming ? peerConductor?.activityLabel : undefined
+  });
+  const activityLabel = runStatus.text;
 
   const handleNewChatClick = () => {
-    if (isStreaming) {
-      activeAbortsRef.current.forEach(abort => abort());
-      activeAbortsRef.current = [];
+    if (isStreaming || heldRef.current) {
+      stopConductor();
       setIsStreaming(false);
     }
     onNewChat();
+  };
+  newChatRef.current = () => {
+    handleNewChatClick();
+    requestAnimationFrame(() => composerRef.current?.focus());
   };
 
   const handleSelectChat = (id: string) => {
@@ -6440,21 +7327,28 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       setHistoryOpen(false);
       return;
     }
-    if (isStreaming) {
-      activeAbortsRef.current.forEach(abort => abort());
-      activeAbortsRef.current = [];
+    if (isStreaming || heldRef.current) {
+      stopConductor();
       setIsStreaming(false);
     }
     onSelectConversation(id);
   };
 
-  // Ctrl/Cmd+L → new chat (Cursor-like)
+  // Ctrl/Cmd+L starts a new chat and focuses the composer.
+  // The listener reads newChatRef so it is not stuck on the first render.
+  // Monaco (select line) and the terminal keep the shortcut.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'l' && !e.shiftKey && !e.altKey) {
-        e.preventDefault();
-        handleNewChatClick();
+      if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey) return;
+      if (e.key.toLowerCase() !== 'l') return;
+      const target = e.target;
+      if (target instanceof Element) {
+        if (target.closest('.monaco-editor, .xterm')) return;
+        const field = target.closest('input, textarea, select, [contenteditable="true"]');
+        if (field && field !== composerRef.current) return;
       }
+      e.preventDefault();
+      newChatRef.current();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -6464,6 +7358,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
   const controlColWidthRef = useRef(controlWidth);
   const [nodeWorkColWidth, setNodeWorkColWidth] = useState(nodeWorkWidth);
   const nodeWorkColWidthRef = useRef(nodeWorkWidth);
+  const nodeWorkCollapsedRef = useRef(false);
   const [resizingControl, setResizingControl] = useState(false);
   const [resizingNodeWork, setResizingNodeWork] = useState(false);
   useEffect(() => {
@@ -6480,9 +7375,9 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       const el = document.getElementById('agent-conductor-root');
       if (!el) return;
       const rect = el.getBoundingClientRect();
-      // Leave room for Node Work + min chat; allow Conductor up to ~560px.
-      const nodeW = nodeWorkColWidthRef.current;
-      const next = Math.max(200, Math.min(560, rect.right - e.clientX - nodeW - 4));
+      const nodeW = nodeWorkCollapsedRef.current ? NODE_WORK_RAIL : nodeWorkColWidthRef.current;
+      const max = rect.width - nodeW - MESSAGE_COLUMN_MIN - 8;
+      const next = Math.max(200, Math.min(560, max, rect.right - e.clientX - nodeW - 4));
       controlColWidthRef.current = next;
       setControlColWidth(next);
     };
@@ -6503,7 +7398,8 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       const el = document.getElementById('agent-conductor-root');
       if (!el) return;
       const rect = el.getBoundingClientRect();
-      const next = Math.max(200, Math.min(480, rect.right - e.clientX));
+      const max = rect.width - controlColWidthRef.current - MESSAGE_COLUMN_MIN - 8;
+      const next = Math.max(200, Math.min(480, max, rect.right - e.clientX));
       nodeWorkColWidthRef.current = next;
       setNodeWorkColWidth(next);
     };
@@ -6519,22 +7415,97 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
     };
   }, [resizingNodeWork, onNodeWorkWidthChange]);
 
+  const { collapsed: nodeWorkCollapsed, toggle: toggleNodeWork } = useNodeWorkCollapse(
+    nodeWorkSteps.length > 0
+  );
+  nodeWorkCollapsedRef.current = nodeWorkCollapsed;
+  const tailMessage = messages[messages.length - 1];
+  const scrollSignature = `${messages.length}:${tailMessage?.id || ''}:${tailMessage?.display?.length || 0}:${tailMessage?.raw?.length || 0}:${tailMessage?.toolCalls?.length || 0}:${isStreaming ? 1 : 0}`;
+  const transcriptScroll = useStickToBottom(scrollSignature);
+  const [paneWidth, setPaneWidth] = useState(0);
+  useEffect(() => {
+    const el = document.getElementById('agent-conductor-root');
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const publish = () => setPaneWidth(el.clientWidth);
+    const obs = new ResizeObserver(publish);
+    obs.observe(el);
+    publish();
+    return () => obs.disconnect();
+  }, []);
+  const retryMessage = useStableCallback((_messageId: string) => {
+    const last = [...messagesRef.current].reverse().find(m => m.role === 'user');
+    const text = (last?.raw || last?.display || '').trim();
+    if (text) void handleSendMessage(undefined, text);
+  });
+  const selectPlan = useStableCallback((messageId: string, option: PlanOption) => {
+    const msg = messagesRef.current.find(m => m.id === messageId);
+    if (msg) handleSelectPlanOption(option, msg);
+  });
+  const sendReview = useStableCallback((messageId: string) => {
+    const msg = messagesRef.current.find(m => m.id === messageId);
+    if (msg) void sendReviewPlanToPlanner(msg);
+  });
+  const continueReview = useStableCallback((messageId: string) => {
+    const msg = messagesRef.current.find(m => m.id === messageId);
+    if (msg) void continueAfterCleanReview(msg);
+  });
+  const applyVerdict = useStableCallback((messageId: string) => {
+    const msg = messagesRef.current.find(m => m.id === messageId);
+    if (msg) void applyStepVerdictAndContinue(msg);
+  });
+  const applyAllTools = useStableCallback((messageId: string) => {
+    const msg = messagesRef.current.find(m => m.id === messageId);
+    if (msg) void handleApplyAllTools(msg);
+  });
+  const runTool = useStableCallback((tool: ToolCall) => runSingleTool(tool));
+  const frontierOnline = nodes.filter(
+    n => n.online && isFrontierNode(n) && getEnabledModelsForNode(n).length > 0
+  ).length;
+  const modelReady = nodes.some(n => n.online && getEnabledModelsForNode(n).length > 0);
+  const meterSnap = lastContextMeter();
+  const sampledAssistant = [...messages].reverse().find(
+    m => m.role === 'assistant' && (m.stats?.promptTokens || 0) > 0
+  );
+  const contextUsed = sampledAssistant?.stats?.promptTokens || meterSnap?.promptTokens;
+  const contextPinned = activeTargetMaxCtx || meterSnap?.pinnedCtx || sampledAssistant?.stats?.numCtx || 0;
+  let shownControl = controlColWidth;
+  let shownNodeWork = nodeWorkCollapsed ? NODE_WORK_RAIL : nodeWorkColWidth;
+  if (!fill && paneWidth > 0) {
+    const splits = 8;
+    const reservedNode = nodeWorkCollapsed ? NODE_WORK_RAIL : 200;
+    const maxControl = Math.max(200, paneWidth - reservedNode - MESSAGE_COLUMN_MIN - splits);
+    shownControl = Math.min(controlColWidth, Math.min(560, maxControl));
+    const maxNode = Math.max(200, paneWidth - shownControl - MESSAGE_COLUMN_MIN - splits);
+    shownNodeWork = nodeWorkCollapsed
+      ? NODE_WORK_RAIL
+      : Math.min(nodeWorkColWidth, Math.min(480, maxNode));
+  }
+
   const nodeWorkColumn = (
     <div
-      style={fill ? undefined : { width: nodeWorkColWidth }}
+      style={fill ? undefined : { width: shownNodeWork }}
       className={`flex flex-col min-h-0 ${
-        fill ? 'w-full min-h-[40%] border-t border-[#27272a]' : 'shrink-0 min-w-[200px]'
-      }`}
+        fill ? 'w-full border-t border-[#27272a]' : 'shrink-0'
+      } ${nodeWorkCollapsed && !fill ? '' : fill ? '' : 'min-w-0'}`}
     >
-      <NodeWorkPanel steps={nodeWorkSteps} />
+      <NodeWorkPanel
+        steps={nodeWorkSteps}
+        collapsed={!fill && nodeWorkCollapsed}
+        onToggleCollapsed={toggleNodeWork}
+        persona={runStatus.persona}
+        node={runStatus.node}
+        model={runStatus.model}
+        file={runStatus.file}
+        statusText={runStatus.text}
+      />
     </div>
   );
 
   const conductorColumn = (
       <div
-        style={fill ? undefined : { width: controlColWidth }}
+        style={fill ? undefined : { width: shownControl }}
         className={`flex flex-col min-h-0 bg-[#121215] ${
-          fill ? 'w-full h-full' : 'shrink-0 min-w-[220px] border-l border-[#27272a]'
+          fill ? 'w-full h-full' : 'shrink-0 min-w-0 border-l border-[#27272a]'
         }`}
       >
         <div className="p-2.5 border-b border-[#27272a] shrink-0 space-y-2">
@@ -6548,7 +7519,8 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                 type="button"
                 onClick={() => setMobileControlsOpen(false)}
                 className="p-1 text-zinc-400 hover:text-white rounded"
-                title="Close"
+                title="Close conductor"
+                aria-label="Close conductor"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -6556,10 +7528,10 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
               <HelpTip title="Agent personas" align="right">
                 <p>Left column is the conversation. This column is personas, the durable plan/task list, and routing.</p>
                 <ul className="list-disc pl-3.5 space-y-1">
-                  <li><b className="text-zinc-300">coder</b> — build & edit files</li>
-                  <li><b className="text-zinc-300">planner</b> — options then locks steps/tasks</li>
-                  <li><b className="text-zinc-300">reviewer</b> — Yay/Nay per plan step</li>
-                  <li><b className="text-zinc-300">docs</b> — explanations / docs</li>
+                  <li><b className="text-zinc-300">coder</b> — edits files</li>
+                  <li><b className="text-zinc-300">planner</b> — proposes a plan, then locks the steps</li>
+                  <li><b className="text-zinc-300">reviewer</b> — pass or fail for each step</li>
+                  <li><b className="text-zinc-300">docs</b> — writes explanations</li>
                 </ul>
               </HelpTip>
             )}
@@ -6599,6 +7571,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                 className="shrink-0 text-zinc-400 hover:text-zinc-200"
                 onClick={() => setExecutingPlanNotice(null)}
                 title="Dismiss"
+                aria-label="Dismiss notice"
               >
                 <X className="w-3 h-3" />
               </button>
@@ -6622,6 +7595,67 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
               isPaused={planPaused || (!showStreamingUi && isPlanActive(plannerPlanView))}
               onPause={handleStop}
               onResume={() => void resumeActivePlan()}
+              onSkipStep={stepId => {
+                const plan = plannerPlanRef.current;
+                if (!plan) return;
+                void commitPlannerPlan(skipStep(plan, stepId, 'Skipped.'));
+              }}
+              onEditStepTask={(stepId, taskId, text) => {
+                const plan = plannerPlanRef.current;
+                if (!plan) return;
+                void commitPlannerPlan(editStepTask(plan, stepId, taskId, { title: text }));
+              }}
+              onRetryStep={stepId => {
+                const plan = plannerPlanRef.current;
+                if (!plan) return;
+                const next = retryFailedStep(plan, stepId);
+                if (next === plan) return;
+                void (async () => {
+                  await commitPlannerPlan(next);
+                  if (!isStreaming && !heldRef.current) await dispatchActiveStep();
+                })();
+              }}
+              onUndoStep={stepId => {
+                void (async () => {
+                  const snap = stepSnapshotsRef.current.get(String(stepId));
+                  const plan = plannerPlanRef.current;
+                  if (!plan) return;
+                  if (!snap?.length) {
+                    setExecutingPlanNotice(`No pre-coder snapshot for step #${stepId}.`);
+                    return;
+                  }
+                  for (const file of snap) {
+                    await onApplyFileWrite(file.path, file.content);
+                  }
+                  await commitPlannerPlan({
+                    ...plan,
+                    status: 'active',
+                    activeStepId: String(stepId),
+                    resumePhase: 'coder',
+                    blockedReason: undefined,
+                    updatedAt: Date.now(),
+                    steps: plan.steps.map(s => {
+                      if (String(s.id) !== String(stepId)) {
+                        return s.status === 'in_progress' ? { ...s, status: 'pending' } : s;
+                      }
+                      return {
+                        ...s,
+                        status: 'pending',
+                        blockerKind: undefined,
+                        tasks: s.tasks.map(t => ({
+                          ...t,
+                          status: 'pending',
+                          failureNote: undefined
+                        }))
+                      };
+                    })
+                  });
+                  setPlanPaused(true);
+                  setExecutingPlanNotice(
+                    `Restored the pre-coder files for step #${stepId} and marked it pending.`
+                  );
+                })();
+              }}
             />
           ) : (
             <div className="rounded-md border border-dashed border-[#2a2a36] bg-[#0e0e12] px-2.5 py-3 text-[10px] text-zinc-500 leading-relaxed">
@@ -6635,7 +7669,10 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
             <div className="flex flex-col space-y-1">
               <span className="text-zinc-500 font-medium flex items-center space-x-1">
                 {isFrontier ? <Cloud className="w-3 h-3 text-sky-400 shrink-0" /> : <Cpu className="w-3 h-3 text-emerald-400 shrink-0" />}
-                <span>Hardware Target</span>
+                <span>Computer</span>
+                <HelpTip title="Computer" align="right">
+                  <p>The machine that answers. Turn on “Choose a computer for me” under Automation if you want Studio to pick.</p>
+                </HelpTip>
               </span>
               <select
                 value={nodes.some(n => n.id === targetNodeId) ? targetNodeId : ''}
@@ -6670,7 +7707,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
             </div>
             <div className="flex flex-col space-y-1">
               <span className="text-zinc-500 font-medium flex items-center justify-between">
-                <span>Node Model</span>
+                <span>Model</span>
                 <span className="flex items-center gap-1.5 font-mono text-[9px]">
                   {activeTargetMaxCtx > 0 && (
                     <span
@@ -6733,105 +7770,82 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
             </div>
           </div>
 
-          <button
-            onClick={() => {
-              const next = !isPipelineMode;
+          <AutomationDrawer
+            swarmOn={isPipelineMode}
+            onSwarm={next => {
               setIsPipelineMode(next);
               onConductorPrefsChange?.({ swarmEnabled: next });
             }}
-            className={`w-full flex items-center justify-center space-x-1.5 px-2 py-1 rounded border transition ${
-              isPipelineMode
-                ? 'bg-amber-500/20 border-amber-500/40 text-amber-300 font-semibold'
-                : 'bg-[#18181d] border-[#2a2a34] text-zinc-400 hover:text-zinc-200'
-            }`}
-            title={isPipelineMode ? 'Conductor Swarm is ON' : 'Enable multi-GPU file distribution'}
-          >
-            <Share2 className="w-3 h-3 text-amber-400 shrink-0" />
-            <span className="truncate">
-              Swarm ({onlineLocalNodes.length} local
-              {nodes.filter(n => n.online && isFrontierNode(n) && getEnabledModelsForNode(n).length > 0).length
-                ? ' + frontier'
-                : ''}
-              )
-            </span>
-          </button>
+            localCount={onlineLocalNodes.length}
+            cloudCount={frontierOnline}
+            cloudOn={cloudStrategist}
+            onCloud={next => {
+              cloudStrategistRef.current = next;
+              setCloudStrategist(next);
+              onConductorPrefsChange?.({ cloudStrategistEnabled: next });
+            }}
+            autoNode={autoSelectEndpoint}
+            onAutoNode={next => {
+              setAutoSelectEndpoint(next);
+              onConductorPrefsChange?.({ autoSelectEndpoint: next });
+            }}
+            autoApply={autoApplyWrites}
+            onAutoApply={next => {
+              autoApplyWritesRef.current = next;
+              setAutoApplyWrites(next);
+              onConductorPrefsChange?.({ autoApplyWrites: next });
+            }}
+            autoReview={autoReview}
+            onAutoReview={next => {
+              autoReviewRef.current = next;
+              setAutoReview(next);
+              onConductorPrefsChange?.({ autoReview: next });
+            }}
+          />
 
           {onUpdateNodes && nodes.length > 0 && (
             <button
               type="button"
               onClick={() => {
-                const plan = buildClusterAutoConfigPlan(nodesRef.current);
-                const updated = applyClusterAutoConfigPlan(nodesRef.current, plan);
-                onUpdateNodes(normalizeClusterNodes(updated));
-                setExecutingPlanNotice('⚡ Smart Auto-Configured cluster roles, primary models, and num_ctx caps.');
+                setAutoConfigPlan(buildClusterAutoConfigPlan(nodesRef.current));
+                setAutoConfigMode('confirm');
               }}
               className="w-full flex items-center justify-center space-x-1.5 px-2 py-1 rounded border border-indigo-500/35 bg-indigo-600/15 hover:bg-indigo-600/30 text-indigo-200 font-medium transition"
-              title="Auto-configure primary pinned models, optimal num_ctx caps, VRAM overhead (0.2GB headless / 0.1GB iGPU), and role specialties across all nodes"
+              title="Preview a cluster setup, then apply it"
             >
               <Sparkles className="w-3 h-3 text-amber-300 shrink-0" />
               <span className="truncate">Smart Auto-Configure</span>
             </button>
           )}
-
-          <div className="flex flex-col gap-1.5 text-zinc-400">
-            <label
-              className="flex items-center space-x-1.5 cursor-pointer hover:text-zinc-200"
-              title="When enabled and a Cloud Frontier API is online, uses a lightweight (~500 tok) Cloud Strategist call for Pass-1 Swarm task decomposition and multi-GPU routing"
-            >
-              <input
-                type="checkbox"
-                checked={cloudStrategist}
-                onChange={(e) => {
-                  cloudStrategistRef.current = e.target.checked;
-                  setCloudStrategist(e.target.checked);
-                  onConductorPrefsChange?.({ cloudStrategistEnabled: e.target.checked });
-                }}
-                className="rounded border-[#31313e] bg-[#1e1e24] text-sky-500"
-              />
-              <span className="flex items-center gap-1">
-                <span>Cloud Strategist</span>
-                <Cloud className="w-2.5 h-2.5 text-sky-400 shrink-0" />
-              </span>
-            </label>
-            <label className="flex items-center space-x-1.5 cursor-pointer hover:text-zinc-200">
-              <input
-                type="checkbox"
-                checked={autoSelectEndpoint}
-                onChange={(e) => {
-                  setAutoSelectEndpoint(e.target.checked);
-                  onConductorPrefsChange?.({ autoSelectEndpoint: e.target.checked });
-                }}
-                className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
-              />
-              <span>Auto-Node</span>
-            </label>
-            <label className="flex items-center space-x-1.5 cursor-pointer hover:text-zinc-200">
-              <input
-                type="checkbox"
-                checked={autoApplyWrites}
-                onChange={(e) => {
-                  autoApplyWritesRef.current = e.target.checked;
-                  setAutoApplyWrites(e.target.checked);
-                  onConductorPrefsChange?.({ autoApplyWrites: e.target.checked });
-                }}
-                className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
-              />
-              <span>Auto-apply</span>
-            </label>
-            <label className="flex items-center space-x-1.5 cursor-pointer hover:text-zinc-200">
-              <input
-                type="checkbox"
-                checked={autoReview}
-                onChange={(e) => {
-                  autoReviewRef.current = e.target.checked;
-                  setAutoReview(e.target.checked);
-                  onConductorPrefsChange?.({ autoReview: e.target.checked });
-                }}
-                className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
-              />
-              <span>Auto-review</span>
-            </label>
-          </div>
+          {autoConfigPlan && onUpdateNodes && (
+            <AutoConfigConfirm
+              plan={autoConfigPlan}
+              mode={autoConfigMode}
+              canUndo={!!autoConfigUndo}
+              showDetails={false}
+              onApply={() => {
+                setAutoConfigUndo(snapshotNodeConfigs(nodesRef.current));
+                const updated = applyClusterAutoConfigPlan(nodesRef.current, autoConfigPlan);
+                onUpdateNodes(normalizeClusterNodes(updated));
+                setAutoConfigMode('applied');
+              }}
+              onUndo={() => {
+                if (!autoConfigUndo) return;
+                onUpdateNodes(autoConfigUndo);
+                setAutoConfigUndo(null);
+                setAutoConfigMode('confirm');
+              }}
+              onSelectNode={nodeId => {
+                setTargetNodeId(nodeId);
+                const nextNode = nodesRef.current.find(n => n.id === nodeId);
+                if (nextNode) {
+                  setTargetModel(
+                    pickBestModelForComplexity(nextNode, 'heavy') || getPreferredModelForNode(nextNode)
+                  );
+                }
+              }}
+            />
+          )}
         </div>
       </div>
   );
@@ -6845,7 +7859,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       }`}
     >
       {/* Left — Conversation */}
-      <div className="flex-1 min-w-0 flex flex-col min-h-0 overflow-hidden">
+      <div className={`flex-1 flex flex-col min-h-0 overflow-hidden ${fill ? 'min-w-0' : 'min-w-[320px]'}`}>
       <div className="p-3 border-b border-[#27272a] bg-[#121215] flex flex-col space-y-2 shrink-0">
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center space-x-1.5 text-xs font-bold text-zinc-200 min-w-0">
@@ -6866,6 +7880,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                     : 'text-zinc-300 hover:text-white hover:bg-[#202026] border-transparent hover:border-[#2a2a36]'
                 }`}
                 title="Conductor controls"
+                aria-label="Conductor controls"
               >
                 <SlidersHorizontal className="w-3.5 h-3.5 text-indigo-400" />
                 <span>Controls</span>
@@ -6879,6 +7894,8 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                   historyOpen ? 'bg-indigo-600/30 text-indigo-200' : 'text-zinc-400 hover:text-white hover:bg-[#202026]'
                 }`}
                 title="Chat history"
+                aria-expanded={historyOpen}
+                aria-label="Chat history"
               >
                 <History className="w-3.5 h-3.5" />
               </button>
@@ -6915,6 +7932,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                           }}
                           className="opacity-0 group-hover:opacity-100 p-1.5 text-zinc-500 hover:text-red-400 transition shrink-0"
                           title="Delete chat"
+                          aria-label={`Delete ${c.title}`}
                         >
                           <Trash2 className="w-3 h-3" />
                         </button>
@@ -6927,7 +7945,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
 
             <button
               type="button"
-              onClick={() => fitContext(modelMaxCtx(selectedNode, activeTargetModel), true)}
+              onClick={() => fitContext(modelMaxCtx(selectedNode, activeTargetModel), true, activeTargetModel)}
               disabled={isStreaming || messages.length < 6}
               className="flex items-center space-x-1 px-1.5 py-1 rounded text-[11px] font-medium text-zinc-300 hover:text-white hover:bg-[#202026] border border-transparent hover:border-[#2a2a36] transition disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-zinc-300"
               title="Compact this chat. The work log keeps the finished steps and the next step."
@@ -6949,6 +7967,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                 }}
                 className="flex items-center space-x-1 px-1.5 py-1 rounded text-[11px] font-medium text-zinc-500 hover:text-rose-200 hover:bg-[#202026] border border-transparent hover:border-[#2a2a36] transition"
                 title="Clear chat history only"
+                aria-label="Clear chat history"
               >
                 <Trash2 className="w-3.5 h-3.5" />
               </button>
@@ -6987,51 +8006,52 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       </div>
 
       {fill && (
-        <div className="shrink-0 h-36 max-h-[34%] min-h-[88px] overflow-hidden border-b border-[#27272a] flex flex-col">
-          <NodeWorkPanel steps={nodeWorkSteps} />
+        <div className={`shrink-0 overflow-hidden border-b border-[#27272a] flex flex-col ${nodeWorkCollapsed ? 'h-8' : 'h-36 max-h-[34%] min-h-[88px]'}`}>
+          <NodeWorkPanel
+            steps={nodeWorkSteps}
+            collapsed={nodeWorkCollapsed}
+            collapseLayout="bar"
+            onToggleCollapsed={toggleNodeWork}
+            persona={runStatus.persona}
+            node={runStatus.node}
+            model={runStatus.model}
+            file={runStatus.file}
+            statusText={runStatus.text}
+          />
         </div>
       )}
 
-      {/* Messages Stream */}
-      <div className="flex-1 p-3 overflow-y-auto space-y-3.5 select-text">
+      <div className="flex-1 min-h-0 relative">
+        <div
+          ref={transcriptScroll.ref}
+          onScroll={transcriptScroll.onScroll}
+          className="h-full p-3 overflow-y-auto space-y-3.5 select-text"
+        >
         {messages.length === 0 ? (
-          <div className="h-full flex flex-col items-center justify-center text-center p-4 text-zinc-500 select-none">
-            <MessageSquarePlus className="w-8 h-8 text-indigo-400/60 mb-2" />
-            <p className="text-xs font-semibold text-zinc-200">{currentAgent.name}</p>
-            <p className="text-[11px] text-zinc-500 mt-1">{currentAgent.role}</p>
-            <p className="text-[10px] text-zinc-500 mt-2">
-              Fresh project chat — ask anything, or press{' '}
-              <kbd className="px-1 py-0.5 bg-[#22222a] rounded border border-[#333] font-mono">Ctrl+L</kbd>
-              {' '}to clear history and start over
-            </p>
-
-            <div className="mt-4 p-3 bg-[#18181d] rounded-xl border border-[#272732] text-[10px] text-zinc-400 text-left space-y-1.5 w-full">
-              <div className="flex items-center space-x-1.5">
-                <Zap className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                <span>
-                  <b>Active Target:</b>{' '}
-                  {selectedNode && activeTargetModel
-                    ? <>{selectedNode.name} → <code className="text-indigo-300">{activeTargetModel}</code>{activeTargetMaxCtx > 0 ? ` · ${activeTargetMaxCtx.toLocaleString()} ctx` : ''}{benchmarkStat ? ` (~${benchmarkStat.evalTokPerSec} tok/s)` : ''}</>
-                    : <span className="text-amber-400">none — enable a model on this node</span>}
-                </span>
-              </div>
-              <div className="flex items-center space-x-1.5">
-                <Share2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                <span>
-                  <b>Lead Architect:</b>{' '}
-                  {conductorInfo
-                    ? <>{conductorInfo.node.name} (<code className="text-emerald-300">{conductorInfo.model}</code>{conductorInfo.usedFrontierBackup ? ' · frontier backup' : ''}) takes the complex work on the largest enabled model; light files can use a smaller one</>
-                    : <span className="text-zinc-500">unavailable until a node is online</span>}
-                </span>
-              </div>
-            </div>
-          </div>
+          <EmptyChatChecklist
+            agentName={currentAgent.name}
+            agentRole={currentAgent.role}
+            folderOpen={!!workspacePath}
+            nodeOnline={nodes.some(n => n.online)}
+            modelReady={modelReady}
+            onOpenFolder={onOpenFolder}
+            onOpenHardware={onOpenHardware}
+            onTrySample={() => {
+              setInput('Explain this project in a few sentences, then list the next three files you would read.');
+              requestAnimationFrame(() => composerRef.current?.focus());
+            }}
+          />
         ) : (
           <>
-          {planPaused && isPlanActive(plannerPlanView) && (
+          {(planPaused && isPlanActive(plannerPlanView)) ||
+          (plannerPlanView?.resumePhase === 'final-review' && !showStreamingUi) ? (
             <div className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-100">
               <div className="font-semibold text-amber-200">
-                {plannerPlanView?.blockedReason ? 'Heal and continue' : 'Resume unfinished work'}
+                {plannerPlanView?.resumePhase === 'final-review'
+                  ? 'Resume final review'
+                  : plannerPlanView?.blockedReason
+                    ? 'Heal and continue'
+                    : 'Resume unfinished work'}
               </div>
               <p className="mt-1 text-amber-100/90 leading-relaxed">
                 {plannerPlanView?.blockedReason
@@ -7062,181 +8082,77 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                 {plannerPlanView?.blockedReason ? 'Heal and continue' : 'Resume'}
               </button>
             </div>
-          )}
-          {messages.map(msg => (
-            <div
-              key={msg.id}
-              className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}
-            >
-              {/* Message Header */}
-              <div className="flex items-center space-x-1.5 text-[10px] text-zinc-500 mb-1 px-1">
-                <span>
-                  {msg.role === 'user'
-                    ? 'You'
-                    : (() => {
-                        const msgAgent =
-                          agents.find(a => a.id === msg.agentId) ||
-                          agents.find(a => a.handle === msg.personaHandle) ||
-                          currentAgent;
-                        return msg.endpointName
-                          ? `${msgAgent.name} (${msg.endpointName})`
-                          : msgAgent.name;
-                      })()}
-                </span>
-                <span>•</span>
-                <span>{msg.timestamp}</span>
-                {msg.personaHandle && msg.role === 'assistant' && (
-                  <span className="text-amber-300/90 font-mono bg-amber-950/30 px-1 rounded text-[9px]">
-                    @{msg.personaHandle}
-                  </span>
-                )}
-                {msg.model && (
-                  <span className="text-indigo-400 font-mono bg-indigo-950/40 px-1 rounded text-[9px]">
-                    {msg.model}
-                  </span>
-                )}
-                {msg.stats?.tokensPerSec && (
-                  <span className="text-amber-400 font-mono text-[9px]">
-                    ⚡ {msg.stats.tokensPerSec} tok/s
-                  </span>
-                )}
-              </div>
-
-              {/* Message Content */}
-              <div
-                className={`max-w-[95%] rounded-lg p-3 text-xs leading-relaxed ${
-                  msg.role === 'user'
-                    ? 'bg-indigo-600 text-white rounded-br-none shadow'
-                    : 'bg-[#1e1e24] text-zinc-200 border border-[#2b2b36] rounded-bl-none'
-                }`}
-              >
-                {/* Attached screenshots */}
-                {msg.images && msg.images.length > 0 && (
-                  <div className={`flex flex-wrap gap-1.5 ${msg.display ? 'mb-2' : ''}`}>
-                    {msg.images.map((src, i) => (
-                      <img
-                        key={`${msg.id}-img-${i}`}
-                        src={src}
-                        alt={`Attachment ${i + 1}`}
-                        className="max-h-36 max-w-full rounded border border-white/20 object-contain bg-black/20"
-                      />
-                    ))}
-                  </div>
-                )}
-
-                {/* Strip leftover planner/reviewer XML at render time (local models). */}
-                {(() => {
-                  if (!msg.display) return null;
-                  if (msg.stepVerdict || msg.reviewPlan) return null;
-                  const cleaned = scrubStructuredMarkup(msg.display);
-                  if (!cleaned) return null;
-                  return <div className="whitespace-pre-wrap">{cleaned}</div>;
-                })()}
-
-                {msg.notice && msg.role === 'assistant' && !msg.display?.includes(msg.notice) && (
-                  <div className="mb-2 text-[10px] text-emerald-300/90 font-medium">{msg.notice}</div>
-                )}
-
-                {/* Planner option buttons — never while a plan/task list is still running */}
-                {msg.planOptions &&
-                  msg.planOptions.length > 0 &&
-                  !isPlanActive(plannerPlanView) &&
-                  !hasOpenTasks(executionQueueRef.current) &&
-                  !msg.selectedPlanOptionId && (
-                  <PlanOptionsCard
-                    options={msg.planOptions}
-                    selectedId={msg.selectedPlanOptionId}
-                    disabled={isStreaming}
-                    onSelect={opt => handleSelectPlanOption(opt, msg)}
-                  />
-                )}
-
-                {/* Reviewer fix plan — never Apply writes from reviewer */}
-                {msg.reviewPlan && !msg.stepVerdict && (
-                  <ReviewPlanCard
-                    plan={msg.reviewPlan}
-                    sent={!!msg.reviewSentToCoder}
-                    disabled={isStreaming}
-                    onSendToPlanner={() => sendReviewPlanToPlanner(msg)}
-                    onContinue={
-                      msg.reviewNeedsContinue
-                        ? () => continueAfterCleanReview(msg)
-                        : undefined
-                    }
-                  />
-                )}
-
-                {/* Planner step Yay/Nay */}
-                {msg.stepVerdict && (
-                  <StepVerdictCard
-                    stepId={msg.stepVerdict.stepId}
-                    stepTitle={msg.stepVerdict.stepTitle}
-                    result={msg.stepVerdict.result}
-                    notes={msg.stepVerdict.notes}
-                    sent={!!msg.stepVerdictApplied}
-                    disabled={isStreaming}
-                    needsConfirm={!!msg.stepVerdictNeedsConfirm}
-                    onApply={() => applyStepVerdictAndContinue(msg)}
-                  />
-                )}
-
-                {/* Tool Invocations (hide write/edit Apply UI for reviewer messages) */}
-                {(() => {
-                  const isReviewerMsg =
-                    msg.personaHandle === 'reviewer' || !!msg.reviewPlan || !!msg.stepVerdict;
-                  const tools = isReviewerMsg
-                    ? (msg.toolCalls || []).filter(t =>
-                        ['read_file', 'list_dir', 'search', 'read_terminal'].includes(t.name)
-                      )
-                    : msg.toolCalls || [];
-                  if (!tools.length) return null;
-                  const showApply =
-                    !isReviewerMsg && tools.some(t => t.status !== 'done');
-                  return (
-                    <div className="mt-3 space-y-2 pt-2 border-t border-[#31313e]">
-                      <div className="flex items-center justify-between">
-                        <div className="text-[10px] uppercase font-bold text-indigo-300 tracking-wider">
-                          {isReviewerMsg
-                            ? `Exploration (${tools.length}):`
-                            : `Workspace Actions (${tools.length}):`}
-                        </div>
-                        {showApply && (
-                          <button
-                            onClick={() => handleApplyAllTools(msg)}
-                            className="flex items-center space-x-1 text-[10px] font-sans font-medium px-2 py-0.5 bg-indigo-600/30 hover:bg-indigo-600 text-indigo-200 hover:text-white border border-indigo-500/40 rounded transition"
-                            title="Apply all proposed changes to workspace"
-                          >
-                            <Sparkles className="w-2.5 h-2.5 text-indigo-300" />
-                            <span>Apply All</span>
-                          </button>
-                        )}
-                      </div>
-                      {tools.map(tool => (
-                        <ToolActionCard
-                          key={tool.id}
-                          tool={tool}
-                          workspacePath={workspacePath}
-                          onApplyFileWrite={onApplyFileWrite}
-                          onExecuteToolCommand={onExecuteToolCommand}
-                          onOpenFileInEditor={onOpenFileInEditor}
-                          onRunSingleTool={runSingleTool}
-                          hideApply={isReviewerMsg}
-                        />
-                      ))}
-                    </div>
-                  );
-                })()}
-              </div>
-            </div>
-          ))}
+          ) : null}
+          <MessageList
+            messages={messages}
+            agents={agents}
+            currentAgent={currentAgent}
+            busy={isStreaming}
+            planActive={isPlanActive(plannerPlanView)}
+            tasksOpen={hasOpenTasks(executionQueueRef.current)}
+            workspacePath={workspacePath}
+            onApplyFileWrite={onApplyFileWrite}
+            onExecuteToolCommand={onExecuteToolCommand}
+            onOpenFileInEditor={onOpenFileInEditor}
+            onRunSingleTool={runTool}
+            onRetry={retryMessage}
+            onOpenHardware={onOpenHardware}
+            onSelectPlan={selectPlan}
+            onSendReview={sendReview}
+            onContinueReview={continueReview}
+            onApplyVerdict={applyVerdict}
+            onApplyAll={applyAllTools}
+          />
           </>
         )}
-        <div ref={chatBottomRef} />
+        </div>
+        {transcriptScroll.away && messages.length > 0 && (
+          <button
+            type="button"
+            onClick={transcriptScroll.jump}
+            className="absolute bottom-3 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full border border-indigo-400/50 bg-[#1a1a22] text-[11px] font-medium text-indigo-100 shadow-lg hover:bg-indigo-600/30"
+          >
+            Jump to latest
+          </button>
+        )}
       </div>
 
       {/* Input Composer */}
       <div className="p-3 border-t border-[#27272a] bg-[#121215]">
-        {showStreamingUi && <ActivityIndicator label={activityLabel} />}
+        {assistError && (
+          <ErrorCard
+            className="mb-2"
+            cause={assistError.cause}
+            node={assistError.node}
+            model={assistError.model}
+            onRetry={
+              isStreaming
+                ? undefined
+                : () => {
+                    setAssistError(null);
+                    retryMessage('assist');
+                  }
+            }
+            onOpenHardware={onOpenHardware}
+          />
+        )}
+        <ContextMeter
+          used={contextUsed}
+          pinned={contextPinned}
+          tier={meterSnap?.tier}
+          budget={meterSnap?.promptBudget}
+          model={meterSnap?.model || activeTargetModel}
+          node={selectedNode?.name}
+        />
+        {showStreamingUi && (
+          <ActivityIndicator
+            label={activityLabel}
+            persona={runStatus.persona}
+            node={runStatus.node}
+            model={runStatus.model}
+            file={runStatus.file}
+          />
+        )}
         {projectBrain.lastTerminal && (
           <div className="mb-2 px-2 py-1.5 rounded-md bg-[#0e0e12] border border-[#2a2a36] text-[10px] text-zinc-400 font-mono truncate" title={projectBrain.lastTerminal.output}>
             <span className="text-emerald-400/90">$</span> {projectBrain.lastTerminal.command}
@@ -7251,6 +8167,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                 onClick={() => setPinnedFiles(prev => prev.filter(x => x !== p))}
                 className="text-[9px] px-1.5 py-0.5 rounded border border-indigo-500/40 bg-indigo-600/15 text-indigo-200"
                 title="Unpin from the next message"
+                aria-label={`Unpin ${p}`}
               >
                 @{p} ×
               </button>
@@ -7306,6 +8223,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                   onClick={() => setPendingImages(prev => prev.filter((_, j) => j !== i))}
                   className="absolute -top-1.5 -right-1.5 p-0.5 rounded-full bg-zinc-800 border border-zinc-600 text-zinc-300 hover:text-white hover:bg-red-700"
                   title="Remove image"
+                  aria-label={`Remove image ${i + 1}`}
                 >
                   <X className="w-3 h-3" />
                 </button>
@@ -7337,6 +8255,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
             disabled={isStreaming}
             className="shrink-0 p-2 mb-0.5 text-zinc-400 hover:text-indigo-300 hover:bg-[#1e1e24] rounded-md transition disabled:opacity-30"
             title="Attach screenshot or image"
+            aria-label="Attach image"
           >
             <ImagePlus className="w-4 h-4" />
           </button>
@@ -7353,11 +8272,13 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
             }}
             className="shrink-0 p-2 mb-0.5 text-zinc-400 hover:text-sky-300 hover:bg-[#1e1e24] rounded-md transition disabled:opacity-30"
             title="Pin the active editor file into the next message (@file)"
+            aria-label="Pin the active file"
           >
             <span className="text-[11px] font-mono">@</span>
           </button>
           <div className="relative flex-1">
             <textarea
+              ref={composerRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onPaste={handlePaste}
@@ -7390,7 +8311,8 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                   type="button"
                   onClick={handleStop}
                   className="p-1.5 bg-red-600 hover:bg-red-500 text-white rounded-md transition shadow"
-                  title="Stop Generation"
+                  title="Stop generation"
+                  aria-label="Stop generation"
                 >
                   <Square className="w-3.5 h-3.5" />
                 </button>
@@ -7399,6 +8321,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                   type="submit"
                   disabled={!input.trim() && pendingImages.length === 0}
                   className="p-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-30 text-white rounded-md transition shadow"
+                  aria-label="Send"
                 >
                   <Send className="w-3.5 h-3.5" />
                 </button>
@@ -7411,20 +8334,46 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
 
       {!fill && (
         <>
-          <div
-            onMouseDown={() => setResizingControl(true)}
-            title="Drag to resize Conductor column"
-            className={`w-1 cursor-col-resize transition-colors shrink-0 ${
-              resizingControl ? 'bg-indigo-500' : 'bg-[#22222a] hover:bg-indigo-500/60'
-            }`}
+          <SplitHandle
+            orientation="vertical"
+            label="Resize conductor column"
+            value={shownControl}
+            min={200}
+            max={560}
+            active={resizingControl}
+            onDragStart={() => setResizingControl(true)}
+            onChange={next => {
+              controlColWidthRef.current = next;
+              setControlColWidth(next);
+            }}
+            onCommit={next => {
+              controlColWidthRef.current = next;
+              setControlColWidth(next);
+              onControlWidthChange?.(next);
+            }}
           />
           {conductorColumn}
-          <div
-            onMouseDown={() => setResizingNodeWork(true)}
-            title="Drag to resize Node Work column"
-            className={`w-1 cursor-col-resize transition-colors shrink-0 ${
-              resizingNodeWork ? 'bg-amber-500' : 'bg-[#22222a] hover:bg-amber-500/60'
-            }`}
+          <SplitHandle
+            orientation="vertical"
+            label="Resize node work column"
+            value={shownNodeWork}
+            min={nodeWorkCollapsed ? NODE_WORK_RAIL : 200}
+            max={nodeWorkCollapsed ? NODE_WORK_RAIL : 480}
+            active={resizingNodeWork}
+            onDragStart={() => {
+              if (!nodeWorkCollapsed) setResizingNodeWork(true);
+            }}
+            onChange={next => {
+              if (nodeWorkCollapsed) return;
+              nodeWorkColWidthRef.current = next;
+              setNodeWorkColWidth(next);
+            }}
+            onCommit={next => {
+              if (nodeWorkCollapsed) return;
+              nodeWorkColWidthRef.current = next;
+              setNodeWorkColWidth(next);
+              onNodeWorkWidthChange?.(next);
+            }}
           />
           {nodeWorkColumn}
         </>

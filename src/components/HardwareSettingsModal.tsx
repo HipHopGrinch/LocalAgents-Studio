@@ -1,43 +1,19 @@
 import React, { useEffect, useRef, useState } from 'react';
-import {
-  X,
-  Cpu,
-  Key,
-  Plus,
-  Trash2,
-  RefreshCw,
-  Sliders,
-  FolderOpen,
-  Download,
-  Upload,
-  Lock,
-  Bug,
-  ExternalLink,
-  Globe,
-  Copy,
-  Eye,
-  EyeOff,
-  Sparkles,
-  Zap,
-  Cloud
-} from 'lucide-react';
-import { EndpointNode, NodeConfig, HardwareProfile, ModelMeta, NodeRole } from '../types';
-import { GPU_PRESETS, RAM_PRESETS, guessGpuBandwidth } from '../config/defaults';
+import { Cpu, RefreshCw, X } from 'lucide-react';
+import { EndpointNode, HardwareProfile, ModelMeta, NodeConfig, NodeRole } from '../types';
+import { GPU_PRESETS, guessGpuBandwidth } from '../config/defaults';
 import { TaskId } from '../config/modelCatalog';
 import { pullModel, streamChat } from '../lib/ollamaClient';
 import {
   ALL_NODE_ROLES,
   assignAllowedRoles,
   assignDevNode,
-  findNodeHoldingDev,
   getEnabledModelsForNode,
   isEmbeddingModelName,
   isFrontierNode,
-  isRoleAuto,
   normalizeClusterNodes
 } from '../lib/tools';
 import {
-  SPECIALTY_META,
   applyClusterAutoConfigPlan,
   buildCloudClusterAuditPrompt,
   buildClusterAutoConfigPlan,
@@ -45,15 +21,50 @@ import {
   type ClusterAutoConfigPlan
 } from '../lib/clusterAdvisor';
 import { modelSupportsThinking, normalizeThinkingInfo } from '../lib/thinking';
+import { pinnedNumCtx } from '../lib/contextSize';
+import { useDialog } from './ui/useDialog';
 import { ModelHubPanel } from './hardware/ModelHubPanel';
 import { InstalledModelsPanel } from './hardware/InstalledModelsPanel';
+import { ClusterAutoConfigBar } from './hardware/AutoConfigConfirm';
+import { EndpointsPanel } from './hardware/EndpointsPanel';
+import { IntegrationsPanel } from './hardware/IntegrationsPanel';
+import { AppearancePanel } from './hardware/AppearancePanel';
+import { StatsPanel } from './hardware/StatsPanel';
+import { SupportPanel } from './hardware/SupportPanel';
+import {
+  RemotePanel,
+  type WebConsoleNoteTone,
+  type WebConsolePatch,
+  type WebConsoleStatusView
+} from './hardware/RemotePanel';
+import { AddNodeDialog, NodesTransferDialog } from './hardware/NodeDialogs';
+import { ErrorCard } from './agent/ErrorCard';
+
+/**
+ * Open on a specific section. `nodes` and `endpoints` both land on Endpoints.
+ * Header passes `stats` from the token counter and `endpoints` from the cluster chip
+ * via the optional `onOpenHardware` callback (App wires that next).
+ */
+export type HardwareSettingsTab =
+  | 'nodes'
+  | 'endpoints'
+  | 'models'
+  | 'integrations'
+  | 'hub'
+  | 'appearance'
+  | 'stats'
+  | 'remote'
+  | 'support';
+
+type HardwareMainTab = 'nodes' | 'hub' | 'appearance' | 'stats' | 'remote' | 'support';
+type NodesSection = 'endpoints' | 'models' | 'integrations';
 
 interface HardwareSettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
   nodes: EndpointNode[];
   onUpdateNodes: (nodes: NodeConfig[]) => void;
-  onRefreshNodes: () => void;
+  onRefreshNodes: (opts?: { force?: boolean }) => void;
   estimateContext: number;
   onUpdateEstimateContext: (ctx: number) => void;
   localTokens: number;
@@ -71,6 +82,33 @@ interface HardwareSettingsModalProps {
   onUpdateMcpServersJson?: (json: string) => void;
   /** Keep App settings.webConsole in sync after enable/port/password changes (display only). */
   onWebConsoleChange?: (webConsole: { enabled: boolean; port: number }) => void;
+  /** Honored each time the modal opens (and when the value changes while open). */
+  initialTab?: HardwareSettingsTab;
+}
+
+function snapshotNodeConfigs(list: EndpointNode[]): NodeConfig[] {
+  return list.map(n => {
+    const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, ...cfg } = n;
+    return JSON.parse(JSON.stringify(cfg)) as NodeConfig;
+  });
+}
+
+function applyInitialTab(
+  tab: HardwareSettingsTab,
+  setActiveTab: (tab: HardwareMainTab) => void,
+  setNodesSection: (section: NodesSection) => void
+) {
+  if (tab === 'endpoints' || tab === 'models' || tab === 'integrations') {
+    setActiveTab('nodes');
+    setNodesSection(tab);
+    return;
+  }
+  if (tab === 'nodes') {
+    setActiveTab('nodes');
+    setNodesSection('endpoints');
+    return;
+  }
+  setActiveTab(tab);
 }
 
 export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
@@ -94,68 +132,49 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   onUpdateSearxngUrl,
   mcpServersJson = '',
   onUpdateMcpServersJson,
-  onWebConsoleChange
+  onWebConsoleChange,
+  initialTab
 }) => {
-  const [activeTab, setActiveTab] = useState<'nodes' | 'hub' | 'appearance' | 'stats' | 'remote'>('nodes');
+  const [activeTab, setActiveTab] = useState<HardwareMainTab>('nodes');
+  const [nodesSection, setNodesSection] = useState<NodesSection>('endpoints');
   const [selectedNodeId, setSelectedNodeId] = useState<string>(nodes[0]?.id || '');
   const [selectedTask, setSelectedTask] = useState<TaskId>('agent');
-  const [settingsFilePath, setSettingsFilePath] = useState('');
-  const [logsFilePath, setLogsFilePath] = useState('');
-  const [logCopyNote, setLogCopyNote] = useState('');
-  const [bugReportNote, setBugReportNote] = useState('');
-  const [bugReportBusy, setBugReportBusy] = useState(false);
 
   const [webEnabled, setWebEnabled] = useState(false);
   const [webPort, setWebPort] = useState(3847);
   const [webPassword, setWebPassword] = useState('');
   const [webShowPassword, setWebShowPassword] = useState(false);
-  const [webStatus, setWebStatus] = useState<{
-    enabled: boolean;
-    port: number;
-    listening: boolean;
-    hasPassword: boolean;
-    urls: string[];
-    candidateUrls?: string[];
-    clientCount: number;
-  } | null>(null);
+  const [webStatus, setWebStatus] = useState<WebConsoleStatusView | null>(null);
   const [webBusy, setWebBusy] = useState(false);
   const [webNote, setWebNote] = useState('');
-  /** On phones: list of endpoints vs selected node detail (no side-by-side). */
+  const [webNoteTone, setWebNoteTone] = useState<WebConsoleNoteTone>('info');
+  const [webLanEnabled, setWebLanEnabled] = useState(false);
+  const [webAllowShell, setWebAllowShell] = useState(false);
+  const [webTlsCert, setWebTlsCert] = useState('');
+  const [webTlsKey, setWebTlsKey] = useState('');
+
   const [mobileNodePane, setMobileNodePane] = useState<'list' | 'detail'>('list');
   const [isNarrowHw, setIsNarrowHw] = useState(() =>
     typeof window !== 'undefined' ? window.matchMedia('(max-width: 767px)').matches : false
   );
 
-  useEffect(() => {
-    const mq = window.matchMedia('(max-width: 767px)');
-    const apply = () => setIsNarrowHw(mq.matches);
-    apply();
-    mq.addEventListener('change', apply);
-    return () => mq.removeEventListener('change', apply);
-  }, []);
-  
-  // Benchmark state
   const [benchmarkingModel, setBenchmarkingModel] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [benchmarkingNodeId, setBenchmarkingNodeId] = useState<string | null>(null);
-
-  // Pulling state
   const [pullProgress, setPullProgress] = useState<Record<string, { status: string; completed?: number; total?: number }>>({});
 
-  // Add node form state
   const [showAddNode, setShowAddNode] = useState(false);
   const [newNodeName, setNewNodeName] = useState('');
   const [newNodeUrl, setNewNodeUrl] = useState('http://');
   const [newNodeType, setNewNodeType] = useState<'ollama' | 'openai'>('ollama');
   const [newNodeApiKey, setNewNodeApiKey] = useState('');
 
-  // Custom remote pull state
   const [customPullTag, setCustomPullTag] = useState('');
   const [isPullingCustom, setIsPullingCustom] = useState(false);
   const [customPullStatus, setCustomPullStatus] = useState<string | null>(null);
   const [customPullPercent, setCustomPullPercent] = useState<number | null>(null);
   const [inspectingModel, setInspectingModel] = useState<string | null>(null);
 
-  // Encrypted node export / import
   const [nodesIOMode, setNodesIOMode] = useState<'export' | 'import' | null>(null);
   const [nodesIOPassphrase, setNodesIOPassphrase] = useState('');
   const [nodesIOConfirm, setNodesIOConfirm] = useState('');
@@ -163,9 +182,10 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   const [nodesIOBusy, setNodesIOBusy] = useState(false);
   const [nodesIOError, setNodesIOError] = useState<string | null>(null);
 
-  // Smart Cluster Auto-Configurator & Cloud Strategist Audit state
   const [advisorPlan, setAdvisorPlan] = useState<ClusterAutoConfigPlan | null>(null);
   const [advisorOpen, setAdvisorOpen] = useState(false);
+  const [advisorPhase, setAdvisorPhase] = useState<'confirm' | 'applied'>('confirm');
+  const [undoNodes, setUndoNodes] = useState<NodeConfig[] | null>(null);
   const [advisorCloudBusy, setAdvisorCloudBusy] = useState(false);
   const [advisorStatusNote, setAdvisorStatusNote] = useState<string | null>(null);
 
@@ -174,7 +194,6 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
 
   const currentNode = nodes.find(n => n.id === selectedNodeId) || nodes[0];
 
-  /** Merge /api/show into node modelMeta + live models; default think OFF for new thinking models. */
   const applyShowMeta = (nodeId: string, modelName: string, show: {
     capabilities?: string[];
     description?: string;
@@ -194,7 +213,6 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
       const modelMeta = { ...(n.modelMeta || {}), [modelName]: meta };
       const modelPrefs = { ...(n.modelPrefs || {}) };
       if (supports && modelPrefs[modelName]?.think === undefined) {
-        // Faster coding default; user can turn thinking back on
         modelPrefs[modelName] = { ...modelPrefs[modelName], think: false };
       }
       const models = (n.models || []).map(m =>
@@ -209,7 +227,6 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
       );
       return { ...n, modelMeta, modelPrefs, models };
     });
-    // Keep ref in sync immediately so overlapping inspectModel calls don't clobber each other.
     nodesRef.current = updated as EndpointNode[];
     onUpdateNodes(updated);
   };
@@ -229,12 +246,6 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     }
   };
 
-  useEffect(() => {
-    if (!isOpen || !window.electronAPI) return;
-    window.electronAPI.settingsPath().then(setSettingsFilePath).catch(() => setSettingsFilePath(''));
-    window.electronAPI.logsPath?.().then(setLogsFilePath).catch(() => setLogsFilePath(''));
-  }, [isOpen]);
-
   const refreshWebConsoleStatus = async () => {
     if (!window.electronAPI?.webConsoleGetStatus) return;
     try {
@@ -246,21 +257,33 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
         hasPassword: !!st.hasPassword,
         urls: st.urls || [],
         candidateUrls: st.candidateUrls || st.urls || [],
-        clientCount: st.clientCount || 0
+        clientCount: st.clientCount || 0,
+        lanEnabled: st.lanEnabled,
+        allowShell: st.allowShell,
+        tls: st.tls
       });
       setWebEnabled(!!st.enabled);
       setWebPort(st.port || 3847);
+      if (typeof st.lanEnabled === 'boolean') setWebLanEnabled(st.lanEnabled);
+      if (typeof st.allowShell === 'boolean') setWebAllowShell(st.allowShell);
     } catch {
       /* ignore */
     }
   };
 
   useEffect(() => {
+    const mq = window.matchMedia('(max-width: 767px)');
+    const apply = () => setIsNarrowHw(mq.matches);
+    apply();
+    mq.addEventListener('change', apply);
+    return () => mq.removeEventListener('change', apply);
+  }, []);
+
+  useEffect(() => {
     if (!isOpen) return;
     void refreshWebConsoleStatus();
   }, [isOpen, activeTab]);
 
-  // Keep Enable/listening truthful while the Web Console tab is open.
   useEffect(() => {
     if (!isOpen || activeTab !== 'remote') return;
     const id = window.setInterval(() => {
@@ -269,60 +292,6 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     return () => window.clearInterval(id);
   }, [isOpen, activeTab]);
 
-  const applyWebConsole = async (patch: { enabled?: boolean; port?: number; password?: string }) => {
-    if (!window.electronAPI?.webConsoleUpdate) {
-      setWebNote('Web console API unavailable');
-      return;
-    }
-    setWebBusy(true);
-    setWebNote('');
-    try {
-      const res = await window.electronAPI.webConsoleUpdate(patch);
-      if (res.error) {
-        setWebNote(res.error);
-        await refreshWebConsoleStatus();
-        return;
-      }
-      if (res.status) {
-        setWebStatus({
-          enabled: !!res.status.enabled,
-          port: res.status.port || 3847,
-          listening: !!res.status.listening,
-          hasPassword: !!res.status.hasPassword,
-          urls: res.status.urls || [],
-          candidateUrls:
-            (res.status as { candidateUrls?: string[] }).candidateUrls || res.status.urls || [],
-          clientCount: (res.status as { clientCount?: number }).clientCount || 0
-        });
-      }
-      setWebEnabled(!!res.status?.enabled);
-      setWebPort(res.status?.port || patch.port || webPort);
-      if (patch.password) setWebPassword('');
-      if (res.webConsole) {
-        onWebConsoleChange?.({
-          enabled: !!res.webConsole.enabled,
-          port: res.webConsole.port || res.status?.port || webPort
-        });
-      } else if (res.status) {
-        onWebConsoleChange?.({
-          enabled: !!res.status.enabled,
-          port: res.status.port || webPort
-        });
-      }
-      setWebNote(
-        res.status?.listening
-          ? 'Web console is listening. Leave Enable on while you use phone/PC browsers.'
-          : res.status?.enabled
-            ? 'Enabled but not listening — set a password, or the port may be in use.'
-            : 'Web console stopped.'
-      );
-      await refreshWebConsoleStatus();
-    } finally {
-      setWebBusy(false);
-    }
-  };
-
-  // After opening Hardware Settings, inspect installed models missing Ollama metadata
   useEffect(() => {
     if (!isOpen || !currentNode || currentNode.type === 'openai' || !currentNode.online) return;
     const missing = (currentNode.models || []).filter(m => {
@@ -340,11 +309,124 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [isOpen, currentNode?.id, currentNode?.online, currentNode?.models.map(m => m.name).join(',')]);
+  }, [isOpen, currentNode?.id, currentNode?.online, currentNode?.models?.map(m => m.name).join(',')]);
 
-  if (!isOpen) return null;
+  useEffect(() => {
+    if (!isOpen || !initialTab) return;
+    applyInitialTab(initialTab, setActiveTab, setNodesSection);
+  }, [isOpen, initialTab]);
 
-  const handleUpdateHardware = (field: keyof HardwareProfile, value: any) => {
+  const closeNodesIODialog = () => {
+    setNodesIOMode(null);
+    setNodesIOPassphrase('');
+    setNodesIOConfirm('');
+    setNodesIOMergeMode('replace');
+    setNodesIOBusy(false);
+    setNodesIOError(null);
+  };
+
+  const requestClose = () => {
+    if (showAddNode) {
+      setShowAddNode(false);
+      return;
+    }
+    if (nodesIOMode) {
+      closeNodesIODialog();
+      return;
+    }
+    onClose();
+  };
+
+  const { dialogProps, overlayProps } = useDialog({
+    open: isOpen,
+    onClose: requestClose,
+    labelledBy: 'hardware-settings-title'
+  });
+
+  const note = (text: string, tone: WebConsoleNoteTone) => {
+    setWebNote(text);
+    setWebNoteTone(tone);
+  };
+
+  const applyWebConsole = async (patch: WebConsolePatch) => {
+    if (patch.password != null && patch.password.length < 8) {
+      note('Password must be at least 8 characters.', 'error');
+      return;
+    }
+    if (!window.electronAPI?.webConsoleUpdate) {
+      note('Web console API unavailable', 'error');
+      return;
+    }
+    if (typeof patch.enabled === 'boolean') setWebEnabled(patch.enabled);
+    setWebBusy(true);
+    setWebNote('');
+    try {
+      const res = await window.electronAPI.webConsoleUpdate(patch);
+      if (res.error) {
+        note(res.error, 'error');
+        await refreshWebConsoleStatus();
+        return;
+      }
+      if (res.status) {
+        const status = res.status as WebConsoleStatusView & { clientCount?: number };
+        setWebStatus({
+          enabled: !!res.status.enabled,
+          port: res.status.port || 3847,
+          listening: !!res.status.listening,
+          hasPassword: !!res.status.hasPassword,
+          urls: res.status.urls || [],
+          candidateUrls: status.candidateUrls || res.status.urls || [],
+          clientCount: status.clientCount || 0,
+          lanEnabled: status.lanEnabled,
+          allowShell: status.allowShell,
+          tls: status.tls
+        });
+      }
+      setWebEnabled(!!res.status?.enabled);
+      setWebPort(res.status?.port || patch.port || webPort);
+      if (patch.password) setWebPassword('');
+      if (typeof res.webConsole?.lanEnabled === 'boolean') setWebLanEnabled(res.webConsole.lanEnabled);
+      if (typeof res.webConsole?.allowShell === 'boolean') setWebAllowShell(res.webConsole.allowShell);
+      if (typeof res.webConsole?.tlsCertPath === 'string') setWebTlsCert(res.webConsole.tlsCertPath);
+      if (typeof res.webConsole?.tlsKeyPath === 'string') setWebTlsKey(res.webConsole.tlsKeyPath);
+      const enabled = !!(res.webConsole?.enabled ?? res.status?.enabled);
+      const port = res.webConsole?.port || res.status?.port || webPort;
+      onWebConsoleChange?.({ enabled, port });
+      const keys = Object.keys(patch);
+      const onlyLan = keys.length === 1 && patch.lanEnabled != null;
+      const onlyShell = keys.length === 1 && patch.allowShell != null;
+      if (onlyLan) {
+        note(
+          patch.lanEnabled
+            ? 'LAN access on. Other devices on your network can connect.'
+            : 'LAN access off. This PC only.',
+          'success'
+        );
+      } else if (onlyShell) {
+        note(
+          patch.allowShell
+            ? 'Remote clients can run commands on this PC.'
+            : 'Remote command access is off.',
+          patch.allowShell ? 'warning' : 'success'
+        );
+      } else if (patch.password) {
+        note('Password saved.', 'success');
+      } else if (patch.tlsCertPath != null || patch.tlsKeyPath != null) {
+        note('TLS paths saved.', patch.tlsCertPath && patch.tlsKeyPath ? 'success' : 'info');
+      } else if (res.status?.listening) {
+        note('Web console is listening. Leave Enable on while you use phone/PC browsers.', 'success');
+      } else if (res.status?.enabled) {
+        note('Enabled but not listening — set a password, or the port may be in use.', 'warning');
+      } else {
+        note('Web console stopped.', 'info');
+      }
+      await refreshWebConsoleStatus();
+    } finally {
+      setWebBusy(false);
+    }
+  };
+
+  const handleUpdateHardware = (field: keyof HardwareProfile, value: string | number) => {
     if (!currentNode) return;
     const updated = nodes.map(n => {
       if (n.id === currentNode.id) {
@@ -365,10 +447,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     if (!currentNode) return;
     const updated = nodes.map(n => {
       if (n.id === currentNode.id) {
-        return {
-          ...n,
-          [field]: value
-        };
+        return { ...n, [field]: value };
       }
       return n;
     });
@@ -381,33 +460,20 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
       onUpdateNodes(assignAllowedRoles(nodes, currentNode.id, null));
       return;
     }
-    // Leaving Auto: start with all roles allowed so the node stays usable until trimmed.
     onUpdateNodes(assignAllowedRoles(nodes, currentNode.id, [...ALL_NODE_ROLES]));
   };
 
   const handleToggleAllowedRole = (role: NodeRole, checked: boolean) => {
-    if (!currentNode || isRoleAuto(currentNode)) return;
+    if (!currentNode || !currentNode.roles?.length) return;
     const current = currentNode.roles || [];
-    const next = checked
-      ? [...current.filter(r => r !== role), role]
-      : current.filter(r => r !== role);
-    // Unchecking the last role returns to Auto.
-    onUpdateNodes(
-      assignAllowedRoles(nodes, currentNode.id, next.length ? next : null)
-    );
+    const next = checked ? [...current.filter(r => r !== role), role] : current.filter(r => r !== role);
+    onUpdateNodes(assignAllowedRoles(nodes, currentNode.id, next.length ? next : null));
   };
 
   const handleUpdateDevNode = (enabled: boolean) => {
     if (!currentNode) return;
     onUpdateNodes(assignDevNode(nodes, currentNode.id, enabled));
   };
-
-  const allowedRoleOptions: { value: NodeRole; label: string; hint: string }[] = [
-    { value: 'coder', label: 'Coder', hint: 'coding / Auto-Node coder picks' },
-    { value: 'planner', label: 'Planner', hint: 'Planner persona & Swarm Pass-1' },
-    { value: 'reviewer', label: 'Reviewer', hint: 'reviewer persona & review tasks' },
-    { value: 'docs', label: 'Docs', hint: 'docs persona & README/test tasks' }
-  ];
 
   const handleUpdateFreeTier = (enabled: boolean, dailyCap?: number, rpm?: number) => {
     if (!currentNode) return;
@@ -435,8 +501,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
 
   const handleSetVramOverheadMode = (mode: 'windows_desktop' | 'headless_linux' | 'igpu_display') => {
     if (!currentNode) return;
-    const reserve =
-      mode === 'headless_linux' ? 0.2 : mode === 'igpu_display' ? 0.1 : 1.0;
+    const reserve = mode === 'headless_linux' ? 0.2 : mode === 'igpu_display' ? 0.1 : 1.0;
     const updated = nodes.map(n => {
       if (n.id !== currentNode.id) return n;
       return {
@@ -451,29 +516,35 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     onUpdateNodes(updated);
   };
 
-  const handleRunSmartAutoConfig = (applyImmediately = false) => {
+  const handleRunSmartAutoConfig = () => {
     const plan = buildClusterAutoConfigPlan(nodesRef.current);
     setAdvisorPlan(plan);
     setAdvisorOpen(true);
-    if (applyImmediately) {
-      const updated = applyClusterAutoConfigPlan(nodesRef.current, plan);
-      onUpdateNodes(normalizeClusterNodes(updated));
-      setAdvisorStatusNote('Applied Physics-optimized roles, pinned primary models, and set optimal num_ctx caps.');
-    } else {
-      setAdvisorStatusNote('Generated Hardware-Physics plan. Review below or click Apply to update all nodes.');
-    }
+    setAdvisorPhase('confirm');
+    setAdvisorStatusNote('Review pinned model, num_ctx, and specialty for each node, then apply.');
   };
 
   const handleApplyAdvisorPlan = (planToApply?: ClusterAutoConfigPlan) => {
     const plan = planToApply || advisorPlan;
     if (!plan) return;
+    setUndoNodes(snapshotNodeConfigs(nodesRef.current));
     const updated = applyClusterAutoConfigPlan(nodesRef.current, plan);
     onUpdateNodes(normalizeClusterNodes(updated));
+    setAdvisorPhase('applied');
+    setAdvisorOpen(true);
     setAdvisorStatusNote(
       plan.source === 'cloud_strategist'
-        ? 'Applied Cloud Strategist + Physics cluster configuration!'
-        : 'Applied Smart Hardware-Physics cluster configuration!'
+        ? 'Applied Cloud Strategist + Physics cluster configuration. Undo restores the previous nodes.'
+        : 'Applied Smart Hardware-Physics cluster configuration. Undo restores the previous nodes.'
     );
+  };
+
+  const handleUndoAutoConfig = () => {
+    if (!undoNodes) return;
+    onUpdateNodes(undoNodes);
+    setUndoNodes(null);
+    setAdvisorPhase('confirm');
+    setAdvisorStatusNote('Restored the cluster configuration from before the last apply.');
   };
 
   const handleRunCloudStrategistAudit = async () => {
@@ -498,11 +569,19 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     const basePlan = advisorPlan || buildClusterAutoConfigPlan(nodesRef.current);
     setAdvisorPlan(basePlan);
     setAdvisorOpen(true);
+    setAdvisorPhase('confirm');
     setAdvisorCloudBusy(true);
     setAdvisorStatusNote(`Auditing cluster inventory with ${auditorNode.name} (${auditorModel})...`);
 
     try {
       const prompt = buildCloudClusterAuditPrompt(nodesRef.current, basePlan);
+      const advice = basePlan.nodes.find(n => n.nodeId === auditorNode.id);
+      const pinnedCtx =
+        auditorNode.modelPrefs?.[auditorModel]?.numCtx ??
+        (auditorModel ? advice?.modelNumCtx?.[auditorModel] : undefined);
+      const options: { temperature: number; num_ctx?: number } = { temperature: 0.1 };
+      if (typeof pinnedCtx === 'number' && pinnedCtx > 0) options.num_ctx = pinnedCtx;
+
       const { done } = streamChat(
         auditorNode.url,
         {
@@ -514,7 +593,9 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
             },
             { role: 'user', content: prompt }
           ],
-          options: { temperature: 0.1, num_ctx: 8192 }
+          think: false,
+          format: 'json',
+          options
         },
         () => {},
         auditorNode.type,
@@ -523,21 +604,22 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
       const res = await done;
       const merged = mergeCloudAuditIntoPlan(res.content, basePlan, `${auditorNode.name} (${auditorModel})`);
       setAdvisorPlan(merged);
-      const updated = applyClusterAutoConfigPlan(nodesRef.current, merged);
-      onUpdateNodes(normalizeClusterNodes(updated));
-      setAdvisorStatusNote(`Cloud Strategist audit complete via ${auditorNode.name} (${auditorModel}) and applied to cluster!`);
-    } catch (err: any) {
-      setAdvisorStatusNote(`Cloud audit failed (${err?.message || 'error'}) — kept deterministic Physics plan.`);
+      setAdvisorPhase('confirm');
+      setAdvisorStatusNote(
+        `Cloud Strategist audit ready via ${auditorNode.name} (${auditorModel}). Review the summary, then apply.`
+      );
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'error';
+      setAdvisorStatusNote(`Cloud audit failed (${message}) — kept deterministic Physics plan.`);
     } finally {
       setAdvisorCloudBusy(false);
     }
   };
 
   const handleDetectHardware = async () => {
-    if (!window.electronAPI) return;
+    if (!window.electronAPI || !currentNode) return;
     try {
       const detected = await window.electronAPI.detectHardware();
-      if (!currentNode) return;
       const gpuName = detected.gpu || currentNode.hardware.gpu;
       const guessedBw = guessGpuBandwidth(gpuName);
       const updated = nodesRef.current.map(n => {
@@ -565,11 +647,13 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
 
   const handleRunBenchmark = async (node: EndpointNode, modelName: string) => {
     if (!window.electronAPI) return;
+    setActionError(null);
     setBenchmarkingModel(modelName);
     setBenchmarkingNodeId(node.id);
 
     try {
-      const res = await window.electronAPI.benchmarkModel(node, modelName);
+      const ctx = pinnedNumCtx(node, modelName);
+      const res = await window.electronAPI.benchmarkModel(node, modelName, ctx);
       if (!res.error) {
         const measured = {
           ...res,
@@ -585,10 +669,11 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
         });
         onUpdateNodes(updated);
       } else {
-        alert(`Benchmark failed: ${res.error}`);
+        setActionError(`Benchmark failed: ${res.error}`);
       }
-    } catch (err: any) {
-      alert(`Benchmark error: ${err.message}`);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Benchmark failed';
+      setActionError(`Benchmark error: ${message}`);
     } finally {
       setBenchmarkingModel(null);
       setBenchmarkingNodeId(null);
@@ -605,8 +690,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
         [key]: { status, completed, total }
       }));
     }).done.then(async () => {
-      await onRefreshNodes();
-      // Discover thinking support + description from Ollama after download
+      await onRefreshNodes({ force: true });
       await inspectModel(node, tag);
       setTimeout(() => {
         setPullProgress(prev => {
@@ -633,7 +717,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     setCustomPullPercent(0);
 
     pullModel(currentNode.url, tag, (status, completed, total) => {
-      let pct = null;
+      let pct: number | null = null;
       let label = status;
       if (completed && total && total > 0) {
         pct = Math.round((completed / total) * 100);
@@ -644,7 +728,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     }).done.then(async () => {
       setCustomPullStatus('Pull complete! Inspecting model capabilities…');
       setCustomPullTag('');
-      await onRefreshNodes();
+      await onRefreshNodes({ force: true });
       await inspectModel(currentNode, tag);
       setCustomPullStatus('Pull complete! Thinking controls available if the model supports them.');
       setTimeout(() => {
@@ -668,7 +752,6 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     try {
       const res = await window.electronAPI.deleteModel(node.url, modelName);
       if (res.success) {
-        // Drop local bookkeeping so Conductor dropdowns don't keep ghost models
         const updated = nodes.map(n => {
           if (n.id !== node.id) return n;
           const { [modelName]: _removed, ...restBench } = n.benchmarks || {};
@@ -676,8 +759,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
           const remainingNames = nextModels
             .map(m => m.name)
             .filter(name => !isEmbeddingModelName(name) && !(n.disabledModels || []).includes(name));
-          const nextActive =
-            n.activeModel === modelName ? remainingNames[0] || undefined : n.activeModel;
+          const nextActive = n.activeModel === modelName ? remainingNames[0] || undefined : n.activeModel;
           const { [modelName]: _m, ...restMeta } = n.modelMeta || {};
           const { [modelName]: _p, ...restPrefs } = n.modelPrefs || {};
           return {
@@ -691,22 +773,20 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
           };
         });
         onUpdateNodes(updated);
-        onRefreshNodes();
+        onRefreshNodes({ force: true });
       } else {
-        alert(`Delete failed: ${res.error}`);
+        setActionError(`Delete failed: ${res.error}`);
       }
-    } catch (err: any) {
-      alert(`Delete error: ${err.message}`);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Delete failed';
+      setActionError(`Delete error: ${message}`);
     }
   };
 
   const handleToggleModelEnabled = (node: EndpointNode, modelName: string) => {
     const disabledSet = new Set(node.disabledModels || []);
-    if (disabledSet.has(modelName)) {
-      disabledSet.delete(modelName);
-    } else {
-      disabledSet.add(modelName);
-    }
+    if (disabledSet.has(modelName)) disabledSet.delete(modelName);
+    else disabledSet.add(modelName);
     const nextDisabled = Array.from(disabledSet);
 
     const updated = nodes.map(n => {
@@ -725,10 +805,10 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     onUpdateNodes(updated);
   };
 
-  /** Enable or disable all generative models on the currently selected node only. */
   const handleSetAllModelsEnabled = (node: EndpointNode, enabled: boolean) => {
     const generative = (node.models || []).filter(m => {
-      const isEmbed = m.capabilities?.includes('embedding') ||
+      const isEmbed =
+        m.capabilities?.includes('embedding') ||
         m.name.toLowerCase().includes('embed') ||
         m.name.toLowerCase().includes('bge');
       return !isEmbed;
@@ -740,24 +820,12 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
       if (enabled) {
         const first = generative[0]?.name;
         const nextActive =
-          n.activeModel && generative.some(m => m.name === n.activeModel)
-            ? n.activeModel
-            : first;
+          n.activeModel && generative.some(m => m.name === n.activeModel) ? n.activeModel : first;
         return { ...n, disabledModels: [], activeModel: nextActive };
       }
-      const allNames = generative.map(m => m.name);
-      return { ...n, disabledModels: allNames, activeModel: undefined };
+      return { ...n, disabledModels: generative.map(m => m.name), activeModel: undefined };
     });
     onUpdateNodes(updated);
-  };
-
-  const closeNodesIODialog = () => {
-    setNodesIOMode(null);
-    setNodesIOPassphrase('');
-    setNodesIOConfirm('');
-    setNodesIOMergeMode('replace');
-    setNodesIOBusy(false);
-    setNodesIOError(null);
   };
 
   const openNodesIODialog = (mode: 'export' | 'import') => {
@@ -842,15 +910,16 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
       if (normalized[0]?.id) setSelectedNodeId(normalized[0].id);
       closeNodesIODialog();
       onRefreshNodes();
-    } catch (err: any) {
-      setNodesIOError(err?.message || 'Operation failed');
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Operation failed';
+      setNodesIOError(message);
       setNodesIOBusy(false);
     }
   };
 
   const handleSetPrimaryModel = (node: EndpointNode, modelName: string) => {
     const disabledSet = new Set(node.disabledModels || []);
-    disabledSet.delete(modelName); // Ensure primary model is enabled
+    disabledSet.delete(modelName);
     const updated = nodes.map(n => {
       if (n.id === node.id) {
         return { ...n, activeModel: modelName, disabledModels: Array.from(disabledSet) };
@@ -928,47 +997,72 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     }
   };
 
-  const hwTabs: { id: typeof activeTab; label: string; short: string }[] = [
-    { id: 'nodes', label: `Hardware Nodes (${nodes.length})`, short: `Nodes (${nodes.length})` },
-    { id: 'hub', label: 'Model Hub & Recommendations', short: 'Hub' },
-    { id: 'appearance', label: 'Appearance & Scaling', short: 'Display' },
-    { id: 'stats', label: 'Token Usage & Savings', short: 'Stats' },
-    { id: 'remote', label: 'Web Console', short: 'Remote' }
+  if (!isOpen) return null;
+
+  const hwTabs: { id: HardwareMainTab; label: string; short: string }[] = [
+    { id: 'nodes', label: `Nodes (${nodes.length})`, short: `Nodes (${nodes.length})` },
+    { id: 'hub', label: 'Model Hub', short: 'Hub' },
+    { id: 'appearance', label: 'Appearance', short: 'Display' },
+    { id: 'stats', label: 'Token Stats', short: 'Stats' },
+    { id: 'remote', label: 'Web Console', short: 'Remote' },
+    { id: 'support', label: 'Support', short: 'Support' }
   ];
+
+  const nodeSections: { id: NodesSection; label: string }[] = [
+    { id: 'endpoints', label: 'Endpoints' },
+    { id: 'models', label: 'Models' },
+    { id: 'integrations', label: 'Integrations' }
+  ];
+
+  const nodeTypeById = Object.fromEntries(nodes.map(n => [n.id, n.type]));
 
   return (
     <div
       className={`fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center ${
         isNarrowHw ? 'p-0' : 'p-4'
       }`}
+      {...overlayProps}
     >
-      <div className="bg-[#161619] border border-[#2e2e38] w-full max-w-4xl sm:rounded-xl shadow-2xl overflow-hidden flex flex-col h-[100dvh] sm:h-[85vh] max-h-[100dvh] sm:max-h-[85vh] rounded-none">
-        {/* Header */}
+      <div
+        className="relative bg-[#161619] border border-[#2e2e38] w-full max-w-4xl sm:rounded-xl shadow-2xl overflow-hidden flex flex-col h-[100dvh] sm:h-[85vh] max-h-[100dvh] sm:max-h-[85vh] rounded-none outline-none"
+        {...dialogProps}
+      >
         <div className="shrink-0 bg-[#121215] border-b border-[#27272a]">
           <div className="h-11 px-3 sm:px-4 flex items-center justify-between gap-2">
             <div className="flex items-center space-x-2 text-indigo-400 font-bold text-sm min-w-0">
-              <Cpu className="w-4 h-4 shrink-0" />
-              <span className="truncate">{isNarrowHw ? 'Hardware' : 'Cluster & Hardware Conductor'}</span>
+              <Cpu className="w-4 h-4 shrink-0" aria-hidden="true" />
+              <span id="hardware-settings-title" className="truncate">
+                Hardware & Models
+              </span>
             </div>
             <div className="flex items-center space-x-1.5 shrink-0">
               <button
-                onClick={onRefreshNodes}
+                type="button"
+                onClick={() => onRefreshNodes({ force: true })}
                 className="flex items-center space-x-1 px-2 py-1 text-xs text-zinc-300 hover:text-white bg-[#1e1e24] hover:bg-[#282830] rounded border border-[#2c2c36] transition"
                 title="Ping all endpoints"
+                aria-label="Ping all endpoints"
               >
-                <RefreshCw className="w-3 h-3" />
+                <RefreshCw className="w-3 h-3" aria-hidden="true" />
                 {!isNarrowHw && <span>Ping All</span>}
               </button>
-              <button onClick={onClose} className="p-1.5 text-zinc-400 hover:text-white rounded">
+              <button
+                type="button"
+                onClick={onClose}
+                className="p-1.5 text-zinc-400 hover:text-white rounded"
+                aria-label="Close hardware settings"
+              >
                 <X className="w-4 h-4" />
               </button>
             </div>
           </div>
-          <div className="px-2 pb-2 flex items-center gap-1 overflow-x-auto no-scrollbar">
+          <div className="px-2 pb-2 flex items-center gap-1 overflow-x-auto" role="tablist" aria-label="Hardware settings">
             {hwTabs.map(t => (
               <button
                 key={t.id}
                 type="button"
+                role="tab"
+                aria-selected={activeTab === t.id}
                 onClick={() => {
                   setActiveTab(t.id);
                   if (t.id === 'nodes' && isNarrowHw) setMobileNodePane('list');
@@ -985,778 +1079,163 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
           </div>
         </div>
 
-        {/* Tab 1: Hardware Nodes Configuration & Benchmarking */}
+        {actionError ? (
+          <div className="px-3 pt-2">
+            <ErrorCard cause={actionError} />
+          </div>
+        ) : null}
+
         {activeTab === 'nodes' && (
-          <div className="flex-1 flex flex-col overflow-hidden">
-            <div className="px-3 py-2 border-b border-[#27272a] flex items-center gap-2">
-              <label className="text-[10px] uppercase tracking-wide text-zinc-500 shrink-0" htmlFor="searxng-url">
-                SearXNG
-              </label>
-              <input
-                id="searxng-url"
-                type="text"
-                value={searxngUrl}
-                placeholder="http://127.0.0.1:8080"
-                onChange={e => onUpdateSearxngUrl(e.target.value.trim())}
-                className="min-w-0 flex-1 select-text bg-[#18181d] border border-[#2c2c38] text-zinc-200 rounded px-2 py-1 text-[11px] font-mono"
-              />
-            </div>
-            <div className="px-3 py-2 border-b border-[#27272a] flex items-start gap-2">
-              <label className="text-[10px] uppercase tracking-wide text-zinc-500 shrink-0 pt-1" htmlFor="mcp-json">
-                Local MCP
-              </label>
-              <textarea
-                id="mcp-json"
-                value={mcpServersJson}
-                placeholder={'[{"name":"local","command":"npx","args":["-y","@modelcontextprotocol/server-everything"]}]'}
-                onChange={e => onUpdateMcpServersJson?.(e.target.value)}
-                rows={2}
-                className="min-w-0 flex-1 select-text bg-[#18181d] border border-[#2c2c38] text-zinc-200 rounded px-2 py-1 text-[10px] font-mono"
-              />
+          <div className="flex-1 flex flex-col overflow-hidden min-h-0">
+            <div className="px-2 pt-2 pb-1 flex items-center gap-1 border-b border-[#27272a]" role="tablist" aria-label="Node settings">
+              {nodeSections.map(section => (
+                <button
+                  key={section.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={nodesSection === section.id}
+                  onClick={() => setNodesSection(section.id)}
+                  className={`px-2.5 py-1 rounded text-[11px] transition ${
+                    nodesSection === section.id
+                      ? 'bg-[#1e1e28] text-indigo-200 border border-indigo-500/40 font-medium'
+                      : 'text-zinc-400 hover:text-white border border-transparent'
+                  }`}
+                >
+                  {section.label}
+                </button>
+              ))}
             </div>
 
-            {/* Smart Cluster Auto-Configurator Banner */}
-            <div className="px-3 py-2.5 border-b border-[#27272a] bg-gradient-to-r from-indigo-950/35 via-[#16161d] to-violet-950/30 flex flex-col gap-2">
-              <div className="flex items-center justify-between gap-2 flex-wrap">
-                <div className="flex items-center gap-2 min-w-0">
-                  <Sparkles className="w-4 h-4 text-amber-400 shrink-0" />
-                  <div className="min-w-0">
-                    <div className="text-xs font-bold text-zinc-100 flex items-center gap-1.5 flex-wrap">
-                      <span>Smart Cluster Auto-Configurator</span>
-                      <span className="text-[9px] font-mono uppercase px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
-                        Multi-GPU Physics + Cloud Strategist
-                      </span>
-                    </div>
-                    <p className="text-[10px] text-zinc-400 truncate">
-                      Pins 1 primary model per GPU to stop VRAM swap thrashing, tunes <code className="text-zinc-300">num_ctx</code> &amp; VRAM overhead (Headless Linux 0.2GB / iGPU 0.1GB), and assigns optimal cluster roles.
-                    </p>
-                  </div>
-                </div>
-                <div className="flex items-center gap-1.5 shrink-0 flex-wrap">
-                  <button
-                    type="button"
-                    onClick={() => handleRunSmartAutoConfig(true)}
-                    disabled={nodes.length === 0 || advisorCloudBusy}
-                    className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold bg-indigo-600 hover:bg-indigo-500 text-white shadow flex items-center gap-1.5 transition disabled:opacity-40"
-                    title="Inspects all nodes, pins the best primary model per GPU, sets optimal num_ctx & VRAM overhead, and assigns roles"
-                  >
-                    <Zap className="w-3.5 h-3.5 text-amber-300" />
-                    <span>Smart Auto-Configure Cluster</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleRunCloudStrategistAudit}
-                    disabled={nodes.length === 0 || advisorCloudBusy}
-                    className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold bg-sky-600/25 hover:bg-sky-600/40 text-sky-200 border border-sky-500/40 flex items-center gap-1.5 transition disabled:opacity-40"
-                    title="Calls your Cloud Frontier model (or top local planner) with the full cluster JSON inventory to audit roles, primary models, and context limits"
-                  >
-                    <Cloud className="w-3.5 h-3.5 text-sky-300" />
-                    <span>{advisorCloudBusy ? 'Auditing Cluster…' : 'Cloud Strategist Audit'}</span>
-                  </button>
-                  {advisorPlan && (
-                    <button
-                      type="button"
-                      onClick={() => setAdvisorOpen(v => !v)}
-                      className="px-2 py-1 rounded text-[10px] text-zinc-400 hover:text-zinc-200 bg-[#1e1e26] border border-[#2e2e3a]"
-                    >
-                      {advisorOpen ? 'Hide Plan' : 'Show Plan'}
-                    </button>
-                  )}
-                </div>
-              </div>
+            {nodesSection === 'endpoints' && (
+              <EndpointsPanel
+                nodes={nodes}
+                currentNode={currentNode}
+                selectedNodeId={selectedNodeId}
+                isNarrow={isNarrowHw}
+                mobilePane={mobileNodePane}
+                onMobilePane={setMobileNodePane}
+                onSelectNode={setSelectedNodeId}
+                onUpdateNodeProp={handleUpdateNodeProp}
+                onSetRoleAuto={handleSetRoleAuto}
+                onToggleAllowedRole={handleToggleAllowedRole}
+                onUpdateDevNode={handleUpdateDevNode}
+                onUpdateFreeTier={handleUpdateFreeTier}
+                onDeleteNode={handleDeleteNode}
+                onApplyGpuPreset={handleApplyGpuPreset}
+                onUpdateHardware={handleUpdateHardware}
+                onSetVramOverheadMode={handleSetVramOverheadMode}
+                onDetectHardware={() => void handleDetectHardware()}
+                onOpenExport={() => openNodesIODialog('export')}
+                onOpenImport={() => openNodesIODialog('import')}
+                onAddNode={() => setShowAddNode(true)}
+                banner={
+                  <ClusterAutoConfigBar
+                    nodeCount={nodes.length}
+                    cloudBusy={advisorCloudBusy}
+                    plan={advisorPlan}
+                    open={advisorOpen}
+                    mode={advisorPhase}
+                    canUndo={!!undoNodes}
+                    statusNote={advisorStatusNote}
+                    onPreview={handleRunSmartAutoConfig}
+                    onAudit={() => void handleRunCloudStrategistAudit()}
+                    onToggleOpen={() => setAdvisorOpen(v => !v)}
+                    onApply={() => handleApplyAdvisorPlan()}
+                    onUndo={handleUndoAutoConfig}
+                    onDismissNote={() => setAdvisorStatusNote(null)}
+                    onSelectNode={id => {
+                      setSelectedNodeId(id);
+                      if (isNarrowHw) setMobileNodePane('detail');
+                    }}
+                    pullProgress={pullProgress}
+                    onPull={(nodeId, tag) => {
+                      const node = nodes.find(n => n.id === nodeId);
+                      if (node) handlePullModel(node, tag);
+                    }}
+                    nodeTypeById={nodeTypeById}
+                  />
+                }
+              />
+            )}
 
-              {advisorStatusNote && (
-                <div className="text-[11px] text-emerald-300 bg-emerald-950/30 border border-emerald-500/30 rounded px-2.5 py-1 flex items-center justify-between gap-2">
-                  <span>{advisorStatusNote}</span>
-                  <button
-                    type="button"
-                    onClick={() => setAdvisorStatusNote(null)}
-                    className="text-zinc-400 hover:text-white text-[10px]"
-                  >
-                    ✕
-                  </button>
-                </div>
-              )}
-
-              {advisorOpen && advisorPlan && (
-                <div className="bg-[#111116] border border-[#2b2b38] rounded-lg p-3 space-y-2.5 max-h-60 overflow-y-auto">
-                  <div className="flex items-center justify-between gap-2 flex-wrap border-b border-[#23232e] pb-1.5">
-                    <div className="text-[11px] text-zinc-200 font-medium">
-                      {advisorPlan.summary}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => handleApplyAdvisorPlan(advisorPlan)}
-                      className="px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-semibold shrink-0"
-                    >
-                      Re-Apply All Recommendations
-                    </button>
-                  </div>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                    {advisorPlan.nodes.map(rec => {
-                      const meta = SPECIALTY_META[rec.specialty];
-                      const targetNode = nodes.find(n => n.id === rec.nodeId);
-                      return (
-                        <div
-                          key={rec.nodeId}
-                          onClick={() => setSelectedNodeId(rec.nodeId)}
-                          className="p-2.5 rounded-lg bg-[#17171f] border border-[#292936] hover:border-indigo-500/50 cursor-pointer space-y-1.5 transition"
+            {nodesSection === 'models' && (
+              <div className="flex-1 overflow-y-auto p-4 space-y-3 min-h-0">
+                {currentNode ? (
+                  <>
+                    {nodes.length > 1 && (
+                      <label className="flex items-center gap-2 text-[11px] text-zinc-400">
+                        <span className="shrink-0">Models on</span>
+                        <select
+                          value={currentNode.id}
+                          aria-label="Endpoint for installed models"
+                          onChange={e => setSelectedNodeId(e.target.value)}
+                          className="min-w-0 flex-1 bg-[#1c1c24] border border-[#2c2c38] text-zinc-100 rounded px-2.5 py-1 outline-none text-xs"
                         >
-                          <div className="flex items-center justify-between gap-1.5">
-                            <span className="text-xs font-bold text-zinc-100 truncate">{rec.nodeName}</span>
-                            <span className={`text-[9px] font-mono uppercase px-1.5 py-0.5 rounded border ${meta.badgeClass}`}>
-                              {meta.shortLabel}: {meta.label}
-                            </span>
-                          </div>
-                          <div className="text-[10px] font-mono text-zinc-300 flex flex-wrap gap-x-3 gap-y-0.5">
-                            <span>
-                              Primary:{' '}
-                              <strong className="text-indigo-300">
-                                {rec.primaryModel || '(none installed)'}
-                              </strong>
-                            </span>
-                            {rec.primaryModel && rec.modelNumCtx[rec.primaryModel] && (
-                              <span>
-                                num_ctx:{' '}
-                                <strong className="text-emerald-300">
-                                  {(rec.modelNumCtx[rec.primaryModel] / 1024).toFixed(0)}k
-                                </strong>
-                              </span>
-                            )}
-                            <span>
-                              Usable VRAM:{' '}
-                              <strong className="text-amber-300">{rec.usableVramGB} GB</strong> (reserve {rec.recommendedReserveVramGB} GB)
-                            </span>
-                          </div>
-                          <p className="text-[10px] text-zinc-400 leading-relaxed">{rec.rationale}</p>
-                          {rec.disabledModels.length > 0 && (
-                            <div className="text-[10px] text-amber-300/90">
-                              • Disabled {rec.disabledModels.length} secondary model{rec.disabledModels.length === 1 ? '' : 's'} ({rec.disabledModels.slice(0, 3).join(', ')}) to prevent VRAM swap thrashing.
-                            </div>
-                          )}
-                          {rec.recommendedPulls.length > 0 && targetNode && targetNode.type !== 'openai' && (
-                            <div className="pt-1 flex items-center gap-1.5 flex-wrap">
-                              <span className="text-[9px] uppercase tracking-wider text-zinc-500">Suggested Pulls:</span>
-                              {rec.recommendedPulls.map(p => {
-                                const pullKey = `${targetNode.id}:${p.tag}`;
-                                const prog = pullProgress[pullKey];
-                                return (
-                                  <button
-                                    key={p.tag}
-                                    type="button"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      handlePullModel(targetNode, p.tag);
-                                    }}
-                                    disabled={!!prog}
-                                    className="px-2 py-0.5 rounded text-[10px] font-mono bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-200 border border-indigo-500/30 transition"
-                                    title={`${p.tag} (${p.sizeGB} GB · ~${p.estimatedTokPerSec} tok/s) — ${p.reason}`}
-                                  >
-                                    {prog ? `${p.tag} (${prog.status})` : `⬇ ollama pull ${p.tag}`}
-                                  </button>
-                                );
-                              })}
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-            </div>
-            <div className="flex-1 flex overflow-hidden min-h-0">
-            {/* Left Node Sidebar — full width on phone until a node is opened */}
-            <div
-              className={`${
-                isNarrowHw
-                  ? mobileNodePane === 'list'
-                    ? 'w-full'
-                    : 'hidden'
-                  : 'w-64 border-r'
-              } border-[#27272a] bg-[#121215] flex flex-col justify-between p-2 shrink-0`}
-            >
-              <div className="space-y-1 overflow-y-auto">
-                <div className="text-[10px] uppercase font-bold text-zinc-500 px-2 py-1 tracking-wider">
-                  Configured Endpoints
-                </div>
-                {nodes.length === 0 && (
-                  <div className="px-2 py-6 text-center text-zinc-500 space-y-2">
-                    <Cpu className="w-8 h-8 text-indigo-400/50 mx-auto" />
-                    <p className="text-xs font-semibold text-zinc-300">No endpoints yet</p>
-                    <p className="text-[10px] leading-relaxed">
-                      Add a local Ollama node or Frontier API. On the web console, wait for the desktop session to sync if Studio already has nodes.
-                    </p>
+                          {nodes.map(n => (
+                            <option key={n.id} value={n.id}>
+                              {n.name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    )}
+                    <InstalledModelsPanel
+                      currentNode={currentNode}
+                      benchmarkingModel={benchmarkingModel}
+                      benchmarkingNodeId={benchmarkingNodeId}
+                      customPullTag={customPullTag}
+                      onCustomPullTagChange={setCustomPullTag}
+                      isPullingCustom={isPullingCustom}
+                      customPullStatus={customPullStatus}
+                      customPullPercent={customPullPercent}
+                      onDirectPull={handleDirectPull}
+                      onToggleModelEnabled={handleToggleModelEnabled}
+                      onSetAllModelsEnabled={handleSetAllModelsEnabled}
+                      onSetPrimaryModel={handleSetPrimaryModel}
+                      onRunBenchmark={handleRunBenchmark}
+                      onDeleteModel={handleDeleteModelFromNode}
+                      onToggleThinking={handleToggleThinking}
+                      onSetModelNumCtx={handleSetModelNumCtx}
+                      onInspectModel={inspectModel}
+                      inspectingModel={inspectingModel}
+                    />
+                  </>
+                ) : (
+                  <div className="h-full flex flex-col items-center justify-center text-center px-6 text-zinc-500">
+                    <p className="text-sm font-semibold text-zinc-200">Add an endpoint first</p>
+                    <p className="text-xs mt-2 max-w-sm">Installed models and benchmarks show up once a node is connected.</p>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setNodesSection('endpoints');
+                        setShowAddNode(true);
+                      }}
+                      className="mt-4 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs rounded-lg"
+                    >
+                      Add endpoint
+                    </button>
                   </div>
                 )}
-                {nodes.map(n => {
-                  const isFrontier = n.type === 'openai' || !!n.apiKey;
-                  return (
-                    <div
-                      key={n.id}
-                      onClick={() => {
-                        setSelectedNodeId(n.id);
-                        if (isNarrowHw) setMobileNodePane('detail');
-                      }}
-                      className={`p-2.5 rounded-lg cursor-pointer transition text-xs flex flex-col space-y-1 ${
-                        selectedNodeId === n.id
-                          ? 'bg-indigo-600/20 border border-indigo-500/40 text-white'
-                          : 'bg-[#18181d] border border-transparent text-zinc-300 hover:bg-[#202026]'
-                      }`}
-                    >
-                      <div className="flex items-center justify-between">
-                        <span className="font-semibold truncate">{n.name}</span>
-                        <span
-                          className={`w-2 h-2 rounded-full ${
-                            n.online ? 'bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]' : 'bg-red-500'
-                          }`}
-                        />
-                      </div>
-                      <div className="flex items-center justify-between text-[10px] text-zinc-400 font-mono gap-1">
-                        <span className="truncate flex items-center gap-1 min-w-0">
-                          {n.isDevNode && (
-                            <span className="shrink-0 text-[9px] uppercase tracking-wide text-sky-300 bg-sky-500/15 border border-sky-500/30 px-1 rounded">
-                              Dev
-                            </span>
-                          )}
-                          {n.specialty && SPECIALTY_META[n.specialty] && (
-                            <span
-                              className={`shrink-0 text-[9px] uppercase tracking-wide px-1 rounded border ${SPECIALTY_META[n.specialty].badgeClass}`}
-                              title={SPECIALTY_META[n.specialty].description}
-                            >
-                              {SPECIALTY_META[n.specialty].shortLabel}
-                            </span>
-                          )}
-                          <span className="truncate">
-                            {isFrontier
-                              ? 'Frontier API'
-                              : `${Math.max(0, +(n.hardware.vramGB - (n.hardware.reserveVramGB ?? 1)).toFixed(1))}/${n.hardware.vramGB}GB`}
-                          </span>
-                        </span>
-                        {n.online && n.latency !== null && (
-                          <span className="text-emerald-400 shrink-0">{n.latency}ms</span>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
               </div>
+            )}
 
-              <div className="space-y-1.5 pt-2 border-t border-[#27272a]">
-                <div className="grid grid-cols-2 gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => openNodesIODialog('export')}
-                    disabled={nodes.length === 0}
-                    className="py-1.5 px-1.5 border border-[#2d2d38] hover:border-indigo-500/60 text-zinc-400 hover:text-indigo-200 text-[10px] rounded-lg flex items-center justify-center space-x-1 transition disabled:opacity-40"
-                    title="Save encrypted backup of node setup (names, URLs, API keys, models prefs)"
-                  >
-                    <Download className="w-3 h-3 shrink-0" />
-                    <span>Export</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => openNodesIODialog('import')}
-                    className="py-1.5 px-1.5 border border-[#2d2d38] hover:border-indigo-500/60 text-zinc-400 hover:text-indigo-200 text-[10px] rounded-lg flex items-center justify-center space-x-1 transition"
-                    title="Restore node setup from an encrypted .enc backup"
-                  >
-                    <Upload className="w-3 h-3 shrink-0" />
-                    <span>Import</span>
-                  </button>
-                </div>
-                <button
-                  onClick={() => setShowAddNode(true)}
-                  className="w-full py-2 border border-dashed border-[#2d2d38] hover:border-indigo-500 text-zinc-400 hover:text-indigo-300 text-xs rounded-lg flex items-center justify-center space-x-1.5 transition"
-                >
-                  <Plus className="w-3.5 h-3.5" />
-                  <span>Add Node / Frontier API</span>
-                </button>
-              </div>
-            </div>
-
-            {/* Right Node Configuration Panel */}
-            <div
-              className={`${
-                isNarrowHw ? (mobileNodePane === 'detail' ? 'w-full' : 'hidden') : 'flex-1'
-              } p-4 sm:p-5 overflow-y-auto space-y-5 min-w-0`}
-            >
-              {isNarrowHw && currentNode && mobileNodePane === 'detail' && (
-                <button
-                  type="button"
-                  onClick={() => setMobileNodePane('list')}
-                  className="text-[11px] text-indigo-300 hover:text-indigo-200"
-                >
-                  ← All endpoints
-                </button>
-              )}
-              {currentNode && (
-                <>
-                  {/* Node Identity & Connection */}
-                  <div className="bg-[#121215] border border-[#272730] rounded-xl p-4 space-y-3">
-                    <div className="flex items-center justify-between gap-2 flex-wrap">
-                      <div className="flex items-center space-x-2 min-w-0 flex-wrap">
-                        <span className="text-sm font-bold text-zinc-100 truncate">{currentNode.name}</span>
-                        {currentNode.type === 'openai' ? (
-                          <span className="text-[10px] bg-sky-500/20 text-sky-300 border border-sky-500/30 px-2 py-0.5 rounded font-mono">
-                            Frontier API (OpenAI Compatible)
-                          </span>
-                        ) : (
-                          <span className="text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 px-2 py-0.5 rounded font-mono">
-                            Local Ollama Node
-                          </span>
-                        )}
-                        {currentNode.specialty && SPECIALTY_META[currentNode.specialty] && (
-                          <span
-                            className={`text-[10px] px-2 py-0.5 rounded font-mono border ${SPECIALTY_META[currentNode.specialty].badgeClass}`}
-                            title={SPECIALTY_META[currentNode.specialty].description}
-                          >
-                            {SPECIALTY_META[currentNode.specialty].label}
-                          </span>
-                        )}
-                      </div>
-
-                      <button
-                        onClick={() => handleDeleteNode(currentNode.id)}
-                        className="text-xs text-red-400 hover:text-red-300 flex items-center space-x-1 p-1"
-                        title="Delete node"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                        <span>Delete</span>
-                      </button>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-3 text-xs">
-                      <div>
-                        <label className="text-[11px] text-zinc-400 font-medium">Node Display Name</label>
-                        <input
-                          type="text"
-                          value={currentNode.name}
-                          onChange={(e) => handleUpdateNodeProp('name', e.target.value)}
-                          className="w-full mt-1 bg-[#1a1a20] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1.5 outline-none font-sans"
-                        />
-                      </div>
-                      <div>
-                        <label className="text-[11px] text-zinc-400 font-medium">Endpoint URL</label>
-                        <input
-                          type="text"
-                          value={currentNode.url}
-                          onChange={(e) => handleUpdateNodeProp('url', e.target.value)}
-                          className="w-full mt-1 bg-[#1a1a20] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1.5 outline-none font-mono text-[11px]"
-                        />
-                      </div>
-                      <div className="col-span-2">
-                        <label className="text-[11px] text-zinc-400 font-medium">Allowed Roles</label>
-                        <div className="mt-1.5 space-y-1.5 rounded border border-[#2a2a36] bg-[#1a1a20] px-2.5 py-2">
-                          <label className="flex items-start gap-2 text-[11px] text-zinc-200 cursor-pointer">
-                            <input
-                              type="checkbox"
-                              checked={isRoleAuto(currentNode)}
-                              onChange={(e) => handleSetRoleAuto(e.target.checked)}
-                              className="mt-0.5 accent-emerald-500"
-                            />
-                            <span>
-                              <span className="font-medium">Auto</span>
-                              <span className="text-zinc-500">
-                                {' '}
-                                — all roles; soft name/id preference, local-first
-                              </span>
-                            </span>
-                          </label>
-                          <div
-                            className={`grid grid-cols-2 gap-x-3 gap-y-1 pl-0.5 ${
-                              isRoleAuto(currentNode) ? 'opacity-45 pointer-events-none' : ''
-                            }`}
-                          >
-                            {allowedRoleOptions.map(opt => {
-                              // Auto: show all checked + greyed (every role allowed).
-                              const checked =
-                                isRoleAuto(currentNode) ||
-                                (currentNode.roles?.includes(opt.value) ?? false);
-                              return (
-                                <label
-                                  key={opt.value}
-                                  className={`flex items-start gap-2 text-[11px] ${
-                                    isRoleAuto(currentNode)
-                                      ? 'text-zinc-500 cursor-not-allowed'
-                                      : 'text-zinc-200 cursor-pointer'
-                                  }`}
-                                >
-                                  <input
-                                    type="checkbox"
-                                    checked={checked}
-                                    disabled={isRoleAuto(currentNode)}
-                                    onChange={(e) =>
-                                      handleToggleAllowedRole(opt.value, e.target.checked)
-                                    }
-                                    className="mt-0.5 accent-emerald-500 disabled:opacity-50"
-                                  />
-                                  <span>
-                                    <span className="font-medium">{opt.label}</span>
-                                    <span className="text-zinc-500"> — {opt.hint}</span>
-                                  </span>
-                                </label>
-                              );
-                            })}
-                          </div>
-                        </div>
-                        <p className="text-[10px] text-zinc-500 mt-1">
-                          Auto allows every role. Uncheck Auto to limit this node to selected roles —
-                          multiple nodes may share the same role. Tagged nodes are preferred for those
-                          jobs (including Frontier); otherwise routing falls back to Auto / local-first.
-                        </p>
-                      </div>
-                      <div className="col-span-2">
-                        <label className="flex items-start gap-2 text-[11px] text-zinc-300 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={!!currentNode.isDevNode}
-                            onChange={(e) => handleUpdateDevNode(e.target.checked)}
-                            className="mt-0.5 rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
-                          />
-                          <span>
-                            <span className="font-medium text-zinc-200">
-                              Dev node (workspace &amp; installs)
-                            </span>
-                            {(() => {
-                              const holder = findNodeHoldingDev(nodes, currentNode.id);
-                              if (currentNode.isDevNode) {
-                                return (
-                                  <span className="block text-[10px] text-emerald-400/90 mt-0.5">
-                                    This PC hosts the open folder, PowerShell, and package installs.
-                                    Other nodes still analyze images, review, and generate — their
-                                    file/terminal tools run here.
-                                  </span>
-                                );
-                              }
-                              if (holder) {
-                                return (
-                                  <span className="block text-[10px] text-zinc-500 mt-0.5">
-                                    Currently {holder.name}. Checking this box moves Dev here (only
-                                    one). Inference can stay on any GPU.
-                                  </span>
-                                );
-                              }
-                              return (
-                                <span className="block text-[10px] text-zinc-500 mt-0.5">
-                                  Mark where Studio and the project live. Defaults to localhost when
-                                  detectable. Remote GPUs remain full multimodal collaborators.
-                                </span>
-                              );
-                            })()}
-                          </span>
-                        </label>
-                      </div>
-                    </div>
-
-                    {/* API Key for Frontier (Gemini / Grok / OpenAI / OpenRouter) */}
-                    {(currentNode.type === 'openai' || currentNode.apiKey !== undefined) && (
-                      <div>
-                        <label className="text-[11px] text-zinc-400 font-medium flex items-center space-x-1">
-                          <Key className="w-3 h-3 text-amber-400" />
-                          <span>API Key (Google Gemini / xAI Grok / OpenAI / OpenRouter)</span>
-                        </label>
-                        <input
-                          type="password"
-                          placeholder={
-                            currentNode.url?.includes('googleapis.com')
-                              ? 'AIzaSy... (Gemini API Key)'
-                              : 'xai-... or sk-...'
-                          }
-                          value={currentNode.apiKey || ''}
-                          onChange={(e) => handleUpdateNodeProp('apiKey', e.target.value)}
-                          className="w-full mt-1 bg-[#1a1a20] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1.5 outline-none font-mono text-[11px]"
-                        />
-                        <label className="mt-2 flex items-center gap-2 text-[11px] text-zinc-300 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={!!currentNode.freeTier}
-                            onChange={(e) => handleUpdateFreeTier(e.target.checked)}
-                            className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
-                          />
-                          <span>Free tier</span>
-                        </label>
-                        {currentNode.freeTier && (
-                          <div className="mt-1.5 space-y-1.5">
-                            <label className="flex items-center gap-2 text-[10px] text-zinc-400">
-                              <span>Assist calls per day</span>
-                              <input
-                                type="number"
-                                min={1}
-                                max={500}
-                                value={currentNode.freeTierDailyCap ?? 20}
-                                onChange={e =>
-                                  handleUpdateFreeTier(true, Number(e.target.value), currentNode.freeTierRpm)
-                                }
-                                className="w-16 bg-[#1a1a20] border border-[#2a2a36] text-zinc-200 rounded px-1.5 py-0.5 outline-none font-mono"
-                              />
-                              <span>
-                                used{' '}
-                                {(() => {
-                                  const usage = currentNode.freeTierUsage;
-                                  const today = new Date();
-                                  const day = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
-                                  return usage?.day === day ? usage.count || 0 : 0;
-                                })()}{' '}
-                                today
-                              </span>
-                            </label>
-                            <label className="flex items-center gap-2 text-[10px] text-zinc-400">
-                              <span>Requests per minute (RPM)</span>
-                              <input
-                                type="number"
-                                min={1}
-                                max={60}
-                                value={currentNode.freeTierRpm ?? 10}
-                                onChange={e =>
-                                  handleUpdateFreeTier(
-                                    true,
-                                    currentNode.freeTierDailyCap,
-                                    Number(e.target.value)
-                                  )
-                                }
-                                className="w-16 bg-[#1a1a20] border border-[#2a2a36] text-zinc-200 rounded px-1.5 py-0.5 outline-none font-mono"
-                              />
-                              <span className="text-zinc-500">waits when limit hit</span>
-                            </label>
-                          </div>
-                        )}
-                        <p className="text-[10px] text-zinc-500 mt-1">
-                          Stored only on this PC under %APPDATA%\LocalAgents Studio\settings.json — never inside the EXE. Plaintext, not encrypted.
-                          {currentNode.freeTier
-                            ? ' Free tier means every model on this node is a short assist. Local GPUs still write the code. Assists pace to your RPM (default 10/min) and wait/retry on provider 429 rate limits. Used when a prompt does not fit a local context window, or several files do not fit the local reviewer.'
-                            : ''}
-                        </p>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Hardware Specs & Presets */}
-                  {currentNode.type !== 'openai' && (
-                    <div className="bg-[#121215] border border-[#272730] rounded-xl p-4 space-y-4">
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center space-x-2 text-xs font-bold text-zinc-200">
-                          <Sliders className="w-4 h-4 text-indigo-400" />
-                          <span>Compute & Memory Characteristics</span>
-                        </div>
-
-                        {currentNode.id === 'main-rig' && (
-                          <button
-                            onClick={handleDetectHardware}
-                            className="text-[11px] text-indigo-300 hover:text-white bg-indigo-600/20 hover:bg-indigo-600/40 border border-indigo-500/30 px-2.5 py-1 rounded transition"
-                          >
-                            Auto-Detect This PC's Hardware
-                          </button>
-                        )}
-                      </div>
-
-                      {/* GPU Quick Presets */}
-                      <div className="space-y-1.5">
-                        <label className="text-[11px] text-zinc-400">Apply GPU Preset:</label>
-                        <div className="flex flex-wrap gap-1.5">
-                          {GPU_PRESETS.slice(0, 10).map(p => (
-                            <button
-                              key={p.name}
-                              onClick={() => handleApplyGpuPreset(p.name)}
-                              className={`px-2 py-0.5 rounded text-[10px] border transition ${
-                                currentNode.hardware.gpu.includes(p.name)
-                                  ? 'bg-indigo-600 text-white border-indigo-500'
-                                  : 'bg-[#1a1a20] border-[#2b2b36] text-zinc-400 hover:text-zinc-200'
-                              }`}
-                            >
-                              {p.name}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-
-                      {/* Detailed Hardware Inputs */}
-                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
-                        <div>
-                          <label className="text-[11px] text-zinc-400">GPU Model</label>
-                          <input
-                            type="text"
-                            value={currentNode.hardware.gpu}
-                            onChange={(e) => handleUpdateHardware('gpu', e.target.value)}
-                            className="w-full mt-1 bg-[#1a1a20] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1 outline-none font-mono"
-                          />
-                        </div>
-                        <div>
-                          <label className="text-[11px] text-zinc-400">VRAM (GB)</label>
-                          <input
-                            type="number"
-                            value={currentNode.hardware.vramGB}
-                            onChange={(e) => handleUpdateHardware('vramGB', parseFloat(e.target.value) || 0)}
-                            className="w-full mt-1 bg-[#1a1a20] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1 outline-none font-mono"
-                          />
-                        </div>
-                        <div>
-                          <label className="text-[11px] text-zinc-400">GPU Bandwidth (GB/s)</label>
-                          <input
-                            type="number"
-                            value={currentNode.hardware.gpuBandwidthGBs}
-                            onChange={(e) => handleUpdateHardware('gpuBandwidthGBs', parseFloat(e.target.value) || 0)}
-                            className="w-full mt-1 bg-[#1a1a20] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1 outline-none font-mono"
-                          />
-                        </div>
-
-                        <div>
-                          <label className="text-[11px] text-zinc-400">System RAM (GB)</label>
-                          <input
-                            type="number"
-                            value={currentNode.hardware.ramGB}
-                            onChange={(e) => handleUpdateHardware('ramGB', parseFloat(e.target.value) || 0)}
-                            className="w-full mt-1 bg-[#1a1a20] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1 outline-none font-mono"
-                          />
-                        </div>
-                        <div>
-                          <label className="text-[11px] text-zinc-400">RAM Bandwidth (GB/s)</label>
-                          <input
-                            type="number"
-                            value={currentNode.hardware.ramBandwidthGBs}
-                            onChange={(e) => handleUpdateHardware('ramBandwidthGBs', parseFloat(e.target.value) || 0)}
-                            className="w-full mt-1 bg-[#1a1a20] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1 outline-none font-mono"
-                          />
-                        </div>
-                        <div>
-                          <label className="text-[11px] text-zinc-400">
-                            Reserved VRAM (GB)
-                            <span className="text-[10px] text-emerald-400 font-mono ml-1.5">
-                              ({Math.max(0, +(currentNode.hardware.vramGB - (currentNode.hardware.reserveVramGB ?? 1)).toFixed(1))} GB usable)
-                            </span>
-                          </label>
-                          <input
-                            type="number"
-                            step="0.1"
-                            value={currentNode.hardware.reserveVramGB}
-                            onChange={(e) => handleUpdateHardware('reserveVramGB', parseFloat(e.target.value) || 0)}
-                            className="w-full mt-1 bg-[#1a1a20] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1 outline-none font-mono"
-                          />
-                        </div>
-                      </div>
-
-                      {/* Quick OS / Display VRAM Overhead Mode Presets */}
-                      <div className="space-y-1.5 pt-1 border-t border-[#22222c]">
-                        <div className="flex items-center justify-between gap-2 flex-wrap">
-                          <label className="text-[11px] text-zinc-400">
-                            OS / Display VRAM Overhead Profile:
-                          </label>
-                          <div className="flex items-center gap-1.5 flex-wrap">
-                            {[
-                              {
-                                id: 'windows_desktop' as const,
-                                label: 'Windows Desktop (1.0 GB)',
-                                reserve: 1.0,
-                                hint: 'Primary Windows monitor connected to this GPU'
-                              },
-                              {
-                                id: 'headless_linux' as const,
-                                label: 'Headless Linux (0.2 GB)',
-                                reserve: 0.2,
-                                hint: 'Headless Linux server (e.g. GTX 1080 Ti with 10.8 GB usable VRAM)'
-                              },
-                              {
-                                id: 'igpu_display' as const,
-                                label: 'iGPU Display / 100% Dedicated (0.1 GB)',
-                                reserve: 0.1,
-                                hint: 'Windows/Linux display runs on iGPU — dGPU 100% free for Ollama (e.g. Laptop RTX 3060)'
-                              }
-                            ].map(preset => {
-                              const active =
-                                currentNode.hardware.vramOverheadMode === preset.id ||
-                                Math.abs((currentNode.hardware.reserveVramGB ?? 1) - preset.reserve) < 0.05;
-                              return (
-                                <button
-                                  key={preset.id}
-                                  type="button"
-                                  onClick={() => handleSetVramOverheadMode(preset.id)}
-                                  title={preset.hint}
-                                  className={`px-2 py-0.5 rounded text-[10px] border transition ${
-                                    active
-                                      ? 'bg-emerald-600/30 text-emerald-200 border-emerald-500/50 font-semibold'
-                                      : 'bg-[#1a1a20] border-[#2b2b36] text-zinc-400 hover:text-zinc-200'
-                                  }`}
-                                >
-                                  {preset.label}
-                                </button>
-                              );
-                            })}
-                          </div>
-                        </div>
-                        {currentNode.advisorNote && (
-                          <div className="text-[10px] text-indigo-300/90 bg-indigo-950/25 border border-indigo-500/25 rounded px-2.5 py-1.5 leading-relaxed">
-                            <strong className="text-indigo-200">Cluster Advisor:</strong> {currentNode.advisorNote}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  )}
-
-                  <InstalledModelsPanel
-                    currentNode={currentNode}
-                    benchmarkingModel={benchmarkingModel}
-                    benchmarkingNodeId={benchmarkingNodeId}
-                    customPullTag={customPullTag}
-                    onCustomPullTagChange={setCustomPullTag}
-                    isPullingCustom={isPullingCustom}
-                    customPullStatus={customPullStatus}
-                    customPullPercent={customPullPercent}
-                    onDirectPull={handleDirectPull}
-                    onToggleModelEnabled={handleToggleModelEnabled}
-                    onSetAllModelsEnabled={handleSetAllModelsEnabled}
-                    onSetPrimaryModel={handleSetPrimaryModel}
-                    onRunBenchmark={handleRunBenchmark}
-                    onDeleteModel={handleDeleteModelFromNode}
-                    onToggleThinking={handleToggleThinking}
-                    onSetModelNumCtx={handleSetModelNumCtx}
-                    onInspectModel={inspectModel}
-                    inspectingModel={inspectingModel}
-                  />
-                </>
-              )}
-              {!currentNode && (
-                <div className="h-full flex flex-col items-center justify-center text-center px-8 text-zinc-500">
-                  <Cpu className="w-10 h-10 text-indigo-400/50 mb-3" />
-                  <p className="text-sm font-semibold text-zinc-200">No endpoints configured</p>
-                  <p className="text-xs mt-2 max-w-sm leading-relaxed">
-                    Add a local Ollama node (e.g. <code className="text-indigo-300">http://127.0.0.1:11434</code>) or a Frontier API to get started.
-                  </p>
-                  <button
-                    onClick={() => setShowAddNode(true)}
-                    className="mt-4 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs rounded-lg flex items-center space-x-1.5 transition"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    <span>Add Node / Frontier API</span>
-                  </button>
-                </div>
-              )}
-
-              {!currentNode && (
-                <div className="h-full flex flex-col items-center justify-center text-center p-8 text-zinc-500">
-                  <Cpu className="w-10 h-10 text-indigo-400/40 mb-3" />
-                  <p className="text-sm font-semibold text-zinc-200">No endpoints configured</p>
-                  <p className="text-xs text-zinc-400 mt-1 max-w-sm">
-                    Connect your local Ollama instance (default: <code className="text-indigo-300">http://127.0.0.1:11434</code>) or a remote GPU endpoint to start running agents.
-                  </p>
-                  <button
-                    type="button"
-                    onClick={() => setShowAddNode(true)}
-                    className="mt-4 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium rounded-lg transition shadow flex items-center space-x-1.5"
-                  >
-                    <Plus className="w-4 h-4" />
-                    <span>Add Node / Frontier API</span>
-                  </button>
-                </div>
-              )}
-            </div>
-            </div>
+            {nodesSection === 'integrations' && (
+              <IntegrationsPanel
+                searxngUrl={searxngUrl}
+                onUpdateSearxngUrl={onUpdateSearxngUrl}
+                mcpServersJson={mcpServersJson}
+                onUpdateMcpServersJson={onUpdateMcpServersJson}
+              />
+            )}
           </div>
         )}
-        {activeTab === 'hub' && (
-          currentNode ? (
+
+        {activeTab === 'hub' &&
+          (currentNode ? (
             <ModelHubPanel
               nodes={nodes}
               currentNode={currentNode}
-              selectedNodeId={selectedNodeId}
+              selectedNodeId={selectedNodeId || currentNode.id}
               onSelectNodeId={setSelectedNodeId}
               selectedTask={selectedTask}
               onSelectTask={setSelectedTask}
@@ -1770,8 +1249,10 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
               <p className="text-sm font-semibold text-zinc-200">Add a node first</p>
               <p className="text-xs mt-2">Model Hub needs at least one endpoint to recommend pulls.</p>
               <button
+                type="button"
                 onClick={() => {
                   setActiveTab('nodes');
+                  setNodesSection('endpoints');
                   setShowAddNode(true);
                 }}
                 className="mt-4 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs rounded-lg transition"
@@ -1779,736 +1260,83 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                 Add Node
               </button>
             </div>
-          )
-        )}
+          ))}
 
-        {/* Tab 3: Appearance & Scaling */}
-        {activeTab === 'appearance' && (
-          <div className="flex-1 p-6 flex flex-col space-y-6 overflow-y-auto">
-            <div>
-              <h3 className="text-sm font-bold text-zinc-100 flex items-center space-x-2">
-                <Sliders className="w-4 h-4 text-indigo-400" />
-                <span>UI & Text Scaling</span>
-              </h3>
-              <p className="text-xs text-zinc-400 mt-1 leading-relaxed">
-                Adjust the scaling slider to make text, chat containers, and code editor comfortable on higher resolution screens (such as 1440p, 4K, or high-DPI laptops).
-              </p>
-            </div>
+        {activeTab === 'appearance' && <AppearancePanel uiScale={uiScale} onUpdateUiScale={onUpdateUiScale} />}
 
-            {/* Main Scaling Slider Box */}
-            <div className="bg-[#121215] border border-[#272730] rounded-xl p-5 space-y-4">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-zinc-200">Scale Factor</span>
-                <span className="text-sm font-bold font-mono text-indigo-400 bg-indigo-950/60 px-3 py-0.5 rounded border border-indigo-500/30">
-                  {Math.round(uiScale * 100)}%
-                </span>
-              </div>
-
-              {/* Slider */}
-              <div className="space-y-2">
-                <input
-                  type="range"
-                  min="0.75"
-                  max="1.75"
-                  step="0.05"
-                  value={uiScale}
-                  onChange={(e) => onUpdateUiScale(parseFloat(e.target.value))}
-                  className="w-full accent-indigo-500 cursor-pointer h-2 bg-[#25252e] rounded-lg"
-                />
-                <div className="flex justify-between text-[9px] sm:text-[10px] text-zinc-500 font-mono gap-1">
-                  <span>75%</span>
-                  <span className="hidden sm:inline">100%</span>
-                  <span className="sm:hidden">100%</span>
-                  <span className="hidden sm:inline">125%</span>
-                  <span>150%</span>
-                  <span>175%</span>
-                </div>
-              </div>
-
-              {/* Preset buttons */}
-              <div className="grid grid-cols-3 sm:grid-cols-6 gap-2 pt-1 text-xs">
-                {[
-                  { label: '80%', short: '80%', val: 0.8 },
-                  { label: '100% (Default)', short: '100%', val: 1.0 },
-                  { label: '115%', short: '115%', val: 1.15 },
-                  { label: '125% (HiDPI)', short: '125%', val: 1.25 },
-                  { label: '150% (4K)', short: '150%', val: 1.5 },
-                  { label: '175%', short: '175%', val: 1.75 }
-                ].map(item => (
-                  <button
-                    key={item.val}
-                    type="button"
-                    onClick={() => onUpdateUiScale(item.val)}
-                    className={`py-2 sm:py-1.5 px-2 rounded font-mono text-center transition border truncate ${
-                      Math.abs(uiScale - item.val) < 0.02
-                        ? 'bg-indigo-600 text-white border-indigo-500 font-bold shadow'
-                        : 'bg-[#18181d] text-zinc-400 hover:text-white border-[#272732] hover:bg-[#202026]'
-                    }`}
-                    title={item.label}
-                  >
-                    <span className="sm:hidden">{item.short}</span>
-                    <span className="hidden sm:inline">{item.label}</span>
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Live Interactive Preview Container */}
-            <div className="space-y-2">
-              <span className="text-xs font-semibold text-zinc-300">Live Appearance Preview</span>
-              <div className="bg-[#121215] border border-[#272730] rounded-xl p-4 space-y-3">
-                {/* Sample Chat Message */}
-                <div className="flex items-start space-x-2.5">
-                  <div className="w-6 h-6 rounded-full bg-indigo-600 flex items-center justify-center text-[10px] font-bold text-white shrink-0">
-                    AI
-                  </div>
-                  <div className="flex-1 bg-[#1e1e24] border border-[#2b2b36] rounded-lg p-3 space-y-2 text-xs leading-relaxed text-zinc-200">
-                    <p className="font-semibold text-indigo-300">Agent Conductor</p>
-                    <p>I inspected your project and generated the native application files. Here is the implementation:</p>
-                    <div className="bg-[#121215] border border-[#2a2a36] rounded p-2 font-mono text-[11px] text-zinc-400">
-                      <code>&lt;write_file path="src/main.py"&gt;</code>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="flex items-center justify-between pt-2 border-t border-[#272730] text-[11px] text-zinc-500">
-                  <span>Keyboard shortcuts: <kbd className="px-1.5 py-0.5 bg-[#1e1e24] rounded border border-[#30303c] font-mono text-zinc-300">Ctrl +</kbd> to zoom in, <kbd className="px-1.5 py-0.5 bg-[#1e1e24] rounded border border-[#30303c] font-mono text-zinc-300">Ctrl -</kbd> to zoom out, <kbd className="px-1.5 py-0.5 bg-[#1e1e24] rounded border border-[#30303c] font-mono text-zinc-300">Ctrl 0</kbd> to reset.</span>
-                  {Math.round(uiScale * 100) !== 100 && (
-                    <button
-                      type="button"
-                      onClick={() => onUpdateUiScale(1.0)}
-                      className="text-indigo-400 hover:text-indigo-300 font-medium"
-                    >
-                      Reset to 100%
-                    </button>
-                  )}
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Tab: Web Console (LAN remote UI) */}
-        {activeTab === 'remote' && (
-          <div className="flex-1 p-6 flex flex-col space-y-5 overflow-y-auto">
-            <div>
-              <h3 className="text-sm font-bold text-zinc-100 flex items-center space-x-2">
-                <Globe className="w-4 h-4 text-indigo-400" />
-                <span>Web Console</span>
-              </h3>
-              <p className="text-xs text-zinc-400 mt-1 leading-relaxed">
-                While Studio is running, open these URLs from a phone or another PC on your network to control the same
-                workspace, agents, and terminal. Off by default. Requires a password.
-              </p>
-            </div>
-
-            <div className="bg-[#121215] border border-amber-500/25 rounded-xl p-4 text-[11px] text-amber-100/90 leading-relaxed">
-              Anyone on your LAN with the password can run shell commands and edit project files on this PC. Do not enable
-              on untrusted networks. Prefer Tailscale/VPN if you need access off-LAN.
-            </div>
-
-            <div className="bg-[#121215] border border-[#272730] rounded-xl p-5 space-y-4">
-              <label className="flex items-center justify-between gap-3">
-                <div>
-                  <div className="text-xs font-semibold text-zinc-200">Enable web console</div>
-                  <div className="text-[10px] text-zinc-500">
-                    {webStatus?.listening
-                      ? `Listening · ${webStatus.clientCount || 0} client(s)`
-                      : webStatus?.hasPassword
-                        ? 'Password set · not listening'
-                        : 'Set a password, then enable'}
-                  </div>
-                </div>
-                <input
-                  type="checkbox"
-                  checked={webEnabled}
-                  disabled={webBusy}
-                  onChange={e => {
-                    const on = e.target.checked;
-                    setWebEnabled(on);
-                    void applyWebConsole({ enabled: on, port: webPort });
-                  }}
-                  className="w-4 h-4 accent-indigo-500"
-                />
-              </label>
-
-              <label className="block space-y-1.5">
-                <span className="text-[11px] text-zinc-400">Port</span>
-                <div className="flex gap-2">
-                  <input
-                    type="number"
-                    min={1024}
-                    max={65535}
-                    value={webPort}
-                    onChange={e => setWebPort(parseInt(e.target.value, 10) || 3847)}
-                    className="flex-1 bg-[#1a1a20] border border-[#2a2a36] rounded px-2.5 py-1.5 text-sm font-mono outline-none focus:border-indigo-500"
-                  />
-                  <button
-                    type="button"
-                    disabled={webBusy}
-                    onClick={() => void applyWebConsole({ enabled: webEnabled, port: webPort })}
-                    className="px-3 py-1.5 text-xs rounded bg-[#1e1e24] border border-[#2c2c36] hover:bg-[#282830] text-zinc-200"
-                  >
-                    Apply port
-                  </button>
-                </div>
-              </label>
-
-              <label className="block space-y-1.5">
-                <span className="text-[11px] text-zinc-400">
-                  {webStatus?.hasPassword ? 'Change password' : 'Set password'} (min 8 characters)
-                </span>
-                <div className="flex gap-2">
-                  <div className="relative flex-1">
-                    <input
-                      type={webShowPassword ? 'text' : 'password'}
-                      value={webPassword}
-                      onChange={e => setWebPassword(e.target.value)}
-                      placeholder={webStatus?.hasPassword ? '••••••••' : 'Choose a password'}
-                      className="w-full bg-[#1a1a20] border border-[#2a2a36] rounded px-2.5 py-1.5 pr-9 text-sm outline-none focus:border-indigo-500"
-                    />
-                    <button
-                      type="button"
-                      className="absolute right-2 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300"
-                      onClick={() => setWebShowPassword(v => !v)}
-                      tabIndex={-1}
-                    >
-                      {webShowPassword ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                    </button>
-                  </div>
-                  <button
-                    type="button"
-                    disabled={webBusy || webPassword.length < 4}
-                    onClick={() =>
-                      void applyWebConsole({
-                        enabled: webEnabled,
-                        port: webPort,
-                        password: webPassword
-                      })
-                    }
-                    className="px-3 py-1.5 text-xs rounded bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white"
-                  >
-                    Save
-                  </button>
-                </div>
-              </label>
-
-              {webNote && <p className="text-[11px] text-indigo-300">{webNote}</p>}
-            </div>
-
-            <div className="bg-[#121215] border border-[#272730] rounded-xl p-4 space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs font-semibold text-zinc-200">
-                  {webStatus?.listening ? 'Listening on' : 'Addresses (after Enable)'}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => void refreshWebConsoleStatus()}
-                  className="text-[10px] text-zinc-400 hover:text-white inline-flex items-center gap-1"
-                >
-                  <RefreshCw className="w-3 h-3" /> Refresh
-                </button>
-              </div>
-              {!webStatus?.listening && (
-                <p className="text-[11px] text-amber-200/80">
-                  Turn <span className="font-semibold">Enable web console</span> on (and keep it on). Studio must stay
-                  running — the browser talks to this PC, not a separate server.
-                </p>
-              )}
-              {(() => {
-                const list =
-                  (webStatus?.listening ? webStatus.urls : null) ||
-                  webStatus?.candidateUrls ||
-                  webStatus?.urls ||
-                  [];
-                if (list.length === 0) {
-                  return <p className="text-[11px] text-zinc-500">Set a port to preview addresses.</p>;
-                }
-                return (
-                  <ul className="space-y-1.5">
-                    {list.map(url => (
-                      <li
-                        key={url}
-                        className="flex items-center justify-between gap-2 bg-[#0e0e11] border border-[#2a2a34] rounded px-2.5 py-1.5"
-                      >
-                        <code
-                          className={`text-[11px] font-mono break-all ${
-                            webStatus?.listening ? 'text-indigo-300' : 'text-zinc-500'
-                          }`}
-                        >
-                          {url}
-                        </code>
-                        <div className="flex items-center gap-1 shrink-0">
-                          <button
-                            type="button"
-                            title="Copy"
-                            onClick={() => {
-                              void navigator.clipboard.writeText(url);
-                              setWebNote(`Copied ${url}`);
-                            }}
-                            className="p-1 text-zinc-400 hover:text-white"
-                          >
-                            <Copy className="w-3.5 h-3.5" />
-                          </button>
-                          <a
-                            href={url}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="p-1 text-zinc-400 hover:text-white"
-                            title="Open"
-                          >
-                            <ExternalLink className="w-3.5 h-3.5" />
-                          </a>
-                        </div>
-                      </li>
-                    ))}
-                  </ul>
-                );
-              })()}
-            </div>
-          </div>
-        )}
-
-        {/* Tab 4: Token Usage & Local Savings */}
         {activeTab === 'stats' && (
-          <div className="flex-1 p-6 flex flex-col space-y-6 overflow-y-auto">
-            <div className="bg-[#121215] border border-[#272730] rounded-xl p-4 space-y-2">
-              <h3 className="text-sm font-bold text-zinc-100">Local settings (not in the EXE)</h3>
-              <p className="text-xs text-zinc-400 leading-relaxed">
-                Endpoints, API keys, chats, and layout are saved per Windows user under AppData. Shipping or copying the portable EXE does not include your machine config. Use Export / Import on the Hardware Nodes tab for an encrypted node backup across rebuilds.
-              </p>
-              <code className="block text-[10px] font-mono text-indigo-300/90 break-all bg-[#0e0e11] rounded px-2 py-1.5 border border-[#2a2a34]">
-                {settingsFilePath || '%APPDATA%\\LocalAgents Studio\\settings.json'}
-              </code>
-              <code className="block text-[10px] font-mono text-indigo-300/90 break-all bg-[#0e0e11] rounded px-2 py-1.5 border border-[#2a2a34]">
-                {logsFilePath || '%APPDATA%\\LocalAgents Studio\\logs\\studio.log'}
-              </code>
-              <div className="flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => window.electronAPI?.openSettingsFolder()}
-                  className="inline-flex items-center space-x-1.5 px-2.5 py-1 text-[11px] text-zinc-200 bg-[#1e1e24] hover:bg-[#282830] border border-[#2c2c36] rounded transition"
-                >
-                  <FolderOpen className="w-3.5 h-3.5 text-indigo-400" />
-                  <span>Open settings folder</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={async () => {
-                    const res = await window.electronAPI?.readLogTail?.();
-                    const text = res?.text?.trim();
-                    if (!text) {
-                      setLogCopyNote(res?.error || 'No log yet');
-                      return;
-                    }
-                    try {
-                      await navigator.clipboard.writeText(text);
-                      setLogCopyNote('Copied recent logs');
-                    } catch {
-                      setLogCopyNote('Could not copy');
-                    }
-                    setTimeout(() => setLogCopyNote(''), 2500);
-                  }}
-                  className="inline-flex items-center space-x-1.5 px-2.5 py-1 text-[11px] text-zinc-200 bg-[#1e1e24] hover:bg-[#282830] border border-[#2c2c36] rounded transition"
-                >
-                  <span>Copy recent logs</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => window.electronAPI?.openLogsFolder?.()}
-                  className="inline-flex items-center space-x-1.5 px-2.5 py-1 text-[11px] text-zinc-200 bg-[#1e1e24] hover:bg-[#282830] border border-[#2c2c36] rounded transition"
-                >
-                  <FolderOpen className="w-3.5 h-3.5 text-amber-400" />
-                  <span>Open logs folder</span>
-                </button>
-                {logCopyNote && <span className="text-[10px] text-emerald-300">{logCopyNote}</span>}
-              </div>
-
-              <div className="mt-3 pt-3 border-t border-[#272730] space-y-2">
-                <h4 className="text-xs font-semibold text-zinc-200 flex items-center gap-1.5">
-                  <Bug className="w-3.5 h-3.5 text-rose-400" />
-                  Report error on GitHub
-                </h4>
-                <p className="text-[11px] text-zinc-500 leading-relaxed">
-                  Opens a new GitHub issue with redacted Studio logs (API keys stripped). Sign in to GitHub in your browser to submit. Attach the saved{' '}
-                  <code className="text-zinc-400">bug-report-*.txt</code> from the logs folder if needed.
-                </p>
-                <textarea
-                  value={bugReportNote}
-                  onChange={e => setBugReportNote(e.target.value)}
-                  rows={3}
-                  placeholder="What went wrong? (optional but helpful)"
-                  className="w-full text-xs bg-[#0e0e11] border border-[#2a2a34] rounded-lg px-2.5 py-2 text-zinc-200 placeholder:text-zinc-600 resize-y min-h-[64px]"
-                />
-                <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={bugReportBusy}
-                    onClick={async () => {
-                      if (!window.electronAPI?.reportLogsToGitHub) {
-                        setLogCopyNote('Update required for GitHub report');
-                        return;
-                      }
-                      setBugReportBusy(true);
-                      setLogCopyNote('');
-                      try {
-                        const res = await window.electronAPI.reportLogsToGitHub({
-                          note: bugReportNote.trim()
-                        });
-                        if (res?.error) {
-                          setLogCopyNote(res.error);
-                          return;
-                        }
-                        if (res?.logText) {
-                          try {
-                            await navigator.clipboard.writeText(res.logText);
-                          } catch {
-                            /* ignore */
-                          }
-                        }
-                        setLogCopyNote(
-                          res?.reportName
-                            ? `Issue draft opened · ${res.reportName} saved & copied`
-                            : 'Issue draft opened'
-                        );
-                        setTimeout(() => setLogCopyNote(''), 4000);
-                      } finally {
-                        setBugReportBusy(false);
-                      }
-                    }}
-                    className="inline-flex items-center space-x-1.5 px-2.5 py-1.5 text-[11px] font-medium text-white bg-rose-600/90 hover:bg-rose-500 disabled:opacity-50 border border-rose-500/40 rounded transition"
-                  >
-                    <ExternalLink className="w-3.5 h-3.5" />
-                    <span>{bugReportBusy ? 'Opening…' : 'Submit logs to GitHub'}</span>
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div className="min-w-0">
-                <h3 className="text-sm font-bold text-zinc-100">Local Agent Token Economy</h3>
-                <p className="text-xs text-zinc-400 mt-1">
-                  LocalAgents runs heavy agent loops on your local Ollama GPUs without API charges.
-                  {tokenStatsScope === 'project' && projectLabel
-                    ? ` Showing project “${projectLabel}”.`
-                    : tokenStatsScope === 'project'
-                      ? ' Open a project to track per-project tokens.'
-                      : ' Showing lifetime (global) totals.'}
-                </p>
-              </div>
-              <div className="flex flex-wrap items-center gap-2 shrink-0">
-                {onTokenStatsScopeChange && (
-                  <div
-                    role="group"
-                    aria-label="Token stats scope"
-                    className="flex items-center rounded-lg border border-[#30303a] bg-[#121215] p-0.5"
-                  >
-                    <button
-                      type="button"
-                      onClick={() => onTokenStatsScopeChange('global')}
-                      className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition ${
-                        tokenStatsScope === 'global'
-                          ? 'bg-zinc-700 text-zinc-100'
-                          : 'text-zinc-500 hover:text-zinc-300'
-                      }`}
-                    >
-                      Global
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => onTokenStatsScopeChange('project')}
-                      className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition ${
-                        tokenStatsScope === 'project'
-                          ? 'bg-zinc-700 text-zinc-100'
-                          : 'text-zinc-500 hover:text-zinc-300'
-                      }`}
-                      title={
-                        hasProject
-                          ? 'Current project totals'
-                          : 'Open a project to track per-project tokens'
-                      }
-                    >
-                      Project
-                    </button>
-                  </div>
-                )}
-                {onResetTokenStats && (
-                  <button
-                    type="button"
-                    onClick={onResetTokenStats}
-                    disabled={tokenStatsScope === 'project' && !hasProject}
-                    className="inline-flex items-center px-2.5 py-1 text-[11px] font-medium text-zinc-300 bg-[#1c1c22] hover:bg-[#272730] disabled:opacity-40 disabled:cursor-not-allowed border border-[#30303a] rounded-md transition"
-                    title={
-                      tokenStatsScope === 'project'
-                        ? 'Reset token stats for this project'
-                        : 'Reset lifetime global token stats'
-                    }
-                  >
-                    Reset
-                  </button>
-                )}
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <div className="bg-[#121215] border border-[#272730] rounded-xl p-4 space-y-1">
-                <span className="text-[11px] text-zinc-400 font-medium">Free Local Tokens Generated</span>
-                <div className="text-2xl font-bold font-mono text-emerald-400">
-                  {localTokens.toLocaleString()}
-                </div>
-                <p className="text-[10px] text-zinc-500">Processed entirely on your local GPUs</p>
-              </div>
-
-              <div className="bg-[#121215] border border-[#272730] rounded-xl p-4 space-y-1">
-                <span className="text-[11px] text-zinc-400 font-medium">Frontier Cloud Tokens Used</span>
-                <div className="text-2xl font-bold font-mono text-sky-400">
-                  {frontierTokens.toLocaleString()}
-                </div>
-                <p className="text-[10px] text-zinc-500">Grok / OpenAI / Frontier calls</p>
-              </div>
-
-              <div className="bg-[#121215] border border-emerald-500/30 bg-emerald-950/10 rounded-xl p-4 space-y-1">
-                <span className="text-[11px] text-emerald-300 font-medium">Estimated API Cost Saved</span>
-                <div className="text-2xl font-bold font-mono text-emerald-300">
-                  ${((localTokens / 1000000) * 15).toFixed(2)}
-                </div>
-                <p className="text-[10px] text-emerald-500/80">Based on standard frontier token rates</p>
-              </div>
-            </div>
-          </div>
+          <StatsPanel
+            localTokens={localTokens}
+            frontierTokens={frontierTokens}
+            tokenStatsScope={tokenStatsScope}
+            onTokenStatsScopeChange={onTokenStatsScopeChange}
+            onResetTokenStats={onResetTokenStats}
+            hasProject={hasProject}
+            projectLabel={projectLabel}
+          />
         )}
 
-        {/* Add Node Dialog */}
-        {showAddNode && (
-          <div className="absolute inset-0 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4 z-50">
-            <form
-              onSubmit={handleAddNodeSubmit}
-              className="bg-[#18181d] border border-[#30303e] rounded-xl p-5 w-full max-w-md space-y-4 shadow-2xl"
-            >
-              <div className="flex items-center justify-between">
-                <span className="text-sm font-bold text-zinc-100">Register Endpoint Node</span>
-                <button
-                  type="button"
-                  onClick={() => setShowAddNode(false)}
-                  className="p-1 text-zinc-400 hover:text-white"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-
-              <div className="space-y-3 text-xs">
-                <div>
-                  <label className="text-[11px] text-zinc-400 block mb-1.5 font-medium">Quick Presets / Templates</label>
-                  <div className="flex flex-wrap gap-1.5">
-                    {[
-                      { label: 'Google Gemini', type: 'openai' as const, name: 'Google Gemini', url: 'https://generativelanguage.googleapis.com/v1beta/openai/' },
-                      { label: 'xAI Grok', type: 'openai' as const, name: 'xAI Grok', url: 'https://api.x.ai/v1' },
-                      { label: 'OpenAI', type: 'openai' as const, name: 'OpenAI', url: 'https://api.openai.com/v1' },
-                      { label: 'OpenRouter', type: 'openai' as const, name: 'OpenRouter', url: 'https://openrouter.ai/api/v1' },
-                      { label: 'Local Ollama', type: 'ollama' as const, name: 'Local Ollama', url: 'http://localhost:11434' },
-                    ].map((preset) => (
-                      <button
-                        key={preset.label}
-                        type="button"
-                        onClick={() => {
-                          setNewNodeType(preset.type);
-                          setNewNodeName(preset.name);
-                          setNewNodeUrl(preset.url);
-                        }}
-                        className="px-2 py-1 rounded bg-[#1f1f28] hover:bg-[#2c2c3b] border border-[#2e2e3e] text-[10px] text-zinc-300 hover:text-white font-medium transition-colors"
-                      >
-                        + {preset.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div>
-                  <label className="text-[11px] text-zinc-400">Endpoint Type</label>
-                  <select
-                    value={newNodeType}
-                    onChange={(e) => setNewNodeType(e.target.value as any)}
-                    className="w-full mt-1 bg-[#121215] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1.5 outline-none"
-                  >
-                    <option value="ollama">Local / LAN Ollama Node</option>
-                    <option value="openai">Frontier API (Google Gemini, xAI Grok, OpenAI, OpenRouter)</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="text-[11px] text-zinc-400">Node Name</label>
-                  <input
-                    type="text"
-                    placeholder="e.g. Google Gemini, xAI Grok, or Linux Box 2"
-                    value={newNodeName}
-                    onChange={(e) => setNewNodeName(e.target.value)}
-                    required
-                    className="w-full mt-1 bg-[#121215] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1.5 outline-none"
-                  />
-                </div>
-
-                <div>
-                  <label className="text-[11px] text-zinc-400">URL</label>
-                  <input
-                    type="text"
-                    placeholder={
-                      newNodeType === 'openai'
-                        ? 'https://generativelanguage.googleapis.com/v1beta/openai/ or https://api.x.ai/v1'
-                        : 'http://192.168.1.xxx:11434'
-                    }
-                    value={newNodeUrl}
-                    onChange={(e) => setNewNodeUrl(e.target.value)}
-                    required
-                    className="w-full mt-1 bg-[#121215] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1.5 outline-none font-mono text-[11px]"
-                  />
-                </div>
-
-                {newNodeType === 'openai' && (
-                  <div>
-                    <label className="text-[11px] text-zinc-400">API Key</label>
-                    <input
-                      type="password"
-                      placeholder={
-                        newNodeUrl.includes('googleapis.com')
-                          ? 'AIzaSy... (Gemini API Key)'
-                          : 'xai-... or sk-...'
-                      }
-                      value={newNodeApiKey}
-                      onChange={(e) => setNewNodeApiKey(e.target.value)}
-                      className="w-full mt-1 bg-[#121215] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1.5 outline-none font-mono text-[11px]"
-                    />
-                  </div>
-                )}
-              </div>
-
-              <div className="flex items-center justify-end space-x-2 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setShowAddNode(false)}
-                  className="px-3 py-1.5 text-zinc-400 hover:text-white text-xs"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-xs font-medium"
-                >
-                  Save Node
-                </button>
-              </div>
-            </form>
-          </div>
+        {activeTab === 'remote' && (
+          <RemotePanel
+            webEnabled={webEnabled}
+            webPort={webPort}
+            webPassword={webPassword}
+            webShowPassword={webShowPassword}
+            webStatus={webStatus}
+            webBusy={webBusy}
+            webNote={webNote}
+            webNoteTone={webNoteTone}
+            lanEnabled={webLanEnabled}
+            allowShell={webAllowShell}
+            tlsCertPath={webTlsCert}
+            tlsKeyPath={webTlsKey}
+            onPortChange={setWebPort}
+            onPasswordChange={setWebPassword}
+            onToggleShowPassword={() => setWebShowPassword(v => !v)}
+            onLanEnabledChange={enabled => {
+              setWebLanEnabled(enabled);
+              void applyWebConsole({ lanEnabled: enabled });
+            }}
+            onAllowShellChange={enabled => {
+              setWebAllowShell(enabled);
+              void applyWebConsole({ allowShell: enabled });
+            }}
+            onTlsCertChange={setWebTlsCert}
+            onTlsKeyChange={setWebTlsKey}
+            onApply={patch => void applyWebConsole(patch)}
+            onRefresh={() => void refreshWebConsoleStatus()}
+            onCopied={url => note(`Copied ${url}`, 'success')}
+          />
         )}
 
-        {/* Encrypted Export / Import passphrase dialog */}
-        {nodesIOMode && (
-          <div className="absolute inset-0 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4 z-50">
-            <form
-              onSubmit={handleNodesIOSubmit}
-              className="bg-[#18181d] border border-[#30303e] rounded-xl p-5 w-full max-w-sm space-y-3.5 shadow-2xl"
-            >
-              <div className="flex items-center justify-between">
-                <div className="flex items-center space-x-2 text-sm font-bold text-zinc-100">
-                  <Lock className="w-4 h-4 text-amber-400" />
-                  <span>{nodesIOMode === 'export' ? 'Export nodes (encrypted)' : 'Import nodes (encrypted)'}</span>
-                </div>
-                <button type="button" onClick={closeNodesIODialog} className="p-1 text-zinc-400 hover:text-white">
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
+        {activeTab === 'support' && <SupportPanel />}
 
-              <p className="text-[11px] text-zinc-400 leading-relaxed">
-                {nodesIOMode === 'export'
-                  ? 'Saves node names, URLs, API keys, models prefs, roles, and benchmarks into a passphrase-locked .enc file. Layout and workspace path are not included.'
-                  : 'Decrypt a .enc backup and restore cluster nodes. Choose replace (typical after a new EXE) or merge by id/url.'}
-              </p>
-
-              <div>
-                <label className="text-[11px] text-zinc-400 font-medium">Passphrase</label>
-                <input
-                  type="password"
-                  autoFocus
-                  autoComplete="new-password"
-                  value={nodesIOPassphrase}
-                  onChange={(e) => setNodesIOPassphrase(e.target.value)}
-                  className="w-full mt-1 bg-[#121215] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1.5 outline-none text-xs"
-                  placeholder="Min. 8 characters"
-                />
-              </div>
-
-              {nodesIOMode === 'export' && (
-                <div>
-                  <label className="text-[11px] text-zinc-400 font-medium">Confirm passphrase</label>
-                  <input
-                    type="password"
-                    autoComplete="new-password"
-                    value={nodesIOConfirm}
-                    onChange={(e) => setNodesIOConfirm(e.target.value)}
-                    className="w-full mt-1 bg-[#121215] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1.5 outline-none text-xs"
-                  />
-                </div>
-              )}
-
-              {nodesIOMode === 'import' && (
-                <div className="space-y-1.5">
-                  <span className="text-[11px] text-zinc-400 font-medium">On import</span>
-                  <label className="flex items-start space-x-2 text-[11px] text-zinc-300 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="nodes-io-merge"
-                      checked={nodesIOMergeMode === 'replace'}
-                      onChange={() => setNodesIOMergeMode('replace')}
-                      className="mt-0.5"
-                    />
-                    <span>
-                      <span className="font-medium text-zinc-200">Replace all nodes</span>
-                      <span className="block text-zinc-500">Best for restore after a new build</span>
-                    </span>
-                  </label>
-                  <label className="flex items-start space-x-2 text-[11px] text-zinc-300 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="nodes-io-merge"
-                      checked={nodesIOMergeMode === 'merge'}
-                      onChange={() => setNodesIOMergeMode('merge')}
-                      className="mt-0.5"
-                    />
-                    <span>
-                      <span className="font-medium text-zinc-200">Merge by id / URL</span>
-                      <span className="block text-zinc-500">Keep existing nodes; overwrite matches</span>
-                    </span>
-                  </label>
-                </div>
-              )}
-
-              {nodesIOError && (
-                <p className="text-[11px] text-red-400 bg-red-950/30 border border-red-500/30 rounded px-2.5 py-1.5">
-                  {nodesIOError}
-                </p>
-              )}
-
-              <div className="flex items-center justify-end space-x-2 pt-1">
-                <button
-                  type="button"
-                  onClick={closeNodesIODialog}
-                  disabled={nodesIOBusy}
-                  className="px-3 py-1.5 text-zinc-400 hover:text-white text-xs disabled:opacity-50"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={nodesIOBusy || !nodesIOPassphrase}
-                  className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded text-xs font-medium flex items-center space-x-1.5"
-                >
-                  {nodesIOBusy ? <RefreshCw className="w-3 h-3 animate-spin" /> : null}
-                  <span>{nodesIOMode === 'export' ? 'Choose save location…' : 'Choose file…'}</span>
-                </button>
-              </div>
-            </form>
-          </div>
-        )}
+        <AddNodeDialog
+          open={showAddNode}
+          name={newNodeName}
+          url={newNodeUrl}
+          nodeType={newNodeType}
+          apiKey={newNodeApiKey}
+          onName={setNewNodeName}
+          onUrl={setNewNodeUrl}
+          onType={setNewNodeType}
+          onApiKey={setNewNodeApiKey}
+          onClose={() => setShowAddNode(false)}
+          onSubmit={handleAddNodeSubmit}
+        />
+        <NodesTransferDialog
+          mode={nodesIOMode}
+          passphrase={nodesIOPassphrase}
+          confirm={nodesIOConfirm}
+          mergeMode={nodesIOMergeMode}
+          busy={nodesIOBusy}
+          error={nodesIOError}
+          onPassphrase={setNodesIOPassphrase}
+          onConfirm={setNodesIOConfirm}
+          onMergeMode={setNodesIOMergeMode}
+          onClose={closeNodesIODialog}
+          onSubmit={e => void handleNodesIOSubmit(e)}
+        />
       </div>
     </div>
   );

@@ -10,6 +10,22 @@ if errorlevel 1 (
   exit /b 1
 )
 
+echo Typechecking...
+call npm run typecheck
+if errorlevel 1 (
+  echo Typecheck failed.
+  pause
+  exit /b 1
+)
+
+echo Running tests...
+call npm test
+if errorlevel 1 (
+  echo Tests failed.
+  pause
+  exit /b 1
+)
+
 echo Building UI + packaging Windows EXE...
 call npm run dist
 if errorlevel 1 (

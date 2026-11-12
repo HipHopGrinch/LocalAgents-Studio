@@ -1,6 +1,56 @@
 import { ChatEvent, PullEvent } from '../types';
 import { detectRepeatedToolTagSpam } from './agentLoop';
 
+export type StreamFailureCode = 'idle_timeout' | 'absolute_timeout' | 'stall' | 'aborted' | 'stream_error';
+
+/** Thrown when a chat stream fails. `retriable` is set for idle stalls and deadlines. */
+export class StreamChatError extends Error {
+  readonly retriable: boolean;
+  readonly code: StreamFailureCode;
+  readonly requestId: string;
+
+  constructor(
+    message: string,
+    init: { retriable: boolean; code: StreamFailureCode; requestId: string }
+  ) {
+    super(message);
+    this.name = 'StreamChatError';
+    this.retriable = init.retriable;
+    this.code = init.code;
+    this.requestId = init.requestId;
+  }
+}
+
+export function isRetriableStreamError(err: unknown): err is StreamChatError {
+  return err instanceof StreamChatError && err.retriable;
+}
+
+/**
+ * Classify a main-process chat failure. Idle / stall / absolute deadline are retriable.
+ * User abort is not a stream error — `streamChat` resolves `{ aborted: true }` and flips `handle.signal`.
+ */
+export function classifyStreamError(
+  message: string | undefined,
+  hint?: { retriable?: boolean; code?: string }
+): { retriable: boolean; code: StreamFailureCode } {
+  const code = (hint?.code || '').toLowerCase();
+  if (code === 'idle_timeout' || code === 'absolute_timeout' || code === 'stall') {
+    return { retriable: true, code };
+  }
+  const msg = message || '';
+  if (/absolute[\s_-]*timeout|deadline exceeded|exceeded the \d+ minute/i.test(msg)) {
+    return { retriable: true, code: 'absolute_timeout' };
+  }
+  if (/stall(ed)?|no (?:output|chunk|token|data)/i.test(msg)) {
+    return { retriable: true, code: 'stall' };
+  }
+  if (/idle[\s_-]*timeout|timed out|timeout/i.test(msg) && !/abort/i.test(msg)) {
+    return { retriable: true, code: 'idle_timeout' };
+  }
+  if (hint?.retriable) return { retriable: true, code: 'stall' };
+  return { retriable: false, code: 'stream_error' };
+}
+
 type ChatHandler = (e: ChatEvent) => void;
 type PullHandler = (e: PullEvent) => void;
 
@@ -20,16 +70,26 @@ const newId = (p: string) => `${p}-${Date.now().toString(36)}-${Math.random().to
 export interface ChatResult {
   content: string;
   thinking: string;
+  /** User cancel or tool-spam cut. Do not apply tool calls when this is true. */
   aborted: boolean;
   stats: ChatEvent['stats'];
   /** Stream stopped because the model repeated the same tool tag. */
   toolSpamAborted?: boolean;
+  abortReason?: 'user' | 'tool_spam';
 }
 
 export interface ChatHandle {
   requestId: string;
   done: Promise<ChatResult>;
   abort: () => void;
+  /**
+   * Aborted as soon as the user cancels (or tool-spam cuts the stream).
+   * Check `signal.aborted` before applying tool calls — the promise still resolves
+   * `{ aborted: true }` so existing callers keep working.
+   */
+  signal: AbortSignal;
+  /** Live mirror of `signal.aborted`. Timeouts reject instead of setting this. */
+  readonly aborted: boolean;
 }
 
 /** Stream chat completions through the main process (Ollama or OpenAI-compatible Frontier like Grok). */
@@ -42,11 +102,35 @@ export function streamChat(
 ): ChatHandle {
   ensureSubscribed();
   const requestId = newId('chat');
+  const abortController = new AbortController();
+  let abortedFlag = false;
+  const markAborted = () => {
+    abortedFlag = true;
+    if (!abortController.signal.aborted) abortController.abort();
+  };
   let content = '';
   let thinking = '';
   let frame = 0;
   let spamAborted = false;
   let settled = false;
+
+  const fail = (
+    reject: (err: StreamChatError) => void,
+    message: string | undefined,
+    hint?: { retriable?: boolean; code?: string }
+  ) => {
+    if (settled) return;
+    settled = true;
+    chatHandlers.delete(requestId);
+    const cls = classifyStreamError(message, hint);
+    reject(
+      new StreamChatError(message || 'Unknown error', {
+        retriable: cls.retriable,
+        code: cls.code,
+        requestId
+      })
+    );
+  };
 
   const done = new Promise<ChatResult>((resolve, reject) => {
     const settle = (result: ChatResult) => {
@@ -66,8 +150,16 @@ export function streamChat(
           if (frame) cancelAnimationFrame(frame);
           frame = 0;
           onDelta(content, thinking);
+          markAborted();
           window.electronAPI.abortStream(requestId);
-          settle({ content, thinking, aborted: true, toolSpamAborted: true, stats: {} });
+          settle({
+            content,
+            thinking,
+            aborted: true,
+            toolSpamAborted: true,
+            abortReason: 'tool_spam',
+            stats: {}
+          });
           return;
         }
         // Coalesce UI updates to one per animation frame - streaming 100+ tok/s would otherwise re-render per token
@@ -82,11 +174,17 @@ export function streamChat(
         if (frame) cancelAnimationFrame(frame);
         onDelta(content, thinking);
         if (e.type === 'done') settle({ content, thinking, aborted: false, stats: e.stats });
-        else if (e.type === 'aborted') settle({ content, thinking, aborted: true, stats: {} });
-        else {
-          settled = true;
-          chatHandlers.delete(requestId);
-          reject(new Error(e.error || 'Unknown error'));
+        else if (e.type === 'aborted') {
+          // A timeout that the main process reports as an abort is still a retriable failure.
+          const cls = classifyStreamError(e.error, { retriable: e.retriable, code: e.code });
+          if (e.error && cls.retriable) {
+            fail(reject, e.error, { retriable: true, code: cls.code });
+            return;
+          }
+          markAborted();
+          settle({ content, thinking, aborted: true, abortReason: 'user', stats: {} });
+        } else {
+          fail(reject, e.error, { retriable: e.retriable, code: e.code });
         }
       }
     });
@@ -96,7 +194,18 @@ export function streamChat(
     chatHandlers.get(requestId)?.({ requestId, type: 'error', error: String(err) });
   });
 
-  return { requestId, done, abort: () => window.electronAPI.abortStream(requestId) };
+  return {
+    requestId,
+    done,
+    signal: abortController.signal,
+    get aborted() {
+      return abortedFlag || abortController.signal.aborted;
+    },
+    abort: () => {
+      markAborted();
+      window.electronAPI.abortStream(requestId);
+    }
+  };
 }
 
 export interface PullHandle {

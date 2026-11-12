@@ -79,14 +79,14 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
         <Gauge className="w-4 h-4 text-amber-400 shrink-0" />
         <span>Installed Models & Live Token/Sec Benchmarks</span>
       </div>
-      <span className="text-[10px] text-zinc-500 shrink-0">
+      <span className="text-[11px] text-zinc-500 shrink-0">
         {currentNode.models.length} model(s) available on this host
       </span>
     </div>
 
     {generativeModels.length > 0 && onSetAllModelsEnabled && (
       <div className="flex items-center justify-between gap-2 flex-wrap rounded-lg bg-[#18181d] border border-[#282834] px-2.5 py-1.5">
-        <span className="text-[10px] text-zinc-500">
+        <span className="text-[11px] text-zinc-500">
           Enable/disable for <span className="text-zinc-300 font-medium">{currentNode.name}</span> only
           <span className="text-zinc-600"> · </span>
           {enabledCount}/{generativeModels.length} on
@@ -95,7 +95,7 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
           <button
             type="button"
             onClick={() => onSetAllModelsEnabled(currentNode, true)}
-            className="px-2 py-0.5 text-[10px] rounded border border-[#30303c] bg-[#22222a] text-zinc-300 hover:text-emerald-200 hover:border-emerald-500/40 transition"
+            className="px-2 py-0.5 text-[11px] rounded border border-[#30303c] bg-[#22222a] text-zinc-300 hover:text-emerald-200 hover:border-emerald-500/40 transition"
             title={`Select all generative models on ${currentNode.name}`}
           >
             Select all
@@ -103,7 +103,7 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
           <button
             type="button"
             onClick={() => onSetAllModelsEnabled(currentNode, false)}
-            className="px-2 py-0.5 text-[10px] rounded border border-[#30303c] bg-[#22222a] text-zinc-300 hover:text-zinc-100 hover:border-zinc-500/50 transition"
+            className="px-2 py-0.5 text-[11px] rounded border border-[#30303c] bg-[#22222a] text-zinc-300 hover:text-zinc-100 hover:border-zinc-500/50 transition"
             title={`Deselect all generative models on ${currentNode.name}`}
           >
             Deselect all
@@ -151,6 +151,12 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
                     <button
                       type="button"
                       onClick={() => onToggleModelEnabled(currentNode, m.name)}
+                      aria-pressed={!isDisabled}
+                      aria-label={
+                        isDisabled
+                          ? `Enable ${m.name} for the IDE`
+                          : `Disable ${m.name} for the IDE`
+                      }
                       title={isDisabled ? 'Model is OFF (click to enable for IDE)' : 'Model is ON (click to disable)'}
                       className={`relative inline-flex h-4 w-8 shrink-0 mt-0.5 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out ${
                         !isDisabled ? 'bg-emerald-500' : 'bg-zinc-700'
@@ -176,21 +182,21 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
 
                     <div className="flex items-center flex-wrap gap-1.5">
                       {isDisabled && (
-                        <span className="text-[9px] bg-zinc-800 text-zinc-400 px-1.5 py-0.5 rounded font-sans shrink-0">
+                        <span className="text-[11px] bg-zinc-800 text-zinc-400 px-1.5 py-0.5 rounded font-sans shrink-0">
                           Disabled
                         </span>
                       )}
 
                       {!isEmbed && !isDisabled && (
                         isPrimary ? (
-                          <span className="text-[9px] bg-indigo-500/20 text-indigo-300 border border-indigo-500/40 px-1.5 py-0.5 rounded font-sans font-semibold shrink-0">
+                          <span className="text-[11px] bg-indigo-500/20 text-indigo-300 border border-indigo-500/40 px-1.5 py-0.5 rounded font-sans font-semibold shrink-0">
                             ★ Active Node Model
                           </span>
                         ) : (
                           <button
                             type="button"
                             onClick={() => onSetPrimaryModel(currentNode, m.name)}
-                            className="text-[9px] bg-[#22222c] hover:bg-indigo-600/30 text-zinc-400 hover:text-indigo-200 border border-[#30303e] px-1.5 py-0.5 rounded font-sans transition shrink-0"
+                            className="text-[11px] bg-[#22222c] hover:bg-indigo-600/30 text-zinc-400 hover:text-indigo-200 border border-[#30303e] px-1.5 py-0.5 rounded font-sans transition shrink-0"
                             title="Use this model whenever the Conductor assigns tasks to this hardware node"
                           >
                             Set as Node Default
@@ -199,12 +205,12 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
                       )}
 
                       {isEmbed && (
-                        <span className="text-[9px] bg-purple-500/20 text-purple-300 border border-purple-500/30 px-1.5 py-0.5 rounded font-mono shrink-0">
+                        <span className="text-[11px] bg-purple-500/20 text-purple-300 border border-purple-500/30 px-1.5 py-0.5 rounded font-mono shrink-0">
                           Vector Embedding (RAG)
                         </span>
                       )}
                       {m.size > 0 && (
-                        <span className="text-[10px] text-zinc-500 font-mono shrink-0">
+                        <span className="text-[11px] text-zinc-500 font-mono shrink-0">
                           ({(m.size / 1e9).toFixed(1)} GB)
                         </span>
                       )}
@@ -215,12 +221,12 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
                 <div className="flex items-center space-x-1.5 shrink-0">
                   {bm ? (
                     bm.isEmbedding ? (
-                      <div className="flex items-center space-x-1 bg-purple-500/10 border border-purple-500/30 px-1.5 py-0.5 rounded text-[10px] font-mono text-purple-300">
+                      <div className="flex items-center space-x-1 bg-purple-500/10 border border-purple-500/30 px-1.5 py-0.5 rounded text-[11px] font-mono text-purple-300">
                         <Zap className="w-3 h-3 text-purple-400" />
                         <span>{bm.totalMs}ms</span>
                       </div>
                     ) : (
-                      <div className={`flex items-center space-x-1 px-1.5 py-0.5 rounded text-[10px] font-mono ${
+                      <div className={`flex items-center space-x-1 px-1.5 py-0.5 rounded text-[11px] font-mono ${
                         bm.provisional
                           ? 'bg-zinc-700/40 border border-zinc-600 text-zinc-300'
                           : 'bg-amber-500/10 border border-amber-500/30 text-amber-300'
@@ -230,16 +236,18 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
                       </div>
                     )
                   ) : (
-                    <span className="text-[9px] text-zinc-600 font-mono hidden sm:inline">
+                    <span className="text-[11px] text-zinc-600 font-mono hidden sm:inline">
                       —
                     </span>
                   )}
 
                   <button
+                    type="button"
                     onClick={() => onRunBenchmark(currentNode, m.name)}
                     disabled={benchmarkingModel !== null}
-                    className="flex items-center space-x-1 px-1.5 py-1 bg-[#22222a] hover:bg-indigo-600 hover:text-white text-zinc-300 border border-[#30303c] rounded text-[10px] transition disabled:opacity-50"
+                    className="flex items-center space-x-1 px-1.5 py-1 bg-[#22222a] hover:bg-indigo-600 hover:text-white text-zinc-300 border border-[#30303c] rounded text-[11px] transition disabled:opacity-50"
                     title={isEmbed ? 'Test embedding latency' : 'Benchmark tokens/sec'}
+                    aria-label={isEmbed ? `Test embedding latency for ${m.name}` : `Benchmark ${m.name}`}
                   >
                     {isBenchmarkingThis ? (
                       <RefreshCw className="w-3 h-3 animate-spin text-amber-400" />
@@ -250,9 +258,11 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
                   </button>
 
                   <button
+                    type="button"
                     onClick={() => onDeleteModel(currentNode, m.name)}
                     className="p-1 text-zinc-500 hover:text-red-400 hover:bg-[#282834] rounded transition"
                     title={`Delete ${m.name} from ${currentNode.name}`}
+                    aria-label={`Delete ${m.name} from ${currentNode.name}`}
                   >
                     <Trash2 className="w-3.5 h-3.5" />
                   </button>
@@ -324,7 +334,7 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
                           )}
                         </HelpTip>
                         {modelNativeMax != null && (
-                          <span className="text-[9px] text-zinc-500 font-normal">
+                          <span className="text-[11px] text-zinc-500 font-normal">
                             model {formatCtxLabel(modelNativeMax)}
                           </span>
                         )}
@@ -339,6 +349,7 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
                           );
                         }}
                         className="bg-[#1a1a20] border border-[#2a2a36] focus:border-indigo-500 text-zinc-200 rounded px-1.5 py-0.5 outline-none font-mono text-[11px] shrink-0"
+                        aria-label={`Maximum context for ${m.name}`}
                         title="Maximum Ollama options.num_ctx (requests use a smaller dynamic window)"
                       >
                         {options.map(sz => (
@@ -348,7 +359,7 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
                         ))}
                       </select>
                     </div>
-                    <p className={`text-[10px] font-mono leading-snug ${overMax ? 'text-amber-400' : 'text-zinc-500'}`}>
+                    <p className={`text-[11px] font-mono leading-snug ${overMax ? 'text-amber-400' : 'text-zinc-500'}`}>
                       Ceiling · {fit.label}
                       {overMax ? ' · exceeds model max' : ''}
                       {isFrontier
@@ -358,7 +369,7 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
                           : ''}
                     </p>
                     {vramFit && (
-                      <p className="text-[10px] font-mono leading-snug text-zinc-400 flex items-center flex-wrap gap-x-1.5 gap-y-0.5">
+                      <p className="text-[11px] font-mono leading-snug text-zinc-400 flex items-center flex-wrap gap-x-1.5 gap-y-0.5">
                         <span>
                           Model ~{formatGB(vramFit.weightsGB)} · Max ctx KV ~{formatGB(vramFit.kvGB)} · Total ~
                           {formatGB(vramFit.totalGB)}
@@ -381,16 +392,16 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
                     <div className="flex items-center space-x-1.5 text-[11px] text-violet-300 font-medium">
                       <Brain className="w-3.5 h-3.5 shrink-0" />
                       <span>Thinking mode</span>
-                      <span className="text-[9px] text-zinc-500 font-normal">
+                      <span className="text-[11px] text-zinc-500 font-normal">
                         (from Ollama model info)
                       </span>
                     </div>
                     {m.description && (
-                      <p className="text-[10px] text-zinc-500 mt-0.5 line-clamp-2" title={m.description}>
+                      <p className="text-[11px] text-zinc-500 mt-0.5 line-clamp-2" title={m.description}>
                         {m.description}
                       </p>
                     )}
-                    <p className="text-[10px] text-zinc-500 mt-0.5">
+                    <p className="text-[11px] text-zinc-500 mt-0.5">
                       When ON, the model reasons before answering (slower, often smarter). OFF replies faster — better for coding loops.
                     </p>
                   </div>
@@ -413,14 +424,14 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
               {/* Not yet inspected — offer to read Ollama description */}
               {!isEmbed && !supportsThink && !m.thinking && onInspectModel && (
                 <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-[#252530]">
-                  <span className="text-[10px] text-zinc-500">
+                  <span className="text-[11px] text-zinc-500">
                     Check Ollama for thinking support / description
                   </span>
                   <button
                     type="button"
                     onClick={() => onInspectModel(currentNode, m.name)}
                     disabled={inspectingModel === m.name}
-                    className="flex items-center space-x-1 px-2 py-1 text-[10px] text-zinc-400 hover:text-white border border-[#30303c] rounded transition disabled:opacity-50"
+                    className="flex items-center space-x-1 px-2 py-1 text-[11px] text-zinc-400 hover:text-white border border-[#30303c] rounded transition disabled:opacity-50"
                   >
                     {inspectingModel === m.name ? (
                       <RefreshCw className="w-3 h-3 animate-spin" />

@@ -133,6 +133,20 @@ Do NOT edit or write project files. Do not invent a new product roadmap. For Pla
   }
 ];
 
+/**
+ * Agent pane that fits a ≥320px transcript beside the 270px Conductor and
+ * 280px Node Work columns (plus the inner splitters) at 1080p.
+ */
+export const MIN_CHAT_WIDTH = 880;
+export const MAX_CHAT_WIDTH = 1600;
+export const MIN_EXPLORER_WIDTH = 160;
+export const MAX_EXPLORER_WIDTH = 540;
+
+function clampStoredWidth(value: unknown, min: number, max: number, fallback: number): number {
+  const n = typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
 export const DEFAULT_SETTINGS: AppSettings = {
   version: SETTINGS_VERSION,
   nodes: DEFAULT_NODES,
@@ -147,7 +161,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   tokenStatsScope: 'global',
   workspaceTokenUsage: {},
   explorerWidth: 240,
-  chatWidth: 640,
+  chatWidth: MIN_CHAT_WIDTH,
   agentControlWidth: 270,
   agentNodeWorkWidth: 280,
   uiScale: 1.0,
@@ -155,14 +169,17 @@ export const DEFAULT_SETTINGS: AppSettings = {
   conversations: [],
   activeConversationId: undefined,
   searxngUrl: '',
-  swarmEnabled: true,
-  autoSelectEndpoint: true,
-  autoApplyWrites: true,
-  autoReview: true,
-  cloudStrategistEnabled: true,
+  // Fresh installs only (mergeSettings(null)). A saved settings file keeps its own booleans.
+  swarmEnabled: false,
+  autoSelectEndpoint: false,
+  autoApplyWrites: false,
+  autoReview: false,
+  cloudStrategistEnabled: false,
   webConsole: {
     enabled: false,
-    port: 3847
+    port: 3847,
+    lanEnabled: false,
+    allowShell: false
   }
 };
 
@@ -204,9 +221,13 @@ export function mergeSettings(saved: Partial<AppSettings> | null): AppSettings {
       };
     }),
     conversations: Array.isArray(saved.conversations) ? saved.conversations : [],
+    explorerWidth: clampStoredWidth(saved.explorerWidth, MIN_EXPLORER_WIDTH, MAX_EXPLORER_WIDTH, 240),
+    chatWidth: clampStoredWidth(saved.chatWidth, MIN_CHAT_WIDTH, MAX_CHAT_WIDTH, MIN_CHAT_WIDTH),
     webConsole: {
       enabled: false,
       port: 3847,
+      lanEnabled: false,
+      allowShell: false,
       ...(saved.webConsole || {})
     }
   };

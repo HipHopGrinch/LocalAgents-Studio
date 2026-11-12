@@ -301,7 +301,8 @@ import {
   stepLooksLikeFixStep,
   writePlannerPlan
 } from '../lib/plannerPlan';
-import { transition } from '../lib/conductor';
+import { transition, type RunToken } from '../lib/conductor';
+import { findNodeWorkIndex, settleRunningNodeWork, upsertNodeWork } from '../lib/nodeWork';
 import {
   awaitConductorChat,
   useConductorSession,
@@ -584,8 +585,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     live: runLive,
     registerAbort,
     enter: enterConductorRun,
-    leave: leaveConductorRun,
-    stop: stopConductor
+    leave: leaveConductorSession,
+    stop: stopConductorSession
   } = conductor;
   const messagesRef = useRef<ChatMessage[]>([]);
   const continuationDepthRef = useRef(0);
@@ -617,22 +618,22 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     nodeWorkOwnedRef.current = owned;
   };
   const upsertNodeWorkStep = (step: PipelineStep, indexHint?: number) => {
+    syncNodeWork(upsertNodeWork(nodeWorkStepsRef.current, step, indexHint));
+  };
+  const settleNodeWork = (status: 'completed' | 'failed', content: string) => {
     const prev = nodeWorkStepsRef.current;
-    const key = `${step.nodeId}::${step.targetFile || step.role || ''}`;
-    const idx =
-      typeof indexHint === 'number' && indexHint >= 0
-        ? indexHint
-        : prev.findIndex(
-            s => `${s.nodeId}::${s.targetFile || s.role || ''}` === key
-          );
-    let next: PipelineStep[];
-    if (idx >= 0) {
-      next = [...prev];
-      next[idx] = { ...next[idx], ...step };
-    } else {
-      next = [...prev, step];
-    }
-    syncNodeWork(next);
+    const next = settleRunningNodeWork(prev, status, content);
+    if (next !== prev) syncNodeWork(next);
+  };
+  /** Stop and chat switches: nothing is running any more, so no card may still say it is. */
+  const stopConductor = () => {
+    stopConductorSession();
+    settleNodeWork('failed', 'Stopped');
+  };
+  /** An owned run that ends with a card still running never reported back. */
+  const leaveConductorRun = (owned: boolean, token: RunToken) => {
+    leaveConductorSession(owned, token);
+    if (owned && !heldRef.current) settleNodeWork('failed', 'Stopped before finishing');
   };
 
   const syncReworkCountsFromPlan = (plan: PlannerPlan | null | undefined) => {
@@ -3635,16 +3636,30 @@ ${instruction}`,
     setMessages(prev => (skipUserAppend ? [...prev, initialAgentMsg] : [...prev, userMsg, initialAgentMsg]));
     setIsStreaming(true);
 
+    /** This turn's Node Work card. Finish and failure update it in place, even when the target changes. */
+    let workCard: { nodeId: string; targetFile: string } | null = null;
+    let workCardSettled = false;
+    let turnError = '';
+    const workCardIndex = () =>
+      workCard ? findNodeWorkIndex(nodeWorkStepsRef.current, { ...workCard, role: '' }) : -1;
+    const settleWorkCard = (status: 'completed' | 'failed', content: string) => {
+      if (workCardSettled) return;
+      workCardSettled = true;
+      const idx = workCardIndex();
+      const card = idx >= 0 ? nodeWorkStepsRef.current[idx] : undefined;
+      // A same-node retry reuses this card and may already have finished it.
+      if (card?.status === 'running') upsertNodeWorkStep({ ...card, status, content }, idx);
+    };
     if (useFreshContext || agent.handle === 'coder' || agent.handle === 'reviewer') {
+      workCard = {
+        nodeId: routedNode.id,
+        targetFile: stepVerdictMode ? 'step verdict' : reviewMode ? 'review' : 'workspace'
+      };
       upsertNodeWorkStep({
         nodeId: routedNode.id,
         nodeName: routedNode.name,
         modelName: routedModel,
-        targetFile: stepVerdictMode
-          ? 'step verdict'
-          : reviewMode
-            ? 'review'
-            : 'workspace',
+        targetFile: workCard.targetFile,
         agentHandle: agent.handle || 'coder',
         role: `${agent.name || agent.handle} · ${routedModel}`,
         status: 'running',
@@ -4056,20 +4071,24 @@ ${instruction}`,
           .map(t => t.args?.path)
           .filter(Boolean) as string[];
         const labelPath = writePaths[0] || 'workspace';
-        upsertNodeWorkStep({
-          nodeId: routedNode.id,
-          nodeName: routedNode.name,
-          modelName: routedModel,
-          targetFile: labelPath,
-          agentHandle: agent.handle || 'coder',
-          role: `${agent.name || agent.handle} · ${routedModel}`,
-          status: 'completed',
-          content:
-            annotateAppliedWrites(tools) ||
-            (writePaths.length ? `Completed ${writePaths.join(', ')}` : displayText.slice(0, 120) || 'Done'),
-          toolCalls: tools,
-          stats
-        });
+        upsertNodeWorkStep(
+          {
+            nodeId: routedNode.id,
+            nodeName: routedNode.name,
+            modelName: routedModel,
+            targetFile: labelPath,
+            agentHandle: agent.handle || 'coder',
+            role: `${agent.name || agent.handle} · ${routedModel}`,
+            status: 'completed',
+            content:
+              annotateAppliedWrites(tools) ||
+              (writePaths.length ? `Completed ${writePaths.join(', ')}` : displayText.slice(0, 120) || 'Done'),
+            toolCalls: tools,
+            stats
+          },
+          workCardIndex()
+        );
+        workCardSettled = true;
       } else if (reviewMode || stepVerdictMode) {
         const reviewSummary = parsedVerdict
           ? `${parsedVerdict.result === 'yay' ? 'Yay' : 'Nay'}: ${(parsedVerdict.notes || '').slice(0, 160)}`
@@ -4085,7 +4104,25 @@ ${instruction}`,
           content: stripStepVerdictMarkup(reviewSummary),
           toolCalls: tools,
           stats
-        });
+        }, workCardIndex());
+        workCardSettled = true;
+      } else if (workCard) {
+        upsertNodeWorkStep(
+          {
+            nodeId: routedNode.id,
+            nodeName: routedNode.name,
+            modelName: routedModel,
+            targetFile: workCard.targetFile,
+            agentHandle: agent.handle || 'coder',
+            role: `${agent.name || agent.handle} · ${routedModel}`,
+            status: 'completed',
+            content: displayText.slice(0, 120) || 'Done',
+            toolCalls: tools,
+            stats
+          },
+          workCardIndex()
+        );
+        workCardSettled = true;
       }
 
       const turnContinueOpts = continueDecisionOpts(undefined, {
@@ -4147,6 +4184,7 @@ ${instruction}`,
       }
     } catch (err: any) {
       const errText = String(err?.message || err || '');
+      turnError = errText;
       window.electronAPI?.writeLog?.('error', `single-node ${routedNode?.name || ''}: ${errText}`);
       if (runLive(run) && !opts.retriedSame) {
         setMessages(prev =>
@@ -4179,6 +4217,7 @@ ${instruction}`,
                 : m
             )
           );
+          settleWorkCard('failed', `${errText.slice(0, 120)} · rerouted to ${fail.node.name}`);
           return runSingleNodeTurn({
             ...opts,
             run,
@@ -4206,6 +4245,9 @@ ${instruction}`,
         );
       }
     } finally {
+      if (turnError) settleWorkCard('failed', turnError.slice(0, 160));
+      else if (!runLive(run)) settleWorkCard('failed', 'Stopped');
+      else settleWorkCard('completed', 'Done');
       setIsStreaming(false);
       leaveConductorRun(entered.owned, entered.run.token);
     }

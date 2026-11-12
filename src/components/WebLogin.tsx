@@ -58,7 +58,7 @@ export const WebLogin: React.FC<WebLoginProps> = ({ onSuccess, login }) => {
             value={password}
             onChange={e => setPassword(e.target.value)}
             className="w-full bg-[#121218] border border-[#2a2a36] focus:border-indigo-500 rounded-lg px-3 py-2.5 text-sm outline-none"
-            placeholder="Password set in Hardware Settings"
+            placeholder="Password set in Hardware & Models → Web Console"
           />
         </label>
 

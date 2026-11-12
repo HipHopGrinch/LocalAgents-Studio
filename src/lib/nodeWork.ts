@@ -1,4 +1,5 @@
-import type { PipelineStep } from '../types';
+import type { ChatConversation, ChatMessage, PipelineStep } from '../types';
+import { getActiveTask, markStopped } from './executionQueue';
 
 /** Cards are matched by computer plus target (file, or the role label when there is no file). */
 export function nodeWorkKey(step: Pick<PipelineStep, 'nodeId' | 'targetFile' | 'role'>): string {
@@ -33,12 +34,52 @@ export function upsertNodeWork(
   return next;
 }
 
-/** Mark every card still running as `status`. Returns `steps` unchanged when nothing was running. */
-export function settleRunningNodeWork(
-  steps: PipelineStep[],
-  status: 'completed' | 'failed',
-  content: string
-): PipelineStep[] {
-  if (!steps.some(s => s.status === 'running')) return steps;
-  return steps.map(s => (s.status === 'running' ? { ...s, status, content } : s));
+const unfinished = (s: PipelineStep) => s.status === 'running' || s.status === 'pending';
+
+/**
+ * Fail every card that is still pending or running, for when no more work will report back.
+ * Returns `steps` unchanged when nothing was unfinished.
+ */
+export function failUnfinishedNodeWork(steps: PipelineStep[], content: string): PipelineStep[] {
+  if (!steps.some(unfinished)) return steps;
+  return steps.map(s => (unfinished(s) ? { ...s, status: 'failed' as const, content } : s));
+}
+
+const hasStaleWork = (m: ChatMessage) =>
+  !!m.pipelineSteps?.some(unfinished) || !!m.reviewPlan?.tasks.some(t => t.status === 'in_progress');
+
+/**
+ * Messages saved while a run was live, for a conversation being opened when no run can be:
+ * unfinished Swarm steps fail as Stopped, in-progress review tasks go back to pending.
+ * Returns `messages` unchanged when nothing was stale.
+ */
+export function stopUnfinishedWork(messages: ChatMessage[]): ChatMessage[] {
+  if (!messages.some(hasStaleWork)) return messages;
+  return messages.map(m => {
+    if (!hasStaleWork(m)) return m;
+    return {
+      ...m,
+      ...(m.pipelineSteps ? { pipelineSteps: failUnfinishedNodeWork(m.pipelineSteps, 'Stopped') } : {}),
+      ...(m.reviewPlan
+        ? {
+            reviewPlan: {
+              ...m.reviewPlan,
+              tasks: m.reviewPlan.tasks.map(t =>
+                t.status === 'in_progress' ? { ...t, status: 'pending' as const } : t
+              )
+            }
+          }
+        : {})
+    };
+  });
+}
+
+/** A conversation loaded from disk: its messages and its review queue, as `stopUnfinishedWork`. */
+export function stopUnfinishedConversation(conversation: ChatConversation): ChatConversation {
+  const messages = stopUnfinishedWork(conversation.messages || []);
+  const queue = conversation.executionQueue ?? null;
+  const active = getActiveTask(queue);
+  const executionQueue = queue && active ? markStopped(queue, active.id) : queue;
+  if (messages === conversation.messages && executionQueue === queue) return conversation;
+  return { ...conversation, messages, executionQueue };
 }

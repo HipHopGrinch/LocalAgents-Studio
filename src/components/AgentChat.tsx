@@ -266,6 +266,7 @@ import {
   getActiveTask,
   hasOpenTasks,
   markInProgress,
+  markStopped,
   pickNextPending,
   queueToReviewPlan
 } from '../lib/executionQueue';
@@ -302,7 +303,13 @@ import {
   writePlannerPlan
 } from '../lib/plannerPlan';
 import { transition, type RunToken } from '../lib/conductor';
-import { findNodeWorkIndex, settleRunningNodeWork, upsertNodeWork } from '../lib/nodeWork';
+import {
+  failUnfinishedNodeWork,
+  findNodeWorkIndex,
+  stopUnfinishedWork,
+  upsertNodeWork
+} from '../lib/nodeWork';
+import { isWebConsoleClient } from '../lib/hostApi';
 import {
   awaitConductorChat,
   useConductorSession,
@@ -506,6 +513,13 @@ export const AgentChat: React.FC<AgentChatProps> = ({
 
   const [input, setInput] = useState('');
   const [pendingImages, setPendingImages] = useState<string[]>([]);
+  /**
+   * Switching chats on the desktop stops our run, so nothing in the chat being opened is live.
+   * A mirror of another client's run is left as saved. App does the same for chats loaded from disk.
+   */
+  const ownsReopenedChat = () => !isWebConsoleClient() && !peerConductor?.isStreaming;
+  const reopenMessages = (saved: ChatMessage[]) =>
+    ownsReopenedChat() ? stopUnfinishedWork(saved) : saved;
   const [messages, setMessages] = useState<ChatMessage[]>(conversation?.messages || []);
   const [isStreaming, setIsStreaming] = useState(false);
   useEffect(() => {
@@ -620,20 +634,23 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const upsertNodeWorkStep = (step: PipelineStep, indexHint?: number) => {
     syncNodeWork(upsertNodeWork(nodeWorkStepsRef.current, step, indexHint));
   };
-  const settleNodeWork = (status: 'completed' | 'failed', content: string) => {
+  const failUnfinishedWork = (content: string) => {
     const prev = nodeWorkStepsRef.current;
-    const next = settleRunningNodeWork(prev, status, content);
+    const next = failUnfinishedNodeWork(prev, content);
     if (next !== prev) syncNodeWork(next);
   };
-  /** Stop and chat switches: nothing is running any more, so no card may still say it is. */
+  /** Stop and chat switches: nothing is running any more, so no card or activity may still say it is. */
   const stopConductor = () => {
     stopConductorSession();
-    settleNodeWork('failed', 'Stopped');
+    failUnfinishedWork('Stopped');
+    activityStackRef.current = [];
+    setActivityStack([]);
   };
-  /** An owned run that ends with a card still running never reported back. */
+  /** An owned run that ends with a card still pending or running never reported back. */
   const leaveConductorRun = (owned: boolean, token: RunToken) => {
+    const releasing = owned && runIsCurrent(token);
     leaveConductorSession(owned, token);
-    if (owned && !heldRef.current) settleNodeWork('failed', 'Stopped before finishing');
+    if (releasing && !heldRef.current) failUnfinishedWork('Stopped before finishing');
   };
 
   const syncReworkCountsFromPlan = (plan: PlannerPlan | null | undefined) => {
@@ -811,12 +828,21 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       setIsStreaming(false);
       resetAgentLoopBudget();
       conversationIdRef.current = nextId;
-      const nextMsgs = conversation?.messages || [];
-      skipPersistRef.current = true;
+      const savedMsgs = conversation?.messages || [];
+      const nextMsgs = reopenMessages(savedMsgs);
+      // Persist only when reopening corrected Swarm steps left running.
+      skipPersistRef.current = nextMsgs === savedMsgs;
       setMessages(nextMsgs);
       messagesRef.current = nextMsgs;
       approvedPlanRef.current = conversation?.approvedPlan ?? null;
-      executionQueueRef.current = conversation?.executionQueue ?? null;
+      const savedQueue = conversation?.executionQueue ?? null;
+      const activeQueueTask = getActiveTask(savedQueue);
+      const nextQueue =
+        savedQueue && activeQueueTask && ownsReopenedChat()
+          ? markStopped(savedQueue, activeQueueTask.id)
+          : savedQueue;
+      executionQueueRef.current = nextQueue;
+      if (nextQueue !== savedQueue) onConversationPatch?.({ executionQueue: nextQueue });
       plannerPlanRef.current = conversation?.plannerPlan ?? null;
       setPlannerPlanView(conversation?.plannerPlan ?? null);
       // Durable rework counts live on each step — seed the in-memory cache.
@@ -2086,7 +2112,14 @@ ${instruction}`,
         }));
       }
     } finally {
-      setIsStreaming(false);
+      if (!runLive(run)) {
+        setMessages(prev =>
+          prev.map(m =>
+            m.id === followUpId && m.display === followUpMsg.display ? { ...m, display: 'Stopped.' } : m
+          )
+        );
+      }
+      if (runIsCurrent(run.token) || !heldRef.current) setIsStreaming(false);
       leaveConductorRun(entered.owned, entered.run.token);
     }
   };
@@ -2203,6 +2236,22 @@ ${instruction}`,
       if (!runLive(run)) return false;
       const { idx, assignment, userPrompt, expectedFilePath } = opts;
       let { node, model, skippedReason } = assignment;
+      // Card indexes are only valid while this run's Swarm column is on screen.
+      const failWorkerCard = (content: string) =>
+        runLive(run) &&
+        upsertNodeWorkStep(
+          {
+            nodeId: node.id,
+            nodeName: node.name,
+            modelName: model,
+            targetFile: expectedFilePath,
+            agentHandle: 'coder',
+            role: `${model} (local)`,
+            status: 'failed',
+            content
+          },
+          idx
+        );
       if (!opts.retargeted) {
         const liveNode = nodesRef.current.find(n => n.id === node.id);
         const stillLive = !!liveNode?.online && getEnabledModelsForNode(liveNode).includes(model);
@@ -2234,6 +2283,7 @@ ${instruction}`,
             }
             return { ...m, pipelineSteps: updatedSteps };
           });
+          failWorkerCard(`Skipped: ${node.name} is offline or ${model} is disabled`);
           return false;
         }
         node = liveNode!;
@@ -2251,6 +2301,7 @@ ${instruction}`,
           }
           return { ...m, pipelineSteps: updatedSteps };
         });
+        failWorkerCard(`Skipped: ${skippedReason}`);
         return false;
       }
 
@@ -2318,6 +2369,7 @@ ${instruction}`,
             node.url,
             payload,
             () => {
+              if (!runLive(run)) return;
               const statusLine = `Writing \`${expectedFilePath}\`…`;
               patchPipelineMsg(m => {
                 if (!m.pipelineSteps) return m;
@@ -2519,7 +2571,7 @@ ${instruction}`,
               : m.display || `Swarm worker finished \`${expectedFilePath}\``
           };
         });
-        upsertNodeWorkStep(
+        if (runLive(run)) upsertNodeWorkStep(
           {
             nodeId: node.id,
             nodeName: node.name,
@@ -2612,6 +2664,7 @@ ${instruction}`,
             model
           };
         });
+        failWorkerCard(`Failed on ${node.name}: ${errText.slice(0, 160)}`);
         return false;
       }
     };
@@ -3426,9 +3479,26 @@ ${instruction}`,
         model: architect?.model
       });
     } finally {
-      activityStackRef.current = [];
-      setActivityStack([]);
-      setIsStreaming(false);
+      // After Stop, a newer run may own the activity stack and the streaming flag.
+      if (runIsCurrent(run.token) || !heldRef.current) {
+        activityStackRef.current = [];
+        setActivityStack([]);
+        setIsStreaming(false);
+      }
+      if (!runLive(run)) {
+        // patchPipelineMsg ignores dead runs, so the stopped state is written directly.
+        setMessages(prev =>
+          prev.map(m =>
+            m.id === agentMsgId
+              ? {
+                  ...m,
+                  display: m.error ? m.display : 'Conductor Swarm stopped.',
+                  pipelineSteps: m.pipelineSteps && failUnfinishedNodeWork(m.pipelineSteps, 'Stopped')
+                }
+              : m
+          )
+        );
+      }
     }
     } finally {
       leaveConductorRun(entered.owned, entered.run.token);
@@ -3640,6 +3710,8 @@ ${instruction}`,
     let workCard: { nodeId: string; targetFile: string } | null = null;
     let workCardSettled = false;
     let turnError = '';
+    let handedOff = '';
+    let retryBubble = '';
     const workCardIndex = () =>
       workCard ? findNodeWorkIndex(nodeWorkStepsRef.current, { ...workCard, role: '' }) : -1;
     const settleWorkCard = (status: 'completed' | 'failed', content: string) => {
@@ -4065,7 +4137,10 @@ ${instruction}`,
       }
 
       // Track ephemeral Coder/Reviewer on the Node Work column.
-      if (!readOnlyMode && (useFreshContext || agent.handle === 'coder')) {
+      if (!runIsCurrent(run.token)) {
+        // Stopped: Stop already failed this card, and the column may now belong to another chat.
+        workCardSettled = true;
+      } else if (!readOnlyMode && (useFreshContext || agent.handle === 'coder')) {
         const writePaths = tools
           .filter(t => t.name === 'write_file' || t.name === 'edit_file')
           .map(t => t.args?.path)
@@ -4187,14 +4262,16 @@ ${instruction}`,
       turnError = errText;
       window.electronAPI?.writeLog?.('error', `single-node ${routedNode?.name || ''}: ${errText}`);
       if (runLive(run) && !opts.retriedSame) {
+        retryBubble = `Retrying ${routedNode.name}…`;
         setMessages(prev =>
           prev.map(m =>
-            m.id === agentMsgId ? { ...m, display: `Retrying ${routedNode.name}…`, error: undefined } : m
+            m.id === agentMsgId ? { ...m, display: retryBubble, error: undefined } : m
           )
         );
         await new Promise(r => setTimeout(r, 400));
         if (!runLive(run)) return originOut;
-        return runSingleNodeTurn({
+        handedOff = `retried on ${routedNode.name}`;
+        return await runSingleNodeTurn({
           ...opts,
           run,
           skipUserAppend: true,
@@ -4210,15 +4287,15 @@ ${instruction}`,
           getEnabledModelsForNode(fail.node).includes(fail.model) &&
           (fail.node.id !== routedNode.id || fail.model !== routedModel)
         ) {
+          retryBubble = `Rerouting to ${fail.node.name}…`;
           setMessages(prev =>
             prev.map(m =>
-              m.id === agentMsgId
-                ? { ...m, display: `Rerouting to ${fail.node.name}…`, error: undefined }
-                : m
+              m.id === agentMsgId ? { ...m, display: retryBubble, error: undefined } : m
             )
           );
           settleWorkCard('failed', `${errText.slice(0, 120)} · rerouted to ${fail.node.name}`);
-          return runSingleNodeTurn({
+          handedOff = `rerouted to ${fail.node.name}`;
+          return await runSingleNodeTurn({
             ...opts,
             run,
             skipUserAppend: true,
@@ -4245,10 +4322,24 @@ ${instruction}`,
         );
       }
     } finally {
-      if (turnError) settleWorkCard('failed', turnError.slice(0, 160));
-      else if (!runLive(run)) settleWorkCard('failed', 'Stopped');
-      else settleWorkCard('completed', 'Done');
-      setIsStreaming(false);
+      // After Stop or a chat switch the column and streaming flag may belong to a newer turn;
+      // Stop already failed this turn's card.
+      const current = runIsCurrent(run.token);
+      if (current && !handedOff) {
+        if (!runLive(run)) settleWorkCard('failed', 'Stopped');
+        else if (turnError) settleWorkCard('failed', turnError.slice(0, 160));
+        else settleWorkCard('completed', 'Done');
+      }
+      if (retryBubble) {
+        // The retry or reroute answers in its own bubble; this one must not keep saying it is retrying.
+        const outcome = handedOff
+          ? `${routedNode.name} failed (${turnError.slice(0, 160)}) — ${handedOff}.`
+          : 'Stopped.';
+        setMessages(prev =>
+          prev.map(m => (m.id === agentMsgId && m.display === retryBubble ? { ...m, display: outcome } : m))
+        );
+      }
+      if (current || !heldRef.current) setIsStreaming(false);
       leaveConductorRun(entered.owned, entered.run.token);
     }
     return originOut;
@@ -4305,6 +4396,24 @@ ${instruction}`,
       });
     }
 
+    const activeTaskId = task.id;
+    const taskConversationId = conversationIdRef.current;
+    const stoppedMidTask = () => {
+      if (!stopRequestedRef.current) return false;
+      // After a chat switch the queue ref holds the other chat's tasks.
+      if (conversationIdRef.current !== taskConversationId) return true;
+      const q = executionQueueRef.current;
+      const next = q ? markStopped(q, activeTaskId) : q;
+      if (next && next !== q) {
+        commitExecutionQueue(next);
+        if (planMsg) {
+          const snap = queueToReviewPlan(next);
+          setMessages(prev => prev.map(m => (m.id === planMsg.id ? { ...m, reviewPlan: snap } : m)));
+        }
+      }
+      return true;
+    };
+
     const singlePlan = formatActiveTaskForPlanner(queue, task, reviewNotes);
     const openLeft = queue.tasks.filter(
       t => t.status === 'pending' || t.status === 'failed'
@@ -4340,7 +4449,7 @@ ${instruction}`,
         plannerPrompt,
         { approvedPlan: syntheticPlan, skipUserAppend: true }
       );
-      if (!stopRequestedRef.current) {
+      if (!stoppedMidTask()) {
         await reviewAndAdvance(depth + 1, `Task #${task.id}: ${task.title}`);
       }
       return;
@@ -4357,7 +4466,7 @@ ${instruction}`,
       notice: `Planner locking fix contract — task #${task.id}`
     });
 
-    if (stopRequestedRef.current) return;
+    if (stoppedMidTask()) return;
 
     const plannerBrief = extractFixContractBrief(
       plannerMsg?.raw || '',
@@ -4386,7 +4495,7 @@ ${instruction}`,
       notice: `Coder implementing task #${task.id}`,
       freshContext: true
     });
-    if (!stopRequestedRef.current) {
+    if (!stoppedMidTask()) {
       await reviewAndAdvance(depth + 1, `Task #${task.id}: ${task.title}`);
     }
     restorePlannerControl();
@@ -5662,6 +5771,16 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       `Escalating step #${stuck.id}`,
       `${reworkCount} Nays → Planner fix steps`
     );
+    const escalationFrame = activityStackRef.current[activityStackRef.current.length - 1];
+    const escalationConversationId = conversationIdRef.current;
+    const escalationRun = runRef.current;
+    /** A Send after Stop clears the stop flag; that newer run now owns the plan controls. */
+    const newerRunHolds = () => heldRef.current && runRef.current !== escalationRun;
+    /** Stop clears the stack, and a newer run may have pushed its own frame since. */
+    const endEscalationActivity = () => {
+      const stack = activityStackRef.current;
+      if (stack[stack.length - 1] === escalationFrame) endActivity();
+    };
     setExecutingPlanNotice(
       `Step #${stuck.id} hit ${reworkCount} Nays — Planner appending fix steps…`
     );
@@ -5689,7 +5808,14 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       freshContext: true
     });
 
-    if (stopRequestedRef.current) {
+    if (
+      stopRequestedRef.current ||
+      (escalationRun && !runIsCurrent(escalationRun.token)) ||
+      newerRunHolds() ||
+      conversationIdRef.current !== escalationConversationId
+    ) {
+      endEscalationActivity();
+      if (conversationIdRef.current !== escalationConversationId || newerRunHolds()) return;
       setPlanPaused(true);
       setPlanResumePhase('coder');
       restorePlannerControl(
@@ -5725,7 +5851,10 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     }
 
     plan = plannerPlanRef.current;
-    if (!plan) return;
+    if (!plan) {
+      endEscalationActivity();
+      return;
+    }
     const before = plan.steps.length;
     plan = insertFixStepsAfter(
       plan,
@@ -5735,7 +5864,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     );
     if (plan.steps.length === before) {
       // Title already on the plan (e.g. "Core game logic … fix") — heal in place.
-      endActivity();
+      endEscalationActivity();
       commitPlannerPlan({
         ...plannerPlanRef.current!,
         blockedReason: `Heal needed on step #${stuck.id} — a new Fix step would duplicate work already on the plan.`,
@@ -5750,7 +5879,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       return;
     }
     commitPlannerPlan(plan);
-    endActivity();
+    endEscalationActivity();
 
     const next = getActiveStep(plan);
     setExecutingPlanNotice(
@@ -7341,8 +7470,12 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
   const latestAssistant = [...messages].reverse().find(m => m.role === 'assistant');
   const peerStreaming = !!(peerConductor?.isStreaming && !isStreaming);
   const localActivityLabel = activityLabelOf(activityStack);
+  // A plan notice stays on the banner after a run ends or pauses; it only means "busy" while a run holds the lock.
   const showStreamingUi =
-    isStreaming || peerStreaming || !!localActivityLabel || !!executingPlanNotice;
+    isStreaming ||
+    peerStreaming ||
+    !!localActivityLabel ||
+    (!!executingPlanNotice && heldRef.current);
   const runStatus = describeRunStatus({
     steps: nodeWorkSteps,
     activityLabel: localActivityLabel,

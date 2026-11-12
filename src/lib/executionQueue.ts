@@ -89,6 +89,13 @@ export function markInProgress(queue: ExecutionQueue, taskId: string): Execution
   return touch(setStatus(queue, taskId, 'in_progress'), { activeTaskId: taskId });
 }
 
+/** Stop: the task goes back to pending but stays active, so Resume picks it up again. */
+export function markStopped(queue: ExecutionQueue, taskId: string): ExecutionQueue {
+  const task = queue.tasks.find(t => t.id === taskId);
+  if (task?.status !== 'in_progress') return queue;
+  return setStatus(queue, taskId, 'pending');
+}
+
 export function markCompleted(queue: ExecutionQueue, taskId: string): ExecutionQueue {
   const next = setStatus(queue, taskId, 'completed');
   return touch(next, {

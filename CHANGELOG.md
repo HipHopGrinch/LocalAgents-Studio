@@ -2,6 +2,12 @@
 
 All notable changes to LocalAgents Studio are listed here. Older releases are summarized in [`AGENTS.md`](AGENTS.md) §6 and the [wiki](https://github.com/HipHopGrinch/LocalAgents-Studio/wiki/Whats-new).
 
+## Unreleased
+
+### Fixed
+
+- **Review fixes, plan option picks, "Retry differently" and the paid-API solution kept running after Stop, or ran inside a new message.** Each of these runs a Planner or Coder turn and then a review, but each turn started its own run. A Send made between the turns cleared Stop, and the next turn then ran as part of that new message. When they ran inside another run, they could also cancel a Stop pressed just before. They now hold one run from start to finish, so Stop ends them and a new Send never picks them up.
+
 ## 1.3.1 — 2026-11-11
 
 Bug-fix release: Studio no longer shows work as still running after it has finished, failed, or been stopped. See [PR #5](https://github.com/HipHopGrinch/LocalAgents-Studio/pull/5).

@@ -4352,9 +4352,15 @@ ${instruction}`,
   const sendReviewPlanToPlanner = async (
     planMsg?: ChatMessage | null,
     resumeDepth?: number,
-    reviewNotes?: string
-  ) => {
+    reviewNotes?: string,
+    parent?: ConductorRun | null
+  ): Promise<void> => {
     if (planMsg?.reviewSentToCoder && !executionQueueRef.current) return;
+    const entered = bindRun(parent ?? null, !parent);
+    if (!entered) return;
+    const run = entered.run;
+    try {
+    if (!runLive(run)) return;
 
     const depth =
       resumeDepth ?? pendingReviewResumeRef.current?.depth ?? 0;
@@ -4371,7 +4377,7 @@ ${instruction}`,
     if (!task || task.status === 'completed') {
       const next = pickNextPending(queue);
       if (!next) {
-        if (autoReviewRef.current) await decideNextStepAndAdvance(depth, '');
+        if (autoReviewRef.current) await decideNextStepAndAdvance(depth, '', run);
         return;
       }
       queue = markInProgress(queue, next.id);
@@ -4399,7 +4405,7 @@ ${instruction}`,
     const activeTaskId = task.id;
     const taskConversationId = conversationIdRef.current;
     const stoppedMidTask = () => {
-      if (!stopRequestedRef.current) return false;
+      if (runLive(run)) return false;
       // After a chat switch the queue ref holds the other chat's tasks.
       if (conversationIdRef.current !== taskConversationId) return true;
       const q = executionQueueRef.current;
@@ -4421,7 +4427,6 @@ ${instruction}`,
 
     onSelectAgent(plannerAgent.id);
     resetAgentLoopBudget();
-    stopRequestedRef.current = false;
 
     const plannerPrompt = formatReviewPlanForPlanner(
       singlePlan,
@@ -4447,10 +4452,10 @@ ${instruction}`,
       await handleSendPipelineMessage(
         `Review fix task #${task.id}: ${task.title}`,
         plannerPrompt,
-        { approvedPlan: syntheticPlan, skipUserAppend: true }
+        { approvedPlan: syntheticPlan, skipUserAppend: true, run }
       );
       if (!stoppedMidTask()) {
-        await reviewAndAdvance(depth + 1, `Task #${task.id}: ${task.title}`);
+        await reviewAndAdvance(depth + 1, `Task #${task.id}: ${task.title}`, run);
       }
       return;
     }
@@ -4463,7 +4468,8 @@ ${instruction}`,
       reviewMode: false,
       contractMode: true,
       skipUserAppend: true,
-      notice: `Planner locking fix contract — task #${task.id}`
+      notice: `Planner locking fix contract — task #${task.id}`,
+      run
     });
 
     if (stoppedMidTask()) return;
@@ -4493,12 +4499,16 @@ ${instruction}`,
       contractMode: false,
       approvedPlan: approvedPlanRef.current,
       notice: `Coder implementing task #${task.id}`,
-      freshContext: true
+      freshContext: true,
+      run
     });
     if (!stoppedMidTask()) {
-      await reviewAndAdvance(depth + 1, `Task #${task.id}: ${task.title}`);
+      await reviewAndAdvance(depth + 1, `Task #${task.id}: ${task.title}`, run);
     }
-    restorePlannerControl();
+    if (runIsCurrent(run.token) || !heldRef.current) restorePlannerControl();
+    } finally {
+      leaveConductorRun(entered.owned, run.token);
+    }
   };
 
   /** User approved a clean review — resume next-step continuation. */
@@ -4547,7 +4557,7 @@ ${instruction}`,
 
     // Legacy flat queue still has work — Planner dispatches; do not invent a new feature step.
     if (hasOpenTasks(executionQueueRef.current)) {
-      await sendReviewPlanToPlanner(null, depth);
+      await sendReviewPlanToPlanner(null, depth, undefined, run);
       return;
     }
 
@@ -5185,7 +5195,8 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
           await sendReviewPlanToPlanner(
             latestReview ? { ...latestReview, reviewPlan: snap } : null,
             depth,
-            after?.failureNote
+            after?.failureNote,
+            run
           );
           return;
         }
@@ -5199,7 +5210,7 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
       if (completed) {
         if (hasOpenTasks(updated)) {
           if (autoReviewRef.current) {
-            await sendReviewPlanToPlanner(null, depth);
+            await sendReviewPlanToPlanner(null, depth, undefined, run);
             return;
           }
           pendingReviewResumeRef.current = { depth, previousTask };
@@ -5256,7 +5267,7 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
         : null;
 
       if (autoReviewRef.current) {
-        await sendReviewPlanToPlanner(planMsg, depth);
+        await sendReviewPlanToPlanner(planMsg, depth, undefined, run);
         return;
       }
       pendingReviewResumeRef.current = { depth, previousTask };
@@ -6761,8 +6772,14 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
     option: PlanOption,
     planMsg: ChatMessage,
     confirmationText: string,
-    attachedImages: string[] = []
-  ) => {
+    attachedImages: string[] = [],
+    parent?: ConductorRun | null
+  ): Promise<void> => {
+    const entered = bindRun(parent ?? null, !parent);
+    if (!entered) return;
+    const run = entered.run;
+    try {
+    if (!runLive(run)) return;
     const original = findPlanOriginalRequest(messagesRef.current, planMsg);
     const approved = buildApprovedPlan(planMsg, option, original);
     approvedPlanRef.current = approved;
@@ -6808,7 +6825,6 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
     });
 
     resetAgentLoopBudget();
-    stopRequestedRef.current = false;
 
     const lockPrompt = `${formatApprovedPlanContext(approved)}
 
@@ -6827,10 +6843,11 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       agent: plannerAgent,
       lockPlanMode: true,
       skipUserAppend: true,
-      notice: `Planner writing steps for Option ${option.id}`
+      notice: `Planner writing steps for Option ${option.id}`,
+      run
     });
 
-    if (stopRequestedRef.current) return;
+    if (!runLive(run)) return;
 
     const raw = lockMsg?.raw || '';
     let parsed = parseExecutionPlan(raw);
@@ -6867,12 +6884,16 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       plan = { ...plan, delivery: approved.delivery, updatedAt: Date.now() };
     }
     plan = activateNextStep(plan);
-    commitPlannerPlan(plan);
+    await commitPlannerPlan(plan, run.token);
+    if (!runLive(run)) return;
     setExecutingPlanNotice(
       `Plan locked (${plan.steps.length} steps) — dispatching next step…`
     );
 
     await dispatchActiveStep();
+    } finally {
+      leaveConductorRun(entered.owned, run.token);
+    }
   };
 
   /** User chose "Retry differently" after the stuck ladder — one more local attempt, new approach. */
@@ -6884,10 +6905,13 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       setExecutingPlanNotice('No local model online to retry.');
       return;
     }
+    const entered = bindRun(null, true);
+    if (!entered) return;
+    const run = entered.run;
+    try {
     stuckRef.current = { key: stuckKey(cleaned), stage: 'big' };
     setExecutingPlanNotice(`Retrying differently on ${big.node.name} · ${big.model}`);
     resetAgentLoopBudget();
-    stopRequestedRef.current = false;
     await runSingleNodeTurn({
       userText: `Retry differently: ${cleaned}`,
       fullPrompt: `You already repeated this step without finishing it. Do NOT repeat the same approach.\n\nEither:\n1) Implement a concrete different fix with <edit_file> / <write_file>, or\n2) Stop and state what is blocking in one short sentence.\n\nStuck step:\n${cleaned}`,
@@ -6896,14 +6920,22 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       reviewMode: false,
       approvedPlan: approvedPlanRef.current,
       notice: `Stuck retry (different approach) on ${big.node.name} · ${big.model}`,
-      pinRoute: big
+      pinRoute: big,
+      run
     });
-    if (!stopRequestedRef.current) await reviewAndAdvance(0, cleaned);
+    if (runLive(run)) await reviewAndAdvance(0, cleaned, run);
+    } finally {
+      leaveConductorRun(entered.owned, run.token);
+    }
   };
 
   const confirmPaidAssist = async (task: string) => {
     const paid = pickPaidFrontier(nodesRef.current);
     if (!paid || !task.trim()) return;
+    const entered = bindRun(null, true);
+    if (!entered) return;
+    const run = entered.run;
+    try {
     setIsStreaming(true);
     setExecutingPlanNotice(`Asking ${paid.node.name} · ${paid.model}…`);
     let brief: string | null = null;
@@ -6912,14 +6944,16 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         paid,
         'The local models are repeating this step and not fixing it. Give one short solution. Do not rewrite the file.',
         `${progressForPrompt()}\n\nStuck step:\n${task}`,
-        false
+        false,
+        run
       );
     } catch (err: any) {
       window.electronAPI?.writeLog?.('warn', `paid stuck: ${err?.message || err}`);
     }
-    if (!brief || stopRequestedRef.current) {
+    if (!runLive(run)) return;
+    if (!brief) {
       setIsStreaming(false);
-      setExecutingPlanNotice(brief ? null : 'The paid API did not return a solution.');
+      setExecutingPlanNotice('The paid API did not return a solution.');
       return;
     }
     const stamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -6955,10 +6989,15 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       approvedPlan: approvedPlanRef.current,
       notice: `Applying the paid solution on ${big.node.name} · ${big.model}`,
       pinRoute: big,
-      freshContext: true
+      freshContext: true,
+      run
     });
-    if (!stopRequestedRef.current) await reviewAndAdvance(0, brief);
-    restorePlannerControl();
+    if (runLive(run)) await reviewAndAdvance(0, brief, run);
+    if (runIsCurrent(run.token) || !heldRef.current) restorePlannerControl();
+    } finally {
+      if (runIsCurrent(run.token) || !heldRef.current) setIsStreaming(false);
+      leaveConductorRun(entered.owned, run.token);
+    }
   };
 
   const handleSelectPlanOption = (option: PlanOption, planMsg: ChatMessage) => {
@@ -6966,7 +7005,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       void navigator.clipboard.writeText(option.description);
       return;
     }
-    if (isStreaming || planMsg.selectedPlanOptionId) return;
+    if (isStreaming || heldRef.current || planMsg.selectedPlanOptionId) return;
     if (option.action === 'paid') {
       setMessages(prev =>
         prev.map(m => (m.id === planMsg.id ? { ...m, selectedPlanOptionId: option.id } : m))
@@ -7062,7 +7101,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
     if (pendingPlan?.planOptions?.length) {
       const matched = matchPlanOption(userText, pendingPlan.planOptions);
       if (matched) {
-        return await executeChosenPlan(matched, pendingPlan, userText, attachedImages);
+        return await executeChosenPlan(matched, pendingPlan, userText, attachedImages, enteredSend.run);
       }
     }
 

@@ -4,7 +4,7 @@
 >
 > **Repo:** https://github.com/HipHopGrinch/LocalAgents-Studio  
 > **Wiki / What’s new:** https://github.com/HipHopGrinch/LocalAgents-Studio/wiki  
-> **Latest release (as of this briefing):** **1.2.26**  
+> **Current version (as of this briefing):** **1.3.0** (see [`CHANGELOG.md`](CHANGELOG.md))  
 > **Discord:** https://discord.gg/ZVkmUfXwW
 
 This document is the fast path from zero → productive. It covers *why the product exists*, *what was built in order*, *where the code lives*, *how the reference cluster is supposed to behave*, and *how we ship*.
@@ -156,6 +156,15 @@ From an external pitfalls review (16 items), landed:
 ### Patch (1.2.26)
 Local Ollama **Bench** broke after 1.2.24 dropped the `url` binding used by `/api/generate` and `/api/embed`. Restored in 1.2.26.
 
+### 2026-11 codebase audit (1.3.0)
+An 84-item audit (UX, FLOW, MODEL, CTX, PLAT) plus two independent review passes (28 more fixes). Full list in [`CHANGELOG.md`](CHANGELOG.md).
+
+- **Security:** web console localhost-by-default with TLS-only LAN, first-message WS auth, Origin check, RPC allowlist (shell-type calls need desktop **Allow shell**); `safeStorage` API keys; realpath workspace jail; main-process command denylist + timeouts; hardened in-app git (`electron/gitGuard.cjs`); IPC sender checks; production CSP without `unsafe-eval`; Electron 45.3.0 with ASAR integrity / OnlyLoadAppFromAsar fuses.
+- **Conductor:** `ConductorSession` run tokens + lock (`src/hooks/useConductorSession.ts`, `src/lib/conductor.ts`); explicit Pass/Fail required; bounded heal; truncated writes rejected; verify via project or bundled `tsc` (never `npx`, never auto `npm install`); per-step Skip/Edit/Retry/Undo.
+- **Models & context:** one pinned `num_ctx` per model, role output budgets, `keep_alive` + warm-up, stable system prefix + volatile user block, lean Swarm worker prompts, fit-aware routing/failover, persisted token calibration (`src/components/agent/modelRequest.ts`).
+- **UX:** Hardware modal split into `src/components/hardware/*`, Ctrl+K palette, memoized message list, first-run checklist, Automation drawer, context meter, specific status line, keyboard splitters, inline `ErrorCard`s.
+- **Engineering:** CI, `build-exe.yml` branch exe artifacts, `npm test` selftest runner, ESLint, `npm run release`.
+
 ---
 
 ## 6. Release ladder (recent) — skim this first
@@ -164,6 +173,7 @@ Full notes: [Wiki → What’s new](https://github.com/HipHopGrinch/LocalAgents-
 
 | Ver | Theme |
 |-----|--------|
+| **1.3.0** | 2026-11 audit: security hardening, Conductor run control + gates, pinned context / model efficiency, chat UX, CI + exe builds, Electron 45 |
 | **1.2.26** | Fix local benchmark `url is not defined` |
 | **1.2.25** | Smart Cluster Auto-Configure + Cloud Strategist Pass-1 + wave load-balance |
 | **1.2.24** | Sandbox, web console secrets, MCP framing, terminal isolation, atomic writes |

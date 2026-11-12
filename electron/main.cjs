@@ -2709,6 +2709,7 @@ function runPowerShell(command, cwd, { timeoutMs = 0, echo = true, capture = fal
       if (timer) clearTimeout(timer);
       if (idleTimer) clearTimeout(idleTimer);
       bucket.delete(proc);
+      send('terminal:state', { running: activeProcCount() > 0 });
       resolve({ code: -1, output: output + err.message, timedOut });
     });
     send('terminal:state', { running: true });

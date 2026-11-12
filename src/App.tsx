@@ -47,6 +47,7 @@ import {
   upsertConversation
 } from './lib/conversations';
 import { isWebConsoleClient } from './lib/hostApi';
+import { stopUnfinishedConversation } from './lib/nodeWork';
 
 /** Token totals mirrored from the desktop live session onto the web console. */
 type SessionTokenMirror = {
@@ -731,7 +732,10 @@ export const App: React.FC = () => {
           workspacePath
         }));
         const fromSettings = conversationsForWorkspace(prev.conversations, workspacePath);
-        let forWs = fromDisk.length ? fromDisk : fromSettings;
+        // A freshly opened project has no live run; work saved mid-run reads as stopped (web clients mirror as-is).
+        let forWs = (fromDisk.length ? fromDisk : fromSettings).map(c =>
+          isWebConsoleClient() ? c : stopUnfinishedConversation(c)
+        );
         let active = loaded.activeConversationId || undefined;
         if (wantNewChat) {
           const fresh = createConversation(workspacePath, selectedAgentId);
@@ -1033,6 +1037,8 @@ export const App: React.FC = () => {
           (m, i) =>
             m.id === messages[i]?.id &&
             m.display === messages[i]?.display &&
+            m.pipelineSteps === messages[i]?.pipelineSteps &&
+            m.reviewPlan === messages[i]?.reviewPlan &&
             m.selectedPlanOptionId === messages[i]?.selectedPlanOptionId &&
             m.chosenPlanOptionId === messages[i]?.chosenPlanOptionId
         )

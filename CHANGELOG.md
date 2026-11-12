@@ -2,6 +2,26 @@
 
 All notable changes to LocalAgents Studio are listed here. Older releases are summarized in [`AGENTS.md`](AGENTS.md) §6 and the [wiki](https://github.com/HipHopGrinch/LocalAgents-Studio/wiki/Whats-new).
 
+## 1.3.1 — 2026-11-11
+
+Bug-fix release: Studio no longer shows work as still running after it has finished, failed, or been stopped. See [PR #5](https://github.com/HipHopGrinch/LocalAgents-Studio/pull/5).
+
+### Fixed
+
+- **Node Work card stuck on "running · working" after a turn finished.** A turn's card was filed under `workspace` when it started and under the file it wrote when it finished, so a second card appeared and the first never ended. The turn now updates its own card and always ends it as done, failed, or stopped. This was the visible symptom after a Frontier model finished a task.
+- **Retries and reroutes ran in the background.** When a request failed and Studio retried it or moved it to another computer, the turn was treated as over while the retry was still generating. Stop turned back into Send, the run lock was released early, and the card was marked failed. The retry is now awaited.
+- **"Retrying …" and "Rerouting to …" stayed on screen.** The first message now says what happened (for example "Main Rig failed (…) — rerouted to Laptop.").
+- **Swarm after Stop.** The message no longer stays on "Pass 1 — Lead Architect … is locking the shared TypeScript contract…", and file cards that had not started are marked Stopped instead of "waiting…".
+- **Swarm files that were skipped or failed.** A file skipped because its computer went offline, or one that failed after a retry, no longer leaves its Node Work card waiting or running through the rest of the run.
+- **Stop and chat switches clean up.** Any Node Work card still pending or running is marked Stopped, and the activity indicator clears. A run that ends with cards still open marks them "Stopped before finishing".
+- **A late finish from a stopped run no longer clears the next one.** Work that was still finishing (a command, a typecheck) after Stop could clear the Stop button and activity of a run you had just started.
+- **Spinner and disabled Play after a run ended.** A leftover plan notice kept the activity indicator moving and the plan's Play button disabled until the notice was dismissed. The notice now only counts as busy while a run is active.
+- **Planner escalation after Stop or a chat switch** left "Escalating step #N" on screen, and could change the plan in the chat you switched to.
+- **Tool follow-up message after Stop** kept its placeholder ("Analyzed project files. Now generating implementation...") and now says "Stopped."
+- **Review-fix task stuck on IN PROGRESS after Stop.** It goes back to pending and stays selected, so Resume picks it up.
+- **Chats reopened after a stop or after restarting Studio** showed Swarm steps still running and review tasks in progress. They now read Stopped and pending. Step and review-task status changes are also saved now; before, they were dropped when nothing else in the message changed.
+- **Terminal pane stuck on "Running"** when a command failed to start.
+
 ## 1.3.0 — 2026-11-11
 
 This release implements the November 2026 codebase audit: 84 findings across UI/UX (UX-*), Conductor flow (FLOW-*), model management (MODEL-*), context use (CTX-*), and platform/security (PLAT-*). Two independent review passes then found 28 more issues, and those are fixed too. See [PR #2](https://github.com/HipHopGrinch/LocalAgents-Studio/pull/2).

@@ -46,12 +46,12 @@ A fresh install starts with no nodes. Add your machines in **Hardware & Models �
 
 ### Live Benchmarking
 - In **Hardware & Models**, click **Benchmark** next to any installed model.
-- Warms the model at its real context size, then measures generation tok/s, prompt tok/s, load time, and time to first token.
+- Warms the model at its real context size, then measures generation tok/s, prompt tok/s, and load time. Cloud benchmarks also record time to first token.
 - Seeded speeds show as **(estimate)** until you benchmark. Live results drive routing.
 
 ### Hybrid Local + Frontier API Support
 - Route routine coding to local GPUs; optionally send planning, audits, or hard heals to Gemini / Grok / OpenAI / OpenRouter.
-- Enter an API key in **Hardware & Models → Endpoints**. Keys are encrypted with the Windows keychain in `%APPDATA%\LocalAgents Studio\settings.json` on that PC (never baked into the EXE). Still, don't commit or share that file.
+- Enter an API key in **Hardware & Models → Endpoints**. Keys are stored in `%APPDATA%\LocalAgents Studio\settings.json` on that PC (never baked into the EXE), encrypted with the Windows keychain when it is available. Don't commit or share that file.
 
 ### Hardware Recommender & Model Hub
 - Catalog with VRAM fit (full GPU / offload / won't fit), smaller-quant suggestions when a model would spill, and one-click remote **Pull Model**.

@@ -10,7 +10,7 @@ This release implements the November 2026 codebase audit: 84 findings across UI/
 
 - **Fresh installs start with automation off.** Swarm, Auto-Node, Auto-apply, Auto-review, and Cloud Strategist now default to off. Saved settings are kept exactly as they were.
 - **Electron 34.5.8 → 45.3.0**, and electron-builder 25 → 26.18.0. The bump resolves later high-severity advisories, including a context-isolation bypass and an ASAR integrity bypass.
-- **API keys are encrypted at rest** with the OS keychain (`safeStorage`). Plaintext and older encrypted keys migrate automatically.
+- **API keys are encrypted at rest** with the OS keychain (`safeStorage`) when it is available. Plaintext and older encrypted keys migrate automatically. If encryption is unavailable, the key stays plaintext.
 - **Web console defaults to localhost only.** LAN access requires a TLS certificate and key. Logged-in browsers can no longer change web-console settings, read or kill the terminal, pull or delete models, or delete nodes unless **Allow shell** is turned on from the desktop.
 - **In-app git commits do not run repository hooks.** This blocks code planted in a cloned repo. Commit from a terminal if you need hooks.
 - **Unsigned updates wait for “Restart to install”** instead of installing as soon as the app is idle. Builds are still unsigned (code signing is pending, PLAT-10).
@@ -90,7 +90,7 @@ This release implements the November 2026 codebase audit: 84 findings across UI/
 
 - **Pinned context (MODEL-1, MODEL-13):** every chat request sends one fixed `num_ctx` per model (`pinnedNumCtx`), so Ollama stops reloading weights. Retries reuse the same window and send a smaller prompt.
 - **Keep-alive and warm-up (MODEL-2, MODEL-12):** requests send `keep_alive`. Models are warmed before Pass 1, each Swarm wave, and repair. The coder model is warmed again after image generation.
-- **Benchmark (MODEL-3):** runs at each model’s pinned context, with warm-up, `think: false`, and time-to-first-token.
+- **Benchmark (MODEL-3):** runs at each model’s pinned context, after an unscored warm-up, with `think: false`. Cloud benchmarks also record time to first token.
 - **Timeouts (MODEL-4):** streams time out after 120 s idle or 15 min total, with distinct error codes. A retriable stream error is retried once on the same node.
 - **Output budgets (MODEL-5, MODEL-11):** `num_predict` comes from per-role budgets. Reviewer, Pass-1, and audit calls use `top_p 0.9`. Frontier calls send `max_tokens` and `include_usage`.
 - **Fit-aware routing (MODEL-6, MODEL-14)**
@@ -119,7 +119,7 @@ This release implements the November 2026 codebase audit: 84 findings across UI/
 - **First run (UX-3):** an empty chat shows a checklist: open a folder, connect a computer, pick a model, try a sample prompt. The editor’s empty state offers **Open folder**.
 - **Plain labels (UX-4):** automation switches (Split across GPUs, Cloud, Choose a computer for me, Save files automatically, Continue after review) sit in a collapsible **Automation** section with help tips. Verdicts read Pass/Fail.
 - **Errors (UX-5):** run, Swarm, routing, cloud-assist, benchmark, and model-delete failures show inline error cards with Retry and Open Hardware instead of `alert()`.
-- **Hardware & Models (UX-6, UX-7):** the modal is split into Endpoints, Models, Integrations, Remote, Stats, Appearance, and Support panels. Header chips open the matching tab. Dialogs share one focus-trap and Escape helper.
+- **Hardware & Models (UX-6, UX-7):** the modal is split into tabs: Endpoints, Models, and Integrations under nodes, plus Model Hub, Appearance, Token Stats, Web Console, and Support. Header chips open the matching tab. Dialogs share one focus-trap and Escape helper.
 - **Context meter (UX-8):** a meter by the composer shows last prompt tokens against the pinned context, colored past 70% and 85%.
 - **Smart Auto-Configure (UX-9):** shows a preview and waits for confirmation, with Undo, in both the Hardware modal and the chat quick button.
 - **Git, explorer, editor, terminal (UX-10 to UX-13)**
@@ -131,7 +131,7 @@ This release implements the November 2026 codebase audit: 84 findings across UI/
   - Icon-only controls have labels.
   - Ctrl+K opens a command palette.
   - Splitters are keyboard-resizable separators.
-  - Ctrl+L focuses the composer.
+  - Ctrl+L starts a new chat and focuses the message box.
   - Zoom shortcuts don’t fire inside inputs, Monaco, or the terminal.
 - **Web console password (UX-16):** at least 8 characters.
 - **Status line (UX-17):** says who is working, for example `Coder on 1080 Ti · model · writing src/App.tsx`.

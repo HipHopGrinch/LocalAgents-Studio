@@ -7691,7 +7691,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                 className="bg-[#1c1c24] border border-[#2a2a36] text-zinc-200 rounded px-2 py-1 outline-none text-[11px] truncate disabled:opacity-50"
               >
                 {nodes.length === 0 ? (
-                  <option value="">No endpoints — open Hardware Settings</option>
+                  <option value="">No endpoints — open Hardware & Models</option>
                 ) : (
                   nodes.map(n => (
                     <option key={n.id} value={n.id} disabled={!n.online}>
@@ -7712,7 +7712,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                   {activeTargetMaxCtx > 0 && (
                     <span
                       className="text-sky-400/90"
-                      title="Studio max context for this model (Hardware Settings). Worker prompts are shaped to this ceiling."
+                      title="Studio max context for this model (Hardware & Models → Models). Worker prompts are shaped to this ceiling."
                     >
                       {activeTargetMaxCtx.toLocaleString()} ctx
                     </span>
@@ -7739,9 +7739,9 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                 {effectiveModels.length === 0 ? (
                   <option value="">
                     {!selectedNode
-                      ? 'Add an endpoint in Hardware Settings'
+                      ? 'Add an endpoint in Hardware & Models'
                       : selectedNode.online
-                        ? 'No models installed — pull in Hardware Settings'
+                        ? 'No models installed — pull in Hardware & Models'
                         : 'Node offline / no models'}
                   </option>
                 ) : (

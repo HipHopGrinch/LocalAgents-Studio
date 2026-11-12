@@ -66,7 +66,7 @@ export const HelpTip: React.FC<HelpTipProps> = ({
           onClick={e => e.stopPropagation()}
         >
           <div className="text-[11px] font-semibold text-zinc-100 mb-1">{title}</div>
-          <div className="text-[10px] leading-relaxed text-zinc-400 space-y-1.5">{children}</div>
+          <div className="text-[11px] leading-relaxed text-zinc-400 space-y-1.5">{children}</div>
         </div>
       )}
     </span>

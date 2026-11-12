@@ -7,9 +7,21 @@
  * - kvKB: approx KV-cache KB per token at f16 (layers * kv_heads * head_dim * 4 bytes).
  *   Omitted where the architecture isn't known; a conservative heuristic is used instead.
  * - quality: subjective 1-10 suitability per task (relative ranking, not a benchmark).
+ * - quantVariants: real Ollama library tags (registry.ollama.ai, 2026-11-11). `confident: false`
+ *   marks a tag that must not be recommended (unsure or different architecture).
  */
 
 export type TaskId = 'agent' | 'coding' | 'reasoning' | 'review' | 'autocomplete' | 'embedding' | 'vision' | 'chat';
+
+/** Alternate quant tag for one catalog row. Sizes are manifest bytes / 1e9. */
+export interface QuantVariant {
+  tag: string;
+  /** q3_k_m | q4_k_m | q5_k_m | q8_0 */
+  quant: string;
+  sizeGB: number;
+  /** false = do not recommend (tag unverified or a different architecture). */
+  confident?: boolean;
+}
 
 export const TASKS: { id: TaskId; label: string; description: string; minTps: number }[] = [
   { id: 'agent', label: 'Agentic Coding', description: 'Tool use, multi-file edits, autonomous loops', minTps: 25 },
@@ -33,6 +45,8 @@ export interface CatalogModel {
   caps: ('tools' | 'thinking' | 'vision' | 'fim' | 'embedding')[];
   quality: Partial<Record<TaskId, number>>;
   notes: string;
+  /** Other quants of this same model. Omitted when the library tags are not verified. */
+  quantVariants?: QuantVariant[];
 }
 
 export const MODEL_CATALOG: CatalogModel[] = [
@@ -92,44 +106,86 @@ export const MODEL_CATALOG: CatalogModel[] = [
   {
     tag: 'qwen2.5-coder:32b', family: 'Qwen2.5-Coder', paramsB: 32.8, sizeGB: 19.85, contextMax: 32768, kvKB: 262,
     caps: ['tools', 'fim'], quality: { coding: 8, review: 7.5, agent: 6.5, autocomplete: 6.5 },
-    notes: 'Older but very solid dense coder.'
+    notes: 'Older but very solid dense coder.',
+    quantVariants: [
+      { tag: 'qwen2.5-coder:32b-instruct-q3_K_M', quant: 'q3_k_m', sizeGB: 15.94, confident: true },
+      { tag: 'qwen2.5-coder:32b-instruct-q4_K_M', quant: 'q4_k_m', sizeGB: 19.85, confident: true },
+      { tag: 'qwen2.5-coder:32b-instruct-q5_K_M', quant: 'q5_k_m', sizeGB: 23.26, confident: true },
+      { tag: 'qwen2.5-coder:32b-instruct-q8_0', quant: 'q8_0', sizeGB: 34.82, confident: true }
+    ]
   },
   {
     tag: 'qwen2.5-coder:14b', family: 'Qwen2.5-Coder', paramsB: 14.8, sizeGB: 8.99, contextMax: 32768, kvKB: 196,
     caps: ['tools', 'fim'], quality: { coding: 7.5, review: 7, agent: 6, autocomplete: 7.5 },
-    notes: 'Fits 12GB+ cards fully.'
+    notes: 'Fits 12GB+ cards fully.',
+    quantVariants: [
+      { tag: 'qwen2.5-coder:14b-instruct-q3_K_M', quant: 'q3_k_m', sizeGB: 7.34, confident: true },
+      { tag: 'qwen2.5-coder:14b-instruct-q4_K_M', quant: 'q4_k_m', sizeGB: 8.99, confident: true },
+      { tag: 'qwen2.5-coder:14b-instruct-q5_K_M', quant: 'q5_k_m', sizeGB: 10.51, confident: true },
+      { tag: 'qwen2.5-coder:14b-instruct-q8_0', quant: 'q8_0', sizeGB: 15.7, confident: true }
+    ]
   },
   {
     tag: 'qwen2.5-coder:7b', family: 'Qwen2.5-Coder', paramsB: 7.6, sizeGB: 4.68, contextMax: 32768, kvKB: 57,
     caps: ['tools', 'fim'], quality: { coding: 6.5, review: 6, agent: 5, autocomplete: 8, chat: 6 },
-    notes: 'Fast; best FIM size/quality balance on mid GPUs.'
+    notes: 'Fast; best FIM size/quality balance on mid GPUs.',
+    quantVariants: [
+      { tag: 'qwen2.5-coder:7b-instruct-q3_K_M', quant: 'q3_k_m', sizeGB: 3.81, confident: true },
+      { tag: 'qwen2.5-coder:7b-instruct-q4_K_M', quant: 'q4_k_m', sizeGB: 4.68, confident: true },
+      { tag: 'qwen2.5-coder:7b-instruct-q5_K_M', quant: 'q5_k_m', sizeGB: 5.44, confident: true },
+      { tag: 'qwen2.5-coder:7b-instruct-q8_0', quant: 'q8_0', sizeGB: 8.1, confident: true }
+    ]
   },
   {
     tag: 'qwen2.5-coder:3b', family: 'Qwen2.5-Coder', paramsB: 3.1, sizeGB: 1.93, contextMax: 32768, kvKB: 36,
     caps: ['fim'], quality: { autocomplete: 7.5, coding: 4.5, chat: 4.5 },
-    notes: 'Very fast inline completions.'
+    notes: 'Very fast inline completions.',
+    quantVariants: [
+      { tag: 'qwen2.5-coder:3b-instruct-q3_K_M', quant: 'q3_k_m', sizeGB: 1.59, confident: true },
+      { tag: 'qwen2.5-coder:3b-instruct-q4_K_M', quant: 'q4_k_m', sizeGB: 1.93, confident: true },
+      { tag: 'qwen2.5-coder:3b-instruct-q5_K_M', quant: 'q5_k_m', sizeGB: 2.22, confident: true },
+      { tag: 'qwen2.5-coder:3b-instruct-q8_0', quant: 'q8_0', sizeGB: 3.29, confident: true }
+    ]
   },
   {
     tag: 'qwen2.5-coder:1.5b', family: 'Qwen2.5-Coder', paramsB: 1.5, sizeGB: 0.99, contextMax: 32768, kvKB: 28,
     caps: ['fim'], quality: { autocomplete: 6.5 },
-    notes: 'Tiny autocomplete model (the -base variant is better for pure FIM).'
+    notes: 'Tiny autocomplete model (the -base variant is better for pure FIM).',
+    quantVariants: [
+      { tag: 'qwen2.5-coder:1.5b-instruct-q3_K_M', quant: 'q3_k_m', sizeGB: 0.82, confident: true },
+      { tag: 'qwen2.5-coder:1.5b-instruct-q4_K_M', quant: 'q4_k_m', sizeGB: 0.99, confident: true },
+      { tag: 'qwen2.5-coder:1.5b-instruct-q5_K_M', quant: 'q5_k_m', sizeGB: 1.13, confident: true },
+      { tag: 'qwen2.5-coder:1.5b-instruct-q8_0', quant: 'q8_0', sizeGB: 1.65, confident: true }
+    ]
   },
 
   // ---------------- General / reasoning ----------------
   {
     tag: 'qwen3:30b', family: 'Qwen3', paramsB: 30.5, activeB: 3.3, sizeGB: 18.56, contextMax: 40960, kvKB: 98,
     caps: ['tools', 'thinking'], quality: { reasoning: 8, chat: 8, coding: 7.5, agent: 7, review: 7 },
-    notes: 'MoE generalist with thinking mode.'
+    notes: 'MoE generalist with thinking mode.',
+    quantVariants: [
+      { tag: 'qwen3:30b-a3b-q4_K_M', quant: 'q4_k_m', sizeGB: 18.62, confident: true },
+      { tag: 'qwen3:30b-a3b-q8_0', quant: 'q8_0', sizeGB: 32.53, confident: true }
+    ]
   },
   {
     tag: 'qwen3:14b', family: 'Qwen3', paramsB: 14.8, sizeGB: 9.28, contextMax: 40960, kvKB: 164,
     caps: ['tools', 'thinking'], quality: { reasoning: 7.5, chat: 7.5, coding: 7, agent: 6.5, review: 7 },
-    notes: 'Dense; good thinking model for 12GB cards.'
+    notes: 'Dense; good thinking model for 12GB cards.',
+    quantVariants: [
+      { tag: 'qwen3:14b-q4_K_M', quant: 'q4_k_m', sizeGB: 9.28, confident: true },
+      { tag: 'qwen3:14b-q8_0', quant: 'q8_0', sizeGB: 15.9, confident: true }
+    ]
   },
   {
     tag: 'qwen3:8b', family: 'Qwen3', paramsB: 8.2, sizeGB: 5.23, contextMax: 40960, kvKB: 147,
     caps: ['tools', 'thinking'], quality: { reasoning: 6.5, chat: 7, coding: 6, agent: 5.5, review: 6 },
-    notes: 'Capable small thinker; fits 6-8GB cards.'
+    notes: 'Capable small thinker; fits 6-8GB cards.',
+    quantVariants: [
+      { tag: 'qwen3:8b-q4_K_M', quant: 'q4_k_m', sizeGB: 5.23, confident: true },
+      { tag: 'qwen3:8b-q8_0', quant: 'q8_0', sizeGB: 8.85, confident: true }
+    ]
   },
   {
     tag: 'qwen3.5:9b', family: 'Qwen3.5', paramsB: 9, sizeGB: 6.55, contextMax: 262144,
@@ -144,22 +200,39 @@ export const MODEL_CATALOG: CatalogModel[] = [
   {
     tag: 'deepseek-r1:32b', family: 'DeepSeek-R1 distill', paramsB: 32.8, sizeGB: 19.85, contextMax: 131072, kvKB: 262,
     caps: ['thinking'], quality: { reasoning: 8.5, review: 7.5, coding: 7 },
-    notes: 'Long chain-of-thought; slow but thorough for debugging.'
+    notes: 'Long chain-of-thought; slow but thorough for debugging.',
+    quantVariants: [
+      { tag: 'deepseek-r1:32b-qwen-distill-q4_K_M', quant: 'q4_k_m', sizeGB: 19.85, confident: true },
+      { tag: 'deepseek-r1:32b-qwen-distill-q8_0', quant: 'q8_0', sizeGB: 34.82, confident: true }
+    ]
   },
   {
     tag: 'deepseek-r1:14b', family: 'DeepSeek-R1 distill', paramsB: 14.8, sizeGB: 8.99, contextMax: 131072, kvKB: 196,
     caps: ['thinking'], quality: { reasoning: 7.5, review: 6.5, coding: 6.5 },
-    notes: 'Reasoning model for 12GB cards.'
+    notes: 'Reasoning model for 12GB cards.',
+    quantVariants: [
+      { tag: 'deepseek-r1:14b-qwen-distill-q4_K_M', quant: 'q4_k_m', sizeGB: 8.99, confident: true },
+      { tag: 'deepseek-r1:14b-qwen-distill-q8_0', quant: 'q8_0', sizeGB: 15.7, confident: true }
+    ]
   },
   {
     tag: 'deepseek-r1:8b', family: 'DeepSeek-R1 distill', paramsB: 8.2, sizeGB: 5.23, contextMax: 131072, kvKB: 147,
     caps: ['thinking'], quality: { reasoning: 6.5, review: 5.5 },
-    notes: 'Qwen3-8B based distill.'
+    notes: 'Qwen3-8B based distill.',
+    // llama-distill tags exist but are a different base model than this Qwen distill. Do not recommend them.
+    quantVariants: [
+      { tag: 'deepseek-r1:8b-llama-distill-q4_K_M', quant: 'q4_k_m', sizeGB: 4.92, confident: false },
+      { tag: 'deepseek-r1:8b-llama-distill-q8_0', quant: 'q8_0', sizeGB: 8.54, confident: false }
+    ]
   },
   {
     tag: 'phi4:14b', family: 'Phi-4', paramsB: 14.7, sizeGB: 9.05, contextMax: 16384, kvKB: 205,
     caps: [], quality: { reasoning: 7, chat: 7, coding: 6.5, review: 6.5 },
-    notes: 'Strong STEM reasoning; 16K context limit.'
+    notes: 'Strong STEM reasoning; 16K context limit.',
+    quantVariants: [
+      { tag: 'phi4:14b-q4_K_M', quant: 'q4_k_m', sizeGB: 9.05, confident: true },
+      { tag: 'phi4:14b-q8_0', quant: 'q8_0', sizeGB: 15.58, confident: true }
+    ]
   },
   {
     tag: 'ministral-3:14b', family: 'Ministral 3', paramsB: 14, sizeGB: 9.08, contextMax: 131072,
@@ -201,12 +274,20 @@ export const MODEL_CATALOG: CatalogModel[] = [
   {
     tag: 'gemma3:27b', family: 'Gemma 3', paramsB: 27, sizeGB: 17.41, contextMax: 131072, kvKB: 120,
     caps: ['vision'], quality: { chat: 8, vision: 8, reasoning: 7, coding: 6.5 },
-    notes: 'Previous-gen multimodal.'
+    notes: 'Previous-gen multimodal.',
+    quantVariants: [
+      { tag: 'gemma3:27b-it-q4_K_M', quant: 'q4_k_m', sizeGB: 17.41, confident: true },
+      { tag: 'gemma3:27b-it-q8_0', quant: 'q8_0', sizeGB: 29.57, confident: true }
+    ]
   },
   {
     tag: 'gemma3:12b', family: 'Gemma 3', paramsB: 12, sizeGB: 8.16, contextMax: 131072, kvKB: 90,
     caps: ['vision'], quality: { chat: 7, vision: 7.5, coding: 5.5 },
-    notes: 'Previous-gen multimodal.'
+    notes: 'Previous-gen multimodal.',
+    quantVariants: [
+      { tag: 'gemma3:12b-it-q4_K_M', quant: 'q4_k_m', sizeGB: 8.16, confident: true },
+      { tag: 'gemma3:12b-it-q8_0', quant: 'q8_0', sizeGB: 13.37, confident: true }
+    ]
   },
 
   // ---------------- Small / fast utility ----------------
@@ -223,7 +304,13 @@ export const MODEL_CATALOG: CatalogModel[] = [
   {
     tag: 'llama3.2:3b', family: 'Llama 3.2', paramsB: 3.2, sizeGB: 2.02, contextMax: 131072, kvKB: 115,
     caps: ['tools'], quality: { chat: 5 },
-    notes: 'Commit messages, summaries.'
+    notes: 'Commit messages, summaries.',
+    quantVariants: [
+      { tag: 'llama3.2:3b-instruct-q3_K_M', quant: 'q3_k_m', sizeGB: 1.69, confident: true },
+      { tag: 'llama3.2:3b-instruct-q4_K_M', quant: 'q4_k_m', sizeGB: 2.02, confident: true },
+      { tag: 'llama3.2:3b-instruct-q5_K_M', quant: 'q5_k_m', sizeGB: 2.32, confident: true },
+      { tag: 'llama3.2:3b-instruct-q8_0', quant: 'q8_0', sizeGB: 3.42, confident: true }
+    ]
   },
   {
     tag: 'starcoder2:7b', family: 'StarCoder2', paramsB: 7, sizeGB: 4.04, contextMax: 16384, kvKB: 66,

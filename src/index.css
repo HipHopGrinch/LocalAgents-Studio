@@ -1,5 +1,15 @@
 @import "tailwindcss";
 
+/* Surfaces, borders, and muted text. --text-min is the floor for UI copy. */
+:root {
+  --surface-1: #121215;
+  --surface-2: #18181b;
+  --surface-3: #1e1e24;
+  --border: #27272a;
+  --text-muted: #a1a1aa;
+  --text-min: 11px;
+}
+
 @theme {
   --animate-activity-square: activity-square 1.05s ease-in-out infinite;
 
@@ -29,14 +39,14 @@
     -webkit-user-select: text;
     user-select: text;
   }
-  
+
   /* Custom scrollbar for dark theme */
   ::-webkit-scrollbar {
     width: 6px;
     height: 6px;
   }
   ::-webkit-scrollbar-track {
-    background: #18181b;
+    background: var(--surface-2);
   }
   ::-webkit-scrollbar-thumb {
     background: #3f3f46;

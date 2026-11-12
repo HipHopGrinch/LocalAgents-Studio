@@ -243,18 +243,46 @@ export function hasExecutionPlanMarkup(text: string): boolean {
   return /<\/?execution_plan\b/i.test(text || '') || /<\/?step\b[^>]*\bid\s*=/i.test(text || '');
 }
 
-/** Parse \`<step_verdict>\` Yay/Nay for a Planner step. */
+export type StepVerdictKind = 'yay' | 'nay' | 'missing';
+
+export interface StepVerdictParse {
+  stepId: string;
+  result: StepVerdictKind;
+  notes: string;
+}
+
+/**
+ * Parse `<step_verdict>`. With no second argument, a reply that has no tag returns null
+ * so streaming can ignore a partial turn — and that null is never a yay.
+ * Pass `{ allowMissing: true }` (AgentChat reviewActiveStep, the `parseStepVerdict(latest?.raw)`
+ * call and the `if (!verdict)` prose fallback around 4746–4758) to get result `missing`
+ * instead of guessing yay.
+ */
 export function parseStepVerdict(raw: string): {
   stepId: string;
   result: 'yay' | 'nay';
   notes: string;
-} | null {
+} | null;
+export function parseStepVerdict(raw: string, opts: { allowMissing: true }): StepVerdictParse;
+export function parseStepVerdict(
+  raw: string,
+  opts?: { allowMissing?: boolean }
+): StepVerdictParse | null {
   const text = (raw || '').replace(/<think>[\s\S]*?<\/think>/gi, '');
   // Prefer closed blocks; fall back to unclosed trailing tag (local models often omit the close).
   const m =
     text.match(/<step_verdict\b([^>]*)>([\s\S]*?)<\/step_verdict\s*>/i) ||
     text.match(/<step_verdict\b([^>]*)>([\s\S]*)$/i);
-  if (!m) return null;
+  if (!m) {
+    if (opts?.allowMissing) {
+      return {
+        stepId: '',
+        result: 'missing',
+        notes: 'Missing <step_verdict> markup. Ask for an explicit yay or nay.'
+      };
+    }
+    return null;
+  }
   const attrs = m[1] || '';
   const body = m[2] || '';
   const stepId =
@@ -294,6 +322,13 @@ export function parseStepVerdict(raw: string): {
     // Local models often omit <result> and only emit <summary>/<notes> — treat as nay if substantive.
     if (notes.length > 20) {
       return { stepId, result: 'nay', notes };
+    }
+    if (opts?.allowMissing) {
+      return {
+        stepId,
+        result: 'missing',
+        notes: notes || 'Missing an explicit yay or nay inside <step_verdict>.'
+      };
     }
     return null;
   }

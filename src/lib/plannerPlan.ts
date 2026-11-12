@@ -4,6 +4,7 @@ import {
   PlannerStep,
   PlannerStepStatus,
   PlannerTask,
+  PlanBlockerKind,
   ExecutionTaskStatus,
   ExecutionQueue,
   DeliveryTarget
@@ -81,19 +82,21 @@ export function stepTasksComplete(step: PlannerStep): boolean {
   return step.tasks.every(t => t.status === 'completed');
 }
 
+/** Pending work only. Failed and abandoned steps are debt until `retryFailedStep`. */
 export function pickNextPendingStep(plan: PlannerPlan): PlannerStep | undefined {
-  return plan.steps.find(s => s.status === 'pending' || s.status === 'failed');
+  return plan.steps.find(s => s.status === 'pending');
 }
 
-/** Activate first pending/failed step (or keep current). */
+/** Activate the next pending step. An in-progress step stays put; failed debt does not. */
 export function activateNextStep(plan: PlannerPlan): PlannerPlan {
   const current = getActiveStep(plan);
-  if (current && (current.status === 'in_progress' || current.status === 'failed')) {
-    return plan;
-  }
+  if (current && current.status === 'in_progress') return plan;
   const next = pickNextPendingStep(plan);
   if (!next) {
-    return touch(plan, { status: 'completed', activeStepId: null });
+    return touch(plan, {
+      status: planHasDebt(plan) ? 'active' : 'completed',
+      activeStepId: null
+    });
   }
   return touch(plan, {
     status: 'active',
@@ -114,8 +117,10 @@ export function activateNextStep(plan: PlannerPlan): PlannerPlan {
 }
 
 /**
- * Heal budget spent: keep the step failed with the compiler note, clear the
- * plan-stopping block, and activate the next pending step so later work still runs.
+ * Heal budget spent: keep the step failed with the compiler note, remember that
+ * its heal budget is exhausted, clear the plan-stopping block, and activate the
+ * next pending step so later work still runs.
+ * `healAttempts` stays put so Play cannot heal this same step again until Retry.
  */
 export function continuePastFailedStep(
   plan: PlannerPlan,
@@ -127,7 +132,8 @@ export function continuePastFailedStep(
       ? {
           ...s,
           status: 'failed' as PlannerStepStatus,
-          reviewNote: note.slice(0, 1200)
+          reviewNote: note.slice(0, 1200),
+          healExhausted: true
         }
       : s
   );
@@ -137,10 +143,9 @@ export function continuePastFailedStep(
   if (!next) {
     return touch(plan, {
       steps,
-      status: 'completed',
+      status: 'active',
       activeStepId: null,
       blockedReason: undefined,
-      healAttempts: 0,
       resumePhase: 'coder'
     });
   }
@@ -151,9 +156,21 @@ export function continuePastFailedStep(
     status: 'active',
     activeStepId: next.id,
     blockedReason: undefined,
-    healAttempts: 0,
     resumePhase: 'coder'
   });
+}
+
+/**
+ * Step Play/Heal may run. An exhausted failed step is skipped until Retry clears it.
+ * An in-progress active step still wins. Failed debt is only chosen when it can still be healed.
+ */
+export function pickHealStep(plan: PlannerPlan): PlannerStep | undefined {
+  const active = getActiveStep(plan);
+  if (active && !active.healExhausted) return active;
+  return (
+    plan.steps.find(s => s.status === 'failed' && !s.healExhausted) ||
+    plan.steps.find(s => s.status === 'in_progress')
+  );
 }
 
 export function markStepInProgress(plan: PlannerPlan, stepId: string): PlannerPlan {
@@ -238,9 +255,54 @@ export const MAX_PLAN_STEPS = 18;
 /** Compiler-driven heal attempts after the escalation wall (no new steps). */
 export const MAX_HEAL_ATTEMPTS = 3;
 
-/** True when a step is already a repair pass — appending another Fix: would duplicate. */
+/**
+ * Explicit repair pass only: a "Fix:" title, or verify/tsc/compiler wording.
+ * A bare "fix" / "repair" / "rework" in a feature title is not a compiler heal.
+ */
 export function stepLooksLikeFixStep(title: string): boolean {
-  return /\bfix\b|repair|rework|resolve\b.*\b(error|tsc|type|compile)/i.test(title || '');
+  const t = (title || '').trim();
+  if (!t) return false;
+  if (/^(?:fix\s*:\s*)+/i.test(t)) return true;
+  if (/\b(?:tsc|typecheck|type-check)\b/i.test(t)) return true;
+  if (/\berror\s*TS\d+\b/i.test(t)) return true;
+  if (/\bverify\b/i.test(t) && /\b(?:fail(?:ed|ure)?|errors?|fix|repair|heal)\b/i.test(t)) return true;
+  if (/\b(?:compiler|compile)\b/i.test(t) && /\b(?:errors?|fail(?:ed|ure)?|fix|repair|heal)\b/i.test(t)) {
+    return true;
+  }
+  return false;
+}
+
+/** Record why a step is stuck. Green verify may advance `compiler` only. */
+export function setStepBlockerKind(
+  plan: PlannerPlan,
+  stepId: string,
+  kind: PlanBlockerKind | undefined
+): PlannerPlan {
+  const id = String(stepId);
+  if (!plan.steps.some(s => String(s.id) === id)) return plan;
+  return touch(plan, {
+    blockerKind: kind,
+    steps: plan.steps.map(s => (String(s.id) === id ? { ...s, blockerKind: kind } : s))
+  });
+}
+
+/**
+ * True only when this step is blocked by the compiler (or its note is a verify failure).
+ * A reviewer Nay stays put on a clean `tsc`.
+ */
+export function canHealAdvanceOnGreenVerify(
+  plan: PlannerPlan | null | undefined,
+  stepId: string
+): boolean {
+  if (!plan || stepId === undefined || stepId === null || String(stepId) === '') return false;
+  const step = plan.steps.find(s => String(s.id) === String(stepId));
+  if (!step) return false;
+  const kind =
+    step.blockerKind ||
+    (String(plan.activeStepId || '') === String(step.id) ? plan.blockerKind : undefined);
+  if (kind === 'review') return false;
+  if (kind === 'compiler') return true;
+  return notesLookLikeVerifyFailure(step.reviewNote || '');
 }
 
 /** Reviewer/verify notes that are compile failures — prefer heal over new plan steps. */
@@ -264,11 +326,13 @@ export function applyStepVerdict(plan: PlannerPlan, verdict: StepVerdict): Plann
 
   if (verdict.result === 'yay') {
     const withDone = touch(plan, {
+      blockerKind: undefined,
       steps: plan.steps.map(s =>
         s.id === step.id
           ? {
               ...s,
               status: 'completed' as PlannerStepStatus,
+              blockerKind: undefined,
               reviewNote: verdict.notes || undefined,
               reworkCount: 0,
               tasks: s.tasks.map(t => ({
@@ -284,16 +348,20 @@ export function applyStepVerdict(plan: PlannerPlan, verdict: StepVerdict): Plann
     return activateNextStep(withDone);
   }
 
-  // Nay — reopen step with notes; tasks go back to pending/failed for rework
+  // Nay — reopen step with notes; tasks go back to pending/failed for rework.
+  // Compiler-shaped notes are the only kind a later green verify may auto-advance.
+  const kind: PlanBlockerKind = notesLookLikeVerifyFailure(verdict.notes) ? 'compiler' : 'review';
   const nextRework = (step.reworkCount || 0) + 1;
   return touch(plan, {
     status: 'active',
     activeStepId: step.id,
+    blockerKind: kind,
     steps: plan.steps.map(s =>
       s.id === step.id
         ? {
             ...s,
             status: 'failed' as PlannerStepStatus,
+            blockerKind: kind,
             reviewNote: verdict.notes || 'Reviewer requested fixes.',
             reworkCount: nextRework,
             tasks: s.tasks.map(t => ({
@@ -318,9 +386,11 @@ export function formatPlanForPanel(plan: PlannerPlan): string {
         ? '[done]'
         : s.status === 'failed'
           ? '[nay]'
-          : s.status === 'in_progress'
-            ? '[active]'
-            : '[ ]';
+          : s.status === 'abandoned'
+            ? '[abandoned]'
+            : s.status === 'in_progress'
+              ? '[active]'
+              : '[ ]';
     const tasks = s.tasks
       .map(t => {
         const tm =
@@ -573,7 +643,8 @@ export function insertFixStepsAfter(
 
 /**
  * Append a newly locked plan onto an existing conversation plan.
- * Prior steps stay (as completed/failed); new steps get remapped ids and become active.
+ * Unfinished prior steps become abandoned debt (not completed). Failed steps stay failed.
+ * New steps get remapped ids and the first one becomes active.
  */
 export function appendPlannerPlan(
   existing: PlannerPlan | null | undefined,
@@ -586,7 +657,7 @@ export function appendPlannerPlan(
     uid: s.uid || String(s.id) || newStepUid(),
     status:
       s.status === 'in_progress' || s.status === 'pending'
-        ? ('completed' as PlannerStepStatus)
+        ? ('abandoned' as PlannerStepStatus)
         : s.status
   }));
 
@@ -630,6 +701,124 @@ export function appendPlannerPlan(
     if (first) return { ...renumbered, activeStepId: first.id };
   }
   return renumbered;
+}
+
+/** Failed or abandoned steps still need a verdict, a retry, or an explicit skip resolution. */
+export function planHasDebt(plan: PlannerPlan | null | undefined): boolean {
+  if (!plan?.steps?.length) return false;
+  return plan.steps.some(s => s.status === 'failed' || s.status === 'abandoned');
+}
+
+/** Final review and dist require every step completed and no unresolved debt. */
+export function planReadyForRelease(plan: PlannerPlan | null | undefined): boolean {
+  if (!plan || plan.status === 'abandoned') return false;
+  if (!plan.steps.length) return false;
+  if (planHasDebt(plan)) return false;
+  return plan.steps.every(s => s.status === 'completed');
+}
+
+/** Persist final-review only when the plan is actually ready to ship. */
+export function markPlanFinalReview(plan: PlannerPlan): PlannerPlan {
+  if (!planReadyForRelease(plan)) return plan;
+  if (plan.resumePhase === 'final-review' && plan.status === 'completed' && !plan.activeStepId) {
+    return plan;
+  }
+  return touch(plan, { resumePhase: 'final-review', status: 'completed', activeStepId: null });
+}
+
+/** User skipped a step. It becomes abandoned debt and the next pending step activates. */
+export function skipStep(plan: PlannerPlan, stepId: string, note?: string): PlannerPlan {
+  const step = plan.steps.find(s => String(s.id) === String(stepId));
+  if (!step || step.status === 'completed') return plan;
+  const steps = plan.steps.map(s =>
+    String(s.id) === String(stepId)
+      ? {
+          ...s,
+          status: 'abandoned' as PlannerStepStatus,
+          reviewNote: (note || s.reviewNote || 'Skipped.').slice(0, 1200)
+        }
+      : s
+  );
+  const cleared =
+    String(plan.activeStepId || '') === String(stepId) ? null : plan.activeStepId;
+  return activateNextStep(touch(plan, { steps, activeStepId: cleared }));
+}
+
+/** Edit one task's title, description, or file without changing step status. */
+export function editStepTask(
+  plan: PlannerPlan,
+  stepId: string,
+  taskId: string,
+  patch: { title?: string; description?: string; file?: string }
+): PlannerPlan {
+  let changed = false;
+  const steps = plan.steps.map(s => {
+    if (String(s.id) !== String(stepId)) return s;
+    return {
+      ...s,
+      tasks: s.tasks.map(t => {
+        if (String(t.id) !== String(taskId)) return t;
+        changed = true;
+        return {
+          ...t,
+          ...(patch.title !== undefined ? { title: patch.title } : {}),
+          ...(patch.description !== undefined ? { description: patch.description } : {}),
+          ...(patch.file !== undefined ? { file: patch.file } : {})
+        };
+      })
+    };
+  });
+  if (!changed) return plan;
+  return touch(plan, { steps });
+}
+
+/**
+ * Re-open a failed or abandoned step as in-progress coder work.
+ * Pending steps are not retried here — they are already eligible.
+ */
+export function retryFailedStep(plan: PlannerPlan, stepId: string): PlannerPlan {
+  const step = plan.steps.find(s => String(s.id) === String(stepId));
+  if (!step || (step.status !== 'failed' && step.status !== 'abandoned')) return plan;
+  return touch(plan, {
+    status: 'active',
+    activeStepId: step.id,
+    resumePhase: 'coder',
+    blockedReason: undefined,
+    healAttempts: 0,
+    blockerKind: undefined,
+    steps: plan.steps.map(s => {
+      if (String(s.id) === String(stepId)) {
+        return {
+          ...s,
+          status: 'in_progress' as PlannerStepStatus,
+          blockerKind: undefined,
+          healExhausted: false,
+          tasks: s.tasks.map(t =>
+            t.status === 'completed'
+              ? t
+              : { ...t, status: 'pending' as ExecutionTaskStatus, failureNote: undefined }
+          )
+        };
+      }
+      if (s.status === 'in_progress') return { ...s, status: 'pending' as PlannerStepStatus };
+      return s;
+    })
+  });
+}
+
+/**
+ * Awaitable plan commit. Callers pass the filesystem writer (main-process IPC).
+ * Returns the plan that was written, with a fresh updatedAt.
+ */
+export async function writePlannerPlan(
+  root: string,
+  conversationId: string,
+  plan: PlannerPlan,
+  writeFile: (absPath: string, content: string) => Promise<unknown>
+): Promise<PlannerPlan> {
+  const next = touch(plan);
+  await writeFile(plannerPlanPath(root, conversationId), serializePlannerPlan(next));
+  return next;
 }
 
 /** Materialize Review fix queue into a PlannerPlan for the Conductor panel. */

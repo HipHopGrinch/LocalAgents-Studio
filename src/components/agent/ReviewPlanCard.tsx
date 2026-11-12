@@ -25,7 +25,7 @@ export const ReviewPlanCard: React.FC<ReviewPlanCardProps> = ({
   if (clean) {
     return (
       <div className="mt-3 space-y-2 pt-2 border-t border-[#31313e]">
-        <div className="flex items-center space-x-1.5 text-[10px] uppercase font-bold text-emerald-300/90 tracking-wider">
+        <div className="flex items-center space-x-1.5 text-[11px] uppercase font-bold text-emerald-300/90 tracking-wider">
           <ThumbsUp className="w-3 h-3" />
           <span>Review clean</span>
         </div>
@@ -51,14 +51,14 @@ export const ReviewPlanCard: React.FC<ReviewPlanCardProps> = ({
             ) : (
               <>
                 <ThumbsUp className="w-3.5 h-3.5" />
-                <span>Looks good / Continue</span>
+                <span>Accept & continue</span>
               </>
             )}
           </button>
         )}
         {!sent && onContinue && (
-          <p className="text-[9px] text-zinc-500">
-            Approves this step and continues the auto-progress loop (next feature step or done).
+          <p className="text-[11px] text-zinc-400">
+            Accepting this pass continues the plan (next step, or done).
           </p>
         )}
       </div>
@@ -67,7 +67,7 @@ export const ReviewPlanCard: React.FC<ReviewPlanCardProps> = ({
 
   return (
     <div className="mt-3 space-y-2 pt-2 border-t border-[#31313e]">
-      <div className="flex items-center space-x-1.5 text-[10px] uppercase font-bold text-violet-300/90 tracking-wider">
+      <div className="flex items-center space-x-1.5 text-[11px] uppercase font-bold text-violet-300/90 tracking-wider">
         <ListTodo className="w-3 h-3" />
         <span>Fix plan for Planner → Coder</span>
       </div>
@@ -93,18 +93,18 @@ export const ReviewPlanCard: React.FC<ReviewPlanCardProps> = ({
               <div className="text-[11px] font-semibold text-zinc-100 flex items-center gap-1.5 flex-wrap">
                 <span className="font-mono text-violet-300">Task {task.id}</span>
                 {status && (
-                  <span className={`font-mono text-[9px] uppercase ${statusClass}`}>
+                  <span className={`font-mono text-[11px] uppercase ${statusClass}`}>
                     {status.replace('_', ' ')}
                   </span>
                 )}
                 <span>{task.title}</span>
                 {task.file && (
-                  <span className="font-mono text-[10px] text-zinc-500 truncate">{task.file}</span>
+                  <span className="font-mono text-[11px] text-zinc-400 truncate">{task.file}</span>
                 )}
               </div>
-              <p className="text-[10px] text-zinc-400 mt-1 leading-relaxed">{task.description}</p>
+              <p className="text-[11px] text-zinc-400 mt-1 leading-relaxed">{task.description}</p>
               {task.failureNote && (
-                <p className="text-[10px] text-rose-300/90 mt-1 leading-relaxed">
+                <p className="text-[11px] text-rose-300/90 mt-1 leading-relaxed">
                   Fix note: {task.failureNote}
                 </p>
               )}
@@ -135,10 +135,9 @@ export const ReviewPlanCard: React.FC<ReviewPlanCardProps> = ({
         )}
       </button>
       {!sent && (
-        <p className="text-[9px] text-zinc-500">
-          Planner takes the next open task (one at a time), writes a fix contract, then{' '}
-          <span className="font-mono text-zinc-400">coder</span> implements it. Reviewer verifies that
-          task and keeps the durable list — it does not apply edits.
+        <p className="text-[11px] text-zinc-400">
+          The planner takes the next open task, writes a fix contract, then the coder implements
+          it. The reviewer checks that task and keeps the list. It does not apply edits.
         </p>
       )}
     </div>

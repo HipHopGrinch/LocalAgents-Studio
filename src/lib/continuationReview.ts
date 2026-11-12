@@ -1,8 +1,10 @@
 import { EndpointNode, PlanOption } from '../types';
-import { DEFAULT_FRONTIER_NUM_CTX, DEFAULT_MODEL_NUM_CTX, resolveModelNumCtx } from './contextSize';
+import { DEFAULT_FRONTIER_NUM_CTX, resolveModelNumCtx } from './contextSize';
 import { parsePlanOptions } from './planOptions';
 import { installedModelSizeB } from './recommender';
-import { getEnabledModelsForNode, isFrontierNode, nodeAllowsRole } from './tools';
+import { isFullGpuFit } from './modelFit';
+import { fileContextCapsForTier, type ModelFitTier } from './clusterInventory';
+import { getEnabledModelsForNode, isFrontierNode, nodeAllowsRole, rankModelsForWeight } from './tools';
 import { isDurableStep, isInspectionOnly } from './workLog';
 import type { NodeRole } from '../types';
 
@@ -21,14 +23,9 @@ export interface NextStepDecision {
 
 export const CONTINUATION_REVIEW_SYSTEM = `You decide the next coding step after work just finished. You do NOT patch files yourself — Coder applies changes from Planner contracts. Reviewer findings go to Planner, not to you as edits.
 
-You may use these tools for inspection only:
-<list_dir path="."/>
-<read_file path="relative/path"/>
-<search query="text"/>
+Touched files are already in the user message. Do not call read, list, search, write, or edit tools. Emit exactly one <next_step> block.
 
-Do NOT use <write_file> or <edit_file>. Do not Apply changes. After at most one round of reads, emit exactly one <next_step> block.
-
-Reading is a tool inside this turn, never a <task>. Do not set <task> to "Read …", "Verify …", "Examine …", or "Check …". A <task> must name a file and a concrete change for Coder (fix, edit, wire, implement).
+Do not set <task> to "Read …", "Verify …", "Examine …", or "Check …". A <task> must name a file and a concrete change for Coder (fix, edit, wire, implement).
 
 <next_step>
 <decision>continue</decision>
@@ -91,8 +88,8 @@ export interface ReviewTarget {
 }
 
 /**
- * Strongest enabled local model for the after-step check.
- * Order: parameter size, then that model's num_ctx, then VRAM.
+ * Strongest enabled local model that fits fully in GPU for this role.
+ * Catalog task quality, then active params, then measured tok/s (see rankModelsForWeight).
  * Only nodes that allow `role` (default reviewer) are considered — Allowed Roles is hard.
  * Frontier is only the pool when no local worker is online.
  */
@@ -105,27 +102,10 @@ export function pickCapableReviewTarget(
   );
   const local = usable.filter(n => !isFrontierNode(n));
   const pool = local.length > 0 ? local : usable;
-  let best: ReviewTarget | undefined;
-  let bestSize = -1;
-  let bestCtx = -1;
-  let bestVram = -1;
-  for (const node of pool) {
-    const vram = node.hardware?.vramGB || 0;
-    for (const model of getEnabledModelsForNode(node)) {
-      const size = sizeOfEnabledModel(node, model);
-      const ctx = resolveModelNumCtx(node, model, DEFAULT_MODEL_NUM_CTX);
-      const wins =
-        size > bestSize ||
-        (size === bestSize && ctx > bestCtx) ||
-        (size === bestSize && ctx === bestCtx && vram > bestVram);
-      if (!wins) continue;
-      best = { node, model };
-      bestSize = size;
-      bestCtx = ctx;
-      bestVram = vram;
-    }
-  }
-  return best;
+  const weight = role === 'docs' ? 'light' : 'heavy';
+  const picked = rankModelsForWeight(pool, weight, { role });
+  if (!picked) return undefined;
+  return { node: picked.node, model: picked.model };
 }
 
 /**
@@ -165,7 +145,7 @@ export function parseFinalReview(raw: string): { result: 'pass' | 'issues'; note
   return { result, notes: notes.slice(0, 4000) };
 }
 
-/** Largest enabled local model, then the card with the most VRAM. Used when a step is repeating. */
+/** Largest enabled local model that fits in GPU, then the card with the most VRAM. */
 export function pickLargestLocalTarget(
   nodes: EndpointNode[],
   role: NodeRole = 'coder'
@@ -177,21 +157,24 @@ export function pickLargestLocalTarget(
       getEnabledModelsForNode(n).length > 0 &&
       nodeAllowsRole(n, role)
   );
-  let best: ReviewTarget | undefined;
-  let bestSize = -1;
-  let bestVram = -1;
+  const cands: { node: EndpointNode; model: string; size: number; vram: number; fits: boolean }[] = [];
   for (const node of pool) {
     const vram = node.hardware?.vramGB || 0;
     for (const model of getEnabledModelsForNode(node)) {
-      const size = sizeOfEnabledModel(node, model);
-      const wins = size > bestSize || (size === bestSize && vram > bestVram);
-      if (!wins) continue;
-      best = { node, model };
-      bestSize = size;
-      bestVram = vram;
+      cands.push({
+        node,
+        model,
+        size: sizeOfEnabledModel(node, model),
+        vram,
+        fits: isFullGpuFit(node, model)
+      });
     }
   }
-  return best;
+  const fitting = cands.filter(c => c.fits);
+  const use = fitting.length ? fitting : cands;
+  use.sort((a, b) => b.size - a.size || b.vram - a.vram);
+  const best = use[0];
+  return best ? { node: best.node, model: best.model } : undefined;
 }
 
 /**
@@ -212,9 +195,13 @@ export function liveRoutePin(
   const pinOk = !!live?.online && getEnabledModelsForNode(live).includes(pin.model);
   if (!pinOk || !live) return best;
   if (isFrontierNode(live)) return { node: live, model: pin.model };
+  const pinFits = isFullGpuFit(live, pin.model);
+  const bestFits = !!best && (isFrontierNode(best.node) || isFullGpuFit(best.node, best.model));
+  if (best && bestFits && !pinFits) return best;
   if (
     best &&
-    !isFrontierNode(best.node) &&
+    bestFits &&
+    pinFits &&
     sizeOfEnabledModel(best.node, best.model) > sizeOfEnabledModel(live, pin.model)
   ) {
     return best;
@@ -425,6 +412,31 @@ export function parseNextStep(raw: string): NextStepDecision | null {
   return { decision, reason, task, options };
 }
 
+/** Cap preloaded touched-file bodies. Continuation review must not spend a turn re-reading them. */
+export function formatPreloadedTouchedFiles(
+  files: { path: string; content: string }[],
+  tier: ModelFitTier = 'tight'
+): string {
+  const caps = fileContextCapsForTier(tier);
+  const chunks: string[] = [];
+  let total = 0;
+  for (const file of files) {
+    if (chunks.length >= caps.maxFiles || total >= caps.maxTotalChars) break;
+    const path = (file.path || '').replace(/\\/g, '/').trim();
+    if (!path) continue;
+    const room = Math.min(caps.maxCharsPerFile, caps.maxTotalChars - total);
+    if (room < 80) break;
+    const raw = (file.content || '').replace(/\r\n/g, '\n');
+    const body =
+      raw.length > room
+        ? `${raw.slice(0, Math.floor(room * 0.7))}\n…(truncated)…\n${raw.slice(-(room - Math.floor(room * 0.7) - 20))}`
+        : raw;
+    chunks.push(`### ${path}\n\`\`\`\n${body}\n\`\`\``);
+    total += body.length;
+  }
+  return chunks.join('\n\n');
+}
+
 export function buildContinuationReviewPrompt(input: {
   approvedPlanText?: string;
   recentTranscript: string;
@@ -432,6 +444,11 @@ export function buildContinuationReviewPrompt(input: {
   workLog?: string;
   writtenPaths?: string[];
   capped?: boolean;
+  /** Already-formatted touched-file block. */
+  touchedFileBodies?: string;
+  /** Raw files; capped with `tier` (default tight) and inlined. */
+  preloadedFiles?: { path: string; content: string }[];
+  tier?: ModelFitTier;
 }): string {
   const plan = input.approvedPlanText?.trim()
     ? `Approved plan:\n${input.approvedPlanText.trim()}`
@@ -442,9 +459,16 @@ export function buildContinuationReviewPrompt(input: {
   const log = input.workLog?.trim()
     ? `\n\nWork log (Bug and durable Next are priority; do not repeat Done or Already asked; never continue with Read/Verify only):\n${input.workLog.trim()}`
     : '';
-  const files = input.writtenPaths?.length
-    ? `\n\nFiles just written (read these, then patch bugs in them with edit_file):\n${input.writtenPaths.join('\n')}`
-    : '';
+  const bodies =
+    input.touchedFileBodies?.trim() ||
+    (input.preloadedFiles?.length
+      ? formatPreloadedTouchedFiles(input.preloadedFiles, input.tier ?? 'tight')
+      : '');
+  const files = bodies
+    ? `\n\n## Touched files (already loaded — do not call read_file, list_dir, or search)\n${bodies}`
+    : input.writtenPaths?.length
+      ? `\n\nFiles just written (bodies were not inlined; decide from the transcript and do not call tools):\n${input.writtenPaths.join('\n')}`
+      : '';
   return `${plan}${log}${files}
 
 Workspace (top level):

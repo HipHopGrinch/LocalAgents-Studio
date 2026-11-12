@@ -2,7 +2,7 @@ import React from 'react';
 import { CheckCircle2, Download } from 'lucide-react';
 import { EndpointNode } from '../../types';
 import { MODEL_CATALOG, TASKS, TaskId } from '../../config/modelCatalog';
-import { estimateFit, FIT_LABEL, isInstalled } from '../../lib/recommender';
+import { estimateFit, FIT_LABEL, isInstalled, recommendQuantVariant } from '../../lib/recommender';
 
 interface ModelHubPanelProps {
   nodes: EndpointNode[];
@@ -65,6 +65,7 @@ export const ModelHubPanel: React.FC<ModelHubPanelProps> = ({
       {TASKS.map(t => (
         <button
           key={t.id}
+          type="button"
           onClick={() => onSelectTask(t.id)}
           className={`px-3 py-1.5 rounded-lg border transition shrink-0 ${
             selectedTask === t.id
@@ -83,6 +84,14 @@ export const ModelHubPanel: React.FC<ModelHubPanelProps> = ({
         const installed = isInstalled(currentNode, model.tag);
         const pullKey = `${currentNode.id}:${model.tag}`;
         const pulling = pullProgress[pullKey];
+        const suggestion = recommendQuantVariant(currentNode, model, estimateContext);
+        const suggestionInstalled = suggestion ? isInstalled(currentNode, suggestion.tag) : false;
+        const suggestionPull = suggestion ? pullProgress[`${currentNode.id}:${suggestion.tag}`] : undefined;
+        const suggestionWhy = suggestion
+          ? suggestion.reason === 'spill'
+            ? `${model.tag} spills out of VRAM at this context. ${suggestion.tag} (${suggestion.quant}, ${suggestion.sizeGB.toFixed(1)} GB) fits.`
+            : `${model.tag} leaves more than 3 GB of VRAM unused. ${suggestion.tag} (${suggestion.quant}, ${suggestion.sizeGB.toFixed(1)} GB) uses that headroom.`
+          : '';
 
         return (
           <div
@@ -93,7 +102,7 @@ export const ModelHubPanel: React.FC<ModelHubPanelProps> = ({
               <div className="flex items-center justify-between">
                 <span className="font-mono font-bold text-zinc-100">{model.tag}</span>
                 <span
-                  className={`px-2 py-0.5 rounded text-[10px] font-medium border ${
+                  className={`px-2 py-0.5 rounded text-[11px] font-medium border ${
                     fit.kind === 'gpu'
                       ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
                       : fit.kind === 'partial'
@@ -105,10 +114,29 @@ export const ModelHubPanel: React.FC<ModelHubPanelProps> = ({
                 </span>
               </div>
               <p className="text-[11px] text-zinc-400 mt-1 leading-relaxed">{model.notes}</p>
+              {suggestion && (
+                <div className="mt-2 rounded-lg border border-[#2c2c38] bg-[#18181d] px-2 py-1.5 space-y-1.5">
+                  <p className="text-[11px] text-zinc-300 leading-relaxed">{suggestionWhy}</p>
+                  {suggestionInstalled ? (
+                    <span className="text-[11px] text-emerald-400">Suggested quant is installed</span>
+                  ) : suggestionPull ? (
+                    <span className="text-[11px] text-amber-300 animate-pulse font-mono">{suggestionPull.status}</span>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => onPullModel(currentNode, suggestion.tag)}
+                      className="inline-flex items-center space-x-1 px-2 py-1 bg-[#25252e] hover:bg-[#30303a] text-zinc-100 rounded text-[11px] font-medium"
+                    >
+                      <Download className="w-3 h-3" />
+                      <span>Pull {suggestion.tag}</span>
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="pt-2 border-t border-[#22222a] flex items-center justify-between text-[11px]">
-              <div className="flex items-center space-x-2 text-zinc-400 font-mono text-[10px]">
+              <div className="flex items-center space-x-2 text-zinc-400 font-mono text-[11px]">
                 <span>Size: {model.sizeGB.toFixed(1)} GB</span>
                 <span>•</span>
                 <span>~{fit.tokensPerSec} tok/s</span>
@@ -120,11 +148,12 @@ export const ModelHubPanel: React.FC<ModelHubPanelProps> = ({
                   <span>Installed</span>
                 </span>
               ) : pulling ? (
-                <span className="text-[10px] text-amber-300 animate-pulse font-mono">
+                <span className="text-[11px] text-amber-300 animate-pulse font-mono">
                   {pulling.status}
                 </span>
               ) : (
                 <button
+                  type="button"
                   onClick={() => onPullModel(currentNode, model.tag)}
                   className="flex items-center space-x-1 px-2.5 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-[11px] font-medium transition"
                 >

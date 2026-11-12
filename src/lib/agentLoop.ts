@@ -1,8 +1,9 @@
 import { ChatMessage, ToolCall } from '../types';
-import { applyEdits, formatToolResult, READ_ONLY_TOOLS } from './tools';
+import { applyEdits, formatToolResult, parseEditBlocks, READ_ONLY_TOOLS } from './tools';
 import { shouldRejectPlannerWrite } from './swarmContract';
 import { shadowOwnedPath } from './projectBrain';
-import { pickImageTarget, placeholderSvg } from './imageRouting';
+import { coderModelToRewarm, pickImageTarget, placeholderSvg } from './imageRouting';
+import { pinnedNumCtx } from './contextSize';
 import { symbolHitsForQuery, type RepoMap } from './repoMap';
 
 /** Fallback when settings.maxAgentSteps is missing. */
@@ -39,8 +40,233 @@ function isDestructiveDelete(cmd: string): boolean {
   return false;
 }
 
+/** Encoded PowerShell, Invoke-Expression, and cmd /c wrappers hide a destructive payload. */
+function isIndirectShell(cmd: string): boolean {
+  const c = cmd || '';
+  if (/(?:^|[\s;&|(])(?:-|\/)(?:encodedcommand|enc)\b/i.test(c)) return true;
+  if (/\b(?:invoke-expression|iex)\b/i.test(c)) return true;
+  if (/\bcmd(?:\.exe)?\s*\/c\b/i.test(c)) return true;
+  if (/\b(?:powershell|pwsh)(?:\.exe)?\b[^\n]*\s-(?:e|ec|en|enc|encodedcommand)\b/i.test(c)) return true;
+  if (/\bfrombase64string\b/i.test(c)) return true;
+  if (/\bdownloadstring\b/i.test(c)) return true;
+  return false;
+}
+
 export function isDestructiveCommand(cmd: string): boolean {
-  return DESTRUCTIVE_CMD.test(cmd) || isDestructiveDelete(cmd);
+  return DESTRUCTIVE_CMD.test(cmd) || isDestructiveDelete(cmd) || isIndirectShell(cmd);
+}
+
+export type ToolResultTier = 'tight' | 'standard' | 'wide';
+
+export function continuationCharCap(tier: ToolResultTier = 'standard'): number {
+  if (tier === 'tight') return 8000;
+  if (tier === 'wide') return 32000;
+  return 16000;
+}
+
+/** Error lines plus a head and tail, capped by fit tier. Short results pass through. */
+export function capToolResultText(text: string, tier: ToolResultTier = 'standard'): string {
+  const raw = text || '';
+  const cap = continuationCharCap(tier);
+  if (raw.length <= cap) return raw;
+  const lines = raw.split(/\r?\n/);
+  const errorLines = lines.filter(l => /\berror\b|exception|\bTS\d+\b|failed/i.test(l)).slice(0, 40);
+  const head = lines.slice(0, 40);
+  const tail = lines.slice(-40);
+  const overlap = lines.length <= 80 ? lines.length : 80;
+  const middle = Math.max(0, lines.length - overlap);
+  const chunks = [
+    errorLines.length ? errorLines.join('\n') : '',
+    head.join('\n'),
+    middle > 0 ? `…and ${middle} more lines` : '',
+    lines.length > 80 ? tail.join('\n') : ''
+  ].filter(Boolean);
+  let out = chunks.join('\n');
+  if (out.length > cap) {
+    out = `${out.slice(0, Math.max(0, cap - 32))}\n…and ${lines.length} more lines`;
+  }
+  return out;
+}
+
+/** Same rule as parseResponse: drop closed and unclosed think blocks. */
+export function stripThinkingForHistory(raw: string): string {
+  return (raw || '').replace(/<think>([\s\S]*?)(<\/think>|$)/gi, '').trim();
+}
+
+/** History must not re-send full write_file bodies. */
+export function omitWriteFileBodies(content: string): string {
+  return (content || '').replace(/<write_file\b([^>]*)>[\s\S]*?(?:<\/write_file\s*>|$)/gi, (_m, attrs) => {
+    const path =
+      /\bpath\s*=\s*"([^"]*)"/i.exec(attrs)?.[1] ||
+      /\bpath\s*=\s*'([^']*)'/i.exec(attrs)?.[1] ||
+      'file';
+    return `<write_file path="${path}">(body omitted)</write_file>`;
+  });
+}
+
+function readHistoryLines(message: ChatMessage): string[] {
+  const calls = message.toolCalls || [];
+  const lines: string[] = [];
+  for (const tool of calls) {
+    if (tool.name !== 'read_file' || tool.status !== 'done') continue;
+    const n = (tool.result || '').length ? (tool.result || '').split(/\r?\n/).length : 0;
+    lines.push(`Read ${tool.args?.path || 'file'} (${n} lines)`);
+  }
+  return lines;
+}
+
+function lineScore(a: string, b: string): number {
+  const x = a.trim();
+  const y = b.trim();
+  if (!x || !y) return 0;
+  if (x === y) return 1;
+  if (x.includes(y) || y.includes(x)) return 0.8;
+  let i = 0;
+  const n = Math.min(x.length, y.length);
+  while (i < n && x[i] === y[i]) i++;
+  return i / Math.max(x.length, y.length);
+}
+
+/** Nearest file lines when a SEARCH block misses. The matcher itself stays in tools.ts. */
+export function nearestSearchHint(fileText: string, search: string): string {
+  const fileLines = (fileText || '').replace(/\r\n/g, '\n').split('\n');
+  const needles = (search || '')
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map(l => l.trim())
+    .filter(Boolean);
+  if (!fileLines.length || !needles.length) return 'Nearest lines: (none)';
+  let best = 0;
+  let bestScore = -1;
+  const head = needles[0];
+  for (let i = 0; i < fileLines.length; i++) {
+    const score = lineScore(fileLines[i], head);
+    if (score > bestScore) {
+      bestScore = score;
+      best = i;
+    }
+  }
+  const from = Math.max(0, best - 2);
+  const to = Math.min(fileLines.length, best + Math.max(needles.length, 1) + 2);
+  const body = fileLines
+    .slice(from, to)
+    .map((l, i) => `${from + i + 1}| ${l}`)
+    .join('\n');
+  return `Nearest lines:\n${body}`;
+}
+
+export function formatEditMismatch(
+  fileText: string,
+  body: string,
+  error: string,
+  applied = 0
+): string {
+  const base = `Diff failed: ${error}`;
+  if (!/not found|no valid search/i.test(error || '')) return base;
+  const blocks = parseEditBlocks(body);
+  const search = blocks[applied]?.search || blocks[0]?.search || '';
+  if (!search.trim()) return base;
+  return `${base}\n${nearestSearchHint(fileText, search)}`;
+}
+
+export interface EditRepeatGuard {
+  seen: Set<string>;
+  order: string[];
+}
+
+export function createEditRepeatGuard(): EditRepeatGuard {
+  return { seen: new Set(), order: [] };
+}
+
+const defaultEditGuard = createEditRepeatGuard();
+
+export function resetEditRepeatGuard(guard: EditRepeatGuard = defaultEditGuard): void {
+  guard.seen.clear();
+  guard.order.length = 0;
+}
+
+function fnv32(text: string): string {
+  let h = 0;
+  for (let i = 0; i < text.length; i++) h = (Math.imul(31, h) + text.charCodeAt(i)) | 0;
+  return Math.abs(h).toString(36);
+}
+
+function normalizePatchText(text: string): string {
+  return (text || '')
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map(l => l.trimEnd())
+    .join('\n')
+    .trim();
+}
+
+/** Identity of one edit: normalized SEARCH (or full write body) plus the resulting bytes. */
+export function editOutcomeKey(path: string, requestBody: string, outcome: string): string {
+  const blocks = parseEditBlocks(requestBody);
+  const searchNorm = (blocks.length ? blocks.map(b => b.search) : [requestBody])
+    .map(normalizePatchText)
+    .join('\n<<<\n');
+  const file = (path || '').replace(/\\/g, '/').toLowerCase();
+  return `${file}|${fnv32(searchNorm)}|${fnv32(normalizePatchText(outcome))}`;
+}
+
+/** @returns true when this exact edit/result was already seen. */
+export function rememberEditOutcome(guard: EditRepeatGuard, key: string): boolean {
+  if (guard.seen.has(key)) return true;
+  guard.seen.add(key);
+  guard.order.push(key);
+  while (guard.order.length > 200) {
+    const old = guard.order.shift();
+    if (old) guard.seen.delete(old);
+  }
+  return false;
+}
+
+export const REPEATED_EDIT_STOP =
+  'REPEATED_EDIT: This is the same edit and the same file result as a previous attempt. Stop. Do not retry this SEARCH/REPLACE or write the same bytes.';
+
+export function isRepeatedEditStop(result?: string): boolean {
+  return (result || '').includes('REPEATED_EDIT:');
+}
+
+function editGuardOf(deps: ToolExecutorDeps): EditRepeatGuard {
+  return deps.editProgress || defaultEditGuard;
+}
+
+function editKey(path: string, requestBody: string, outcome: string): string {
+  return editOutcomeKey(path, requestBody, outcome);
+}
+
+function repeatedEditResult(
+  deps: ToolExecutorDeps,
+  path: string,
+  requestBody: string,
+  outcome: string
+): string | null {
+  return editGuardOf(deps).seen.has(editKey(path, requestBody, outcome)) ? REPEATED_EDIT_STOP : null;
+}
+
+function commitEditOutcome(
+  deps: ToolExecutorDeps,
+  path: string,
+  requestBody: string,
+  outcome: string
+): void {
+  rememberEditOutcome(editGuardOf(deps), editKey(path, requestBody, outcome));
+}
+
+/** Run jobs concurrently and write each result back to its original index. */
+export async function fulfillInOrder<T>(
+  slots: T[],
+  jobs: { index: number; run: () => Promise<T> }[]
+): Promise<T[]> {
+  const next = slots.slice();
+  await Promise.all(
+    jobs.map(async job => {
+      next[job.index] = await job.run();
+    })
+  );
+  return next;
 }
 
 export function commandSignature(tool: ToolCall): string {
@@ -66,6 +292,13 @@ export interface ToolExecutorDeps {
   getRepoMap?: () => RepoMap | null;
   /** Local MCP servers JSON from settings. Empty = MCP calls fail closed. */
   mcpServersJson?: string;
+  /** Same-edit detector for this run. Omit to use the process-wide guard. */
+  editProgress?: EditRepeatGuard;
+  /**
+   * Fit tier for continuation tool results. AgentChat should pass this into
+   * `buildContinuationUserPrompt` as `{ tier }` once the routed model is known.
+   */
+  toolResultTier?: ToolResultTier;
 }
 
 /** Execute one tool without mutating the input; returns a new ToolCall. */
@@ -97,7 +330,12 @@ export async function executeTool(tool: ToolCall, deps: ToolExecutorDeps): Promi
       if (filePath.toLowerCase().endsWith('.json') && content.trim().startsWith('```')) {
         content = content.replace(/^\s*```[a-zA-Z0-9_\-\+#]*[ \t]*\r?\n?/, '').replace(/\r?\n?```\s*$/, '');
       }
+      const repeatedWrite = repeatedEditResult(deps, filePath, content, content);
+      if (repeatedWrite) {
+        return { ...next, status: 'error', result: repeatedWrite };
+      }
       const ok = await deps.onApplyFileWrite(filePath, content);
+      if (ok) commitEditOutcome(deps, filePath, content, content);
       return {
         ...next,
         status: ok ? 'done' : 'error',
@@ -121,9 +359,18 @@ export async function executeTool(tool: ToolCall, deps: ToolExecutorDeps): Promi
       }
       const editRes = applyEdits(readRes.content, body);
       if (editRes.content === undefined) {
-        return { ...next, status: 'error', result: `Diff failed: ${editRes.error}` };
+        const mismatch = formatEditMismatch(readRes.content, body, editRes.error || 'edit failed', editRes.applied);
+        const outcome = editRes.error || mismatch;
+        const repeated = repeatedEditResult(deps, filePath, body, outcome);
+        if (!repeated) commitEditOutcome(deps, filePath, body, outcome);
+        return { ...next, status: 'error', result: repeated || mismatch };
+      }
+      const repeatedEdit = repeatedEditResult(deps, filePath, body, editRes.content);
+      if (repeatedEdit) {
+        return { ...next, status: 'error', result: repeatedEdit };
       }
       const ok = await deps.onApplyFileWrite(filePath, editRes.content);
+      if (ok) commitEditOutcome(deps, filePath, body, editRes.content);
       return {
         ...next,
         status: ok ? 'done' : 'error',
@@ -272,6 +519,15 @@ export async function executeTool(tool: ToolCall, deps: ToolExecutorDeps): Promi
       });
       if (written.error) {
         return { ...next, status: 'error', result: written.error };
+      }
+      const rewarm = coderModelToRewarm(target);
+      if (rewarm && window.electronAPI.warmModel) {
+        const numCtx = pinnedNumCtx(target.node, rewarm.model);
+        try {
+          await window.electronAPI.warmModel(target.node.url, rewarm.model, numCtx);
+        } catch {
+          /* The picture is saved. The next coder turn reloads the model if warm failed. */
+        }
       }
       return {
         ...next,
@@ -456,36 +712,44 @@ export function detectRepeatedToolTagSpam(text: string, threshold = 8): boolean 
   return false;
 }
 
-/** Run all pending read-only tools; returns updated list + whether any ran. */
+/** Run all pending read-only tools concurrently; results stay in call order. */
 export async function runReadOnlyTools(
   tools: ToolCall[],
   deps: ToolExecutorDeps
 ): Promise<{ tools: ToolCall[]; hadReads: boolean }> {
   let hadReads = false;
   const seenKeys = new Set<string>();
-  const out: ToolCall[] = [];
-  for (const tool of collapseDuplicateReadTools(tools)) {
-    if (READ_ONLY_TOOLS.includes(tool.name as any) && tool.status !== 'done' && tool.status !== 'error') {
-      const key = readToolDedupeKey(tool);
-      if (key && seenKeys.has(key)) {
-        out.push({
-          ...tool,
-          status: 'done',
-          result: `(skipped duplicate ${tool.name} — already captured this turn)`
-        });
-        hadReads = true;
-        continue;
-      }
-      if (key) seenKeys.add(key);
-      hadReads = true;
-      out.push(await executeTool(tool, deps));
-    } else {
+  const collapsed = collapseDuplicateReadTools(tools);
+  const out: ToolCall[] = collapsed.slice();
+  const jobs: { index: number; run: () => Promise<ToolCall> }[] = [];
+
+  for (let i = 0; i < collapsed.length; i++) {
+    const tool = collapsed[i];
+    const pending =
+      READ_ONLY_TOOLS.includes(tool.name as (typeof READ_ONLY_TOOLS)[number]) &&
+      tool.status !== 'done' &&
+      tool.status !== 'error';
+    if (!pending) {
       const key = readToolDedupeKey(tool);
       if (key && (tool.status === 'done' || tool.status === 'error')) seenKeys.add(key);
-      out.push(tool);
+      continue;
     }
+    const key = readToolDedupeKey(tool);
+    if (key && seenKeys.has(key)) {
+      hadReads = true;
+      out[i] = {
+        ...tool,
+        status: 'done',
+        result: `(skipped duplicate ${tool.name} — already captured this turn)`
+      };
+      continue;
+    }
+    if (key) seenKeys.add(key);
+    hadReads = true;
+    jobs.push({ index: i, run: () => executeTool(tool, deps) });
   }
-  return { tools: out, hadReads };
+
+  return { tools: await fulfillInOrder(out, jobs), hadReads };
 }
 
 export async function runAuxTools(tools: ToolCall[], deps: ToolExecutorDeps): Promise<ToolCall[]> {
@@ -606,6 +870,11 @@ export function shouldContinueFromTools(
   tools: ToolCall[],
   opts: ContinueDecisionOpts = {}
 ): boolean {
+  if (tools.some(t => isRepeatedEditStop(t.result))) {
+    // One continuation so the model hears the stop, then halt.
+    return (opts.writeFixAttempts ?? 0) < 1;
+  }
+
   const doneTools = tools.filter(t => t.status === 'done' || t.status === 'error');
   const terminalOnly =
     doneTools.length > 0 && doneTools.every(t => t.name === 'read_terminal');
@@ -668,9 +937,16 @@ export function isReadOnlyToolBatch(tools: ToolCall[]): boolean {
 
 export function buildContinuationUserPrompt(
   feedbackTools: ToolCall[],
-  opts?: { finalCommandAttempt?: boolean }
+  opts?: { finalCommandAttempt?: boolean; tier?: ToolResultTier }
 ): string {
-  const resultsXml = feedbackTools.map(t => formatToolResult(t)).join('\n\n');
+  const tier = opts?.tier ?? 'standard';
+  const shown = feedbackTools.map(t =>
+    t.result ? { ...t, result: capToolResultText(t.result, tier) } : t
+  );
+  const resultsXml = shown.map(t => formatToolResult(t, { tier })).join('\n\n');
+  if (shown.some(t => isRepeatedEditStop(t.result))) {
+    return `Edit repeated:\n${resultsXml}\n\nYou repeated an edit that produced the same file result. Stop. Do not emit the same SEARCH/REPLACE or the same write_file body again. Say what is blocked in one short sentence.`;
+  }
   const cmdFailed = feedbackTools.some(t => t.name === 'run_command' && t.status === 'error');
   const writeFailed = feedbackTools.some(
     t => (t.name === 'write_file' || t.name === 'edit_file') && t.status === 'error'
@@ -727,7 +1003,11 @@ export function historyForModel(
   return messages
     .filter(m => m.role === 'user' || m.role === 'assistant')
     .map(m => {
-      const content = stripThinking(m.raw || m.display || '');
+      const stripped = stripThinkingForHistory(stripThinking(m.raw || m.display || ''));
+      const content = [omitWriteFileBodies(stripped), ...readHistoryLines(m)]
+        .filter(part => part && part.trim())
+        .join('\n')
+        .trim();
       const entry: ApiChatMessage = { role: m.role, content };
       if (m.role === 'user' && m.images && m.images.length > 0) {
         // Ollama expects raw base64 (no data: prefix)

@@ -5,7 +5,9 @@ import { EditorView } from './components/EditorView';
 import { GitPanel } from './components/GitPanel';
 import { TerminalPanel } from './components/TerminalPanel';
 import { AgentChat } from './components/AgentChat';
-import { HardwareSettingsModal } from './components/HardwareSettingsModal';
+import { HardwareSettingsModal, type HardwareSettingsTab } from './components/HardwareSettingsModal';
+import { CommandPalette } from './components/CommandPalette';
+import { SplitHandle } from './components/ui/SplitHandle';
 import { UpdateBanner } from './components/UpdateBanner';
 import { ProjectPickerModal } from './components/ProjectPickerModal';
 import { MessageSquare, FolderTree, Code2, Terminal as TerminalIcon, MoreHorizontal } from 'lucide-react';
@@ -22,9 +24,18 @@ import {
   LiveSessionNode,
   LiveConductorState
 } from './types';
-import { DEFAULT_SETTINGS, mergeSettings } from './config/defaults';
+import {
+  DEFAULT_SETTINGS,
+  MAX_CHAT_WIDTH,
+  MAX_EXPLORER_WIDTH,
+  mergeSettings,
+  MIN_CHAT_WIDTH,
+  MIN_EXPLORER_WIDTH
+} from './config/defaults';
 import { bumpFreeTierUsage } from './lib/freeTierAssist';
+import { settingsNodesFromLiveSnapshot } from './lib/settingsNodes';
 import { normalizeClusterNodes } from './lib/tools';
+import { clampWritePath } from './lib/writePath';
 import { getLanguageFromPath } from './utils/language';
 import {
   conversationsForWorkspace,
@@ -157,25 +168,28 @@ function RemoteHostBanner({ remoteLive }: { remoteLive: boolean }) {
   );
 }
 
-/**
- * Keep agent writes inside the open folder.
- * Absolute paths outside the workspace are rejected (null) — never basename-clobbered into root.
- */
-function clampWritePath(root: string, filePath: string): string | null {
-  let p = (filePath || '').trim().replace(/^["']|["']$/g, '');
-  if (!p) return 'file';
-  const rootNorm = root.replace(/[\\/]+$/, '').replace(/\\/g, '/');
-  let norm = p.replace(/\\/g, '/');
-  const rootLower = rootNorm.toLowerCase();
-  const lower = norm.toLowerCase();
-  if (lower === rootLower) return 'file';
-  if (lower.startsWith(rootLower + '/')) {
-    norm = norm.slice(rootNorm.length + 1);
-  } else if (/^[a-zA-Z]:\//.test(norm) || norm.startsWith('//') || norm.startsWith('/')) {
-    return null;
-  }
-  const parts = norm.split('/').filter(part => part && part !== '.' && part !== '..');
-  return parts.length ? parts.join('/') : null;
+const HARDWARE_TABS: readonly HardwareSettingsTab[] = [
+  'nodes',
+  'endpoints',
+  'models',
+  'integrations',
+  'hub',
+  'appearance',
+  'stats',
+  'remote',
+  'support'
+];
+
+function isHardwareTab(tab: string | undefined): tab is HardwareSettingsTab {
+  return !!tab && (HARDWARE_TABS as readonly string[]).includes(tab);
+}
+
+function isTextEditingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) return false;
+  if (target instanceof HTMLElement && target.isContentEditable) return true;
+  const tag = target.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  return !!target.closest('[contenteditable="true"], .monaco-editor, .xterm');
 }
 
 export const App: React.FC = () => {
@@ -209,6 +223,10 @@ export const App: React.FC = () => {
   // Modals & Drawers
   const [isTerminalOpen, setIsTerminalOpen] = useState(false);
   const [isHardwareModalOpen, setIsHardwareModalOpen] = useState(false);
+  const [hardwareTab, setHardwareTab] = useState<HardwareSettingsTab | undefined>(undefined);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  /** True while AgentChat reports a running turn (existing onBusyChange). */
+  const [agentBusy, setAgentBusy] = useState(false);
   /** Mobile / narrow web-console pane (desktop keeps the 3-column layout). */
   type MobilePane = 'chat' | 'files' | 'code' | 'term' | 'more';
   const [mobilePane, setMobilePane] = useState<MobilePane>('chat');
@@ -225,8 +243,8 @@ export const App: React.FC = () => {
   }, []);
 
   // Resizable Sidebar Widths
-  const [explorerWidth, setExplorerWidth] = useState<number>(DEFAULT_SETTINGS.explorerWidth || 240);
-  const [chatWidth, setChatWidth] = useState<number>(DEFAULT_SETTINGS.chatWidth || 640);
+  const [explorerWidth, setExplorerWidth] = useState<number>(DEFAULT_SETTINGS.explorerWidth ?? MIN_EXPLORER_WIDTH);
+  const [chatWidth, setChatWidth] = useState<number>(DEFAULT_SETTINGS.chatWidth ?? MIN_CHAT_WIDTH);
   const [agentControlWidth, setAgentControlWidth] = useState<number>(
     DEFAULT_SETTINGS.agentControlWidth || 270
   );
@@ -336,21 +354,10 @@ export const App: React.FC = () => {
         // Ignore. A web publish can carry the previous desktop node list and would
         // turn a model back on or mark an offline node online.
       } else if (trustIncomingConfig) {
-        const configs: NodeConfig[] = session.nodes.map(n => {
-          const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, hasApiKey: _h, ...cfg } =
-            n as LiveSessionNode & EndpointNode & { hasApiKey?: boolean };
-          return cfg;
-        });
-        // Live session strips apiKeys for web — never wipe local secrets on echo.
+        // Live session strips apiKeys. Keep the saved key and drop runtime fields.
         setSettings(prev => ({
           ...prev,
-          nodes: configs.map(cfg => {
-            const prior = prev.nodes.find(p => p.id === cfg.id);
-            if ((!cfg.apiKey || (cfg as { hasApiKey?: boolean }).hasApiKey) && prior?.apiKey) {
-              return { ...cfg, apiKey: prior.apiKey };
-            }
-            return prior?.apiKey && !cfg.apiKey ? { ...cfg, apiKey: prior.apiKey } : cfg;
-          })
+          nodes: settingsNodesFromLiveSnapshot(prev.nodes, session.nodes)
         }));
         setNodes(prev => applySnapshotNodes(prev, session.nodes, false));
       } else if (session.source === 'seed') {
@@ -467,7 +474,7 @@ export const App: React.FC = () => {
       if (live && Array.isArray(live.nodes) && live.nodes.length > 0) {
         const trustLiveConfig = isRemoteClient || live.source === 'desktop';
         if (trustLiveConfig && (!merged.nodes.length || (live.updatedAt && live.nodes.length >= merged.nodes.length))) {
-          merged.nodes = live.nodes;
+          merged.nodes = settingsNodesFromLiveSnapshot(merged.nodes, live.nodes);
         }
       }
 
@@ -482,8 +489,8 @@ export const App: React.FC = () => {
       if (isRemoteClient && live) {
         setSessionTokens(prev => mergeTokenMirror(prev, live));
       }
-      if (merged.explorerWidth) setExplorerWidth(merged.explorerWidth);
-      if (merged.chatWidth) setChatWidth(merged.chatWidth);
+      setExplorerWidth(merged.explorerWidth ?? MIN_EXPLORER_WIDTH);
+      setChatWidth(merged.chatWidth ?? MIN_CHAT_WIDTH);
       if (merged.agentControlWidth) setAgentControlWidth(merged.agentControlWidth);
       if (merged.agentNodeWorkWidth) setAgentNodeWorkWidth(merged.agentNodeWorkWidth);
 
@@ -671,21 +678,25 @@ export const App: React.FC = () => {
     updateSettings({ uiScale: clamped });
   }, [updateSettings]);
 
-  // Global Keyboard Zoom Shortcuts: Ctrl + / Ctrl - / Ctrl 0
+  // Ctrl+K command palette. Ctrl +/-/0 zoom is ignored while typing or in Monaco / the terminal.
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.ctrlKey || e.metaKey) {
-        if (e.key === '=' || e.key === '+') {
-          e.preventDefault();
-          handleUpdateUiScale(uiScale + 0.05);
-        } else if (e.key === '-' || e.key === '_') {
-          e.preventDefault();
-          handleUpdateUiScale(uiScale - 0.05);
-        } else if (e.key === '0') {
-          e.preventDefault();
-          handleUpdateUiScale(1.0);
-        }
+      if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+      if (e.key.toLowerCase() === 'k' && !e.shiftKey) {
+        if (e.repeat) return;
+        e.preventDefault();
+        setPaletteOpen(open => !open);
+        return;
       }
+      const zoomIn = e.key === '=' || e.key === '+' || e.code === 'NumpadAdd';
+      const zoomOut = e.key === '-' || e.key === '_' || e.code === 'NumpadSubtract';
+      const zoomReset = (e.key === '0' || e.code === 'Numpad0') && !e.shiftKey;
+      if (!zoomIn && !zoomOut && !zoomReset) return;
+      e.preventDefault();
+      if (isTextEditingTarget(e.target)) return;
+      if (zoomIn) handleUpdateUiScale(uiScale + 0.05);
+      else if (zoomOut) handleUpdateUiScale(uiScale - 0.05);
+      else handleUpdateUiScale(1.0);
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
@@ -765,11 +776,11 @@ export const App: React.FC = () => {
 
     const handleMouseMove = (e: MouseEvent) => {
       if (resizingSide === 'explorer') {
-        const nextWidth = Math.max(160, Math.min(540, e.clientX));
+        const nextWidth = Math.max(MIN_EXPLORER_WIDTH, Math.min(MAX_EXPLORER_WIDTH, e.clientX));
         setExplorerWidth(nextWidth);
       } else if (resizingSide === 'chat') {
-        // Whole Agent Conductor (chat + Conductor + Node Work) — allow pulling further left.
-        const nextWidth = Math.max(560, Math.min(1600, window.innerWidth - e.clientX));
+        // Whole agent pane (transcript + Conductor + Node Work).
+        const nextWidth = Math.max(MIN_CHAT_WIDTH, Math.min(MAX_CHAT_WIDTH, window.innerWidth - e.clientX));
         setChatWidth(nextWidth);
       }
     };
@@ -791,7 +802,7 @@ export const App: React.FC = () => {
   const nodesRef = React.useRef(nodes);
   nodesRef.current = nodes;
 
-  const refreshNodes = useCallback(async () => {
+  const refreshNodes = useCallback(async (opts?: { force?: boolean }) => {
     if (!window.electronAPI) return;
     const endpointsToPing = nodesRef.current.map(n => ({
       id: n.id,
@@ -801,7 +812,10 @@ export const App: React.FC = () => {
     }));
 
     try {
-      const results = await window.electronAPI.clusterStatus(endpointsToPing);
+      const results = await window.electronAPI.clusterStatus(
+        endpointsToPing,
+        opts?.force ? { force: true } : undefined
+      );
       setNodes(prev =>
         prev.map(n => {
           const res = results[n.id];
@@ -841,11 +855,17 @@ export const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    // Web + desktop both ping through the host — remotes must not wait solely on live session.
-    refreshNodes();
-    const interval = setInterval(refreshNodes, (settings.pollIntervalSec || 15) * 1000);
-    return () => clearInterval(interval);
-  }, [settings.pollIntervalSec, refreshNodes]);
+    // Web clients share one main-process cache and poll less often. A running turn
+    // slows /api/ps further so prefilling GPUs are not probed every 15s.
+    // Skip the immediate ping when a turn just became busy.
+    if (!agentBusy) void refreshNodes();
+    const baseSec = settings.pollIntervalSec || 15;
+    const sec = agentBusy ? Math.max(baseSec, 60) : isRemoteClient ? Math.max(baseSec, 30) : baseSec;
+    const interval = window.setInterval(() => {
+      void refreshNodes();
+    }, sec * 1000);
+    return () => window.clearInterval(interval);
+  }, [settings.pollIntervalSec, refreshNodes, agentBusy, isRemoteClient]);
 
   // 4. File Tree
   const loadDirectory = async (dirPath: string) => {
@@ -1115,6 +1135,18 @@ export const App: React.FC = () => {
     });
   };
 
+  const handleCursorLine = useCallback((path: string, line: number) => {
+    setOpenTabs(prev => {
+      let changed = false;
+      const next = prev.map(tab => {
+        if (tab.path !== path || tab.cursorLine === line) return tab;
+        changed = true;
+        return { ...tab, cursorLine: line };
+      });
+      return changed ? next : prev;
+    });
+  }, []);
+
   const handleContentChange = (path: string, newContent: string) => {
     setOpenTabs(prev =>
       prev.map(tab => {
@@ -1171,6 +1203,8 @@ export const App: React.FC = () => {
   const handleApplyFileWrite = async (filePath: string, content: string): Promise<boolean> => {
     if (!window.electronAPI || !workspacePath) return false;
 
+    // workspacePath is the desktop-opened folder. Web clients mirror it from the live
+    // session; execTool still rejects a root that is not the main-process pin.
     const rel = clampWritePath(workspacePath, filePath);
     if (!rel) {
       console.error('Write rejected: path outside workspace', filePath);
@@ -1413,6 +1447,7 @@ export const App: React.FC = () => {
   };
 
   const handleAgentBusyChange = useCallback((busy: boolean) => {
+    setAgentBusy(busy);
     void window.electronAPI?.setUpdateBusy?.(busy);
   }, []);
 
@@ -1463,10 +1498,90 @@ export const App: React.FC = () => {
     onConductorPrefsChange: updateSettings,
     onUpdateNodes: handleUpdateNodes,
     onBusyChange: handleAgentBusyChange,
+    onOpenHardware: () => {
+      setHardwareTab('nodes');
+      setIsHardwareModalOpen(true);
+    },
+    onOpenFolder: handleSelectFolder,
     peerConductor,
     peerChatMirror,
     onLiveConductorPublish: handleLiveConductorPublish
   };
+
+  const openHardwareTab = (tab: HardwareSettingsTab) => {
+    setHardwareTab(tab);
+    setIsHardwareModalOpen(true);
+  };
+
+  const paletteActions = [
+    { id: 'open-folder', label: 'Open folder', keywords: 'project workspace', run: () => void handleSelectFolder() },
+    {
+      id: 'hw-endpoints',
+      label: 'Hardware & Models: Endpoints',
+      hint: 'Nodes',
+      keywords: 'cluster gpu ollama',
+      run: () => openHardwareTab('endpoints')
+    },
+    {
+      id: 'hw-models',
+      label: 'Hardware & Models: Models',
+      keywords: 'pull benchmark installed',
+      run: () => openHardwareTab('models')
+    },
+    {
+      id: 'hw-integrations',
+      label: 'Hardware & Models: Integrations',
+      keywords: 'mcp searxng',
+      run: () => openHardwareTab('integrations')
+    },
+    {
+      id: 'hw-hub',
+      label: 'Hardware & Models: Model Hub',
+      keywords: 'catalog recommend quant',
+      run: () => openHardwareTab('hub')
+    },
+    {
+      id: 'hw-appearance',
+      label: 'Hardware & Models: Appearance',
+      keywords: 'zoom scale theme',
+      run: () => openHardwareTab('appearance')
+    },
+    {
+      id: 'hw-stats',
+      label: 'Hardware & Models: Stats',
+      keywords: 'tokens usage',
+      run: () => openHardwareTab('stats')
+    },
+    {
+      id: 'hw-remote',
+      label: 'Hardware & Models: Remote',
+      keywords: 'web console lan',
+      run: () => openHardwareTab('remote')
+    },
+    {
+      id: 'hw-support',
+      label: 'Hardware & Models: Support',
+      keywords: 'logs help',
+      run: () => openHardwareTab('support')
+    },
+    {
+      id: 'toggle-terminal',
+      label: isTerminalOpen ? 'Hide terminal' : 'Show terminal',
+      keywords: 'powershell console',
+      run: () => {
+        const next = !isTerminalOpen;
+        setIsTerminalOpen(next);
+        if (isNarrow) setMobilePane(next ? 'term' : 'chat');
+      }
+    },
+    { id: 'new-chat', label: 'New chat', keywords: 'conversation thread', run: () => handleNewChat() },
+    {
+      id: 'refresh-cluster',
+      label: 'Refresh cluster',
+      keywords: 'ping nodes status',
+      run: () => void refreshNodes({ force: true })
+    }
+  ];
 
   const mobileNavBtn = (id: MobilePane, label: string, Icon: typeof MessageSquare) => (
     <button
@@ -1503,11 +1618,16 @@ export const App: React.FC = () => {
           onOpenRecent={handleOpenRecent}
           onNewProject={handleNewProject}
           nodes={nodes}
-          onRefreshNodes={refreshNodes}
+          onRefreshNodes={() => {
+            void refreshNodes({ force: true });
+          }}
           isTerminalOpen={isTerminalOpen}
           onToggleTerminal={() => {
             setIsTerminalOpen(!isTerminalOpen);
             if (isNarrow) setMobilePane('term');
+          }}
+          onOpenHardware={tab => {
+            if (isHardwareTab(tab)) setHardwareTab(tab);
           }}
           onOpenHardwareModal={() => setIsHardwareModalOpen(true)}
           localTokens={displayLocalTokens}
@@ -1553,6 +1673,7 @@ export const App: React.FC = () => {
                 onCreateFile={handleCreateFile}
                 onCreateFolder={handleCreateFolder}
                 onDelete={handleDeleteTarget}
+                onOpenFolder={handleSelectFolder}
                 rootPath={workspacePath}
                 fill
               />
@@ -1567,6 +1688,9 @@ export const App: React.FC = () => {
                   onCloseTab={handleCloseTab}
                   onContentChange={handleContentChange}
                   onSaveTab={handleSaveTab}
+                  onCursorLine={handleCursorLine}
+                  onOpenFolder={handleSelectFolder}
+                  workspacePath={workspacePath}
                 />
               </div>
             )}
@@ -1602,16 +1726,28 @@ export const App: React.FC = () => {
             onCreateFile={handleCreateFile}
             onCreateFolder={handleCreateFolder}
             onDelete={handleDeleteTarget}
+            onOpenFolder={handleSelectFolder}
             rootPath={workspacePath}
             width={explorerWidth}
           />
 
-          <div
-            onMouseDown={() => setResizingSide('explorer')}
-            title="Drag to resize Explorer sidebar"
-            className={`w-1 cursor-col-resize transition-colors shrink-0 ${
-              resizingSide === 'explorer' ? 'bg-indigo-500' : 'bg-transparent hover:bg-indigo-500/60'
-            }`}
+          <SplitHandle
+            orientation="vertical"
+            label="Resize explorer"
+            value={explorerWidth}
+            min={MIN_EXPLORER_WIDTH}
+            max={MAX_EXPLORER_WIDTH}
+            active={resizingSide === 'explorer'}
+            onDragStart={() => setResizingSide('explorer')}
+            onChange={setExplorerWidth}
+            onCommit={next =>
+              updateSettings({
+                explorerWidth: next,
+                chatWidth,
+                agentControlWidth,
+                agentNodeWorkWidth
+              })
+            }
           />
 
           <div className="flex-1 flex flex-col overflow-hidden min-w-[260px]">
@@ -1623,6 +1759,9 @@ export const App: React.FC = () => {
               onCloseTab={handleCloseTab}
               onContentChange={handleContentChange}
               onSaveTab={handleSaveTab}
+              onCursorLine={handleCursorLine}
+              onOpenFolder={handleSelectFolder}
+              workspacePath={workspacePath}
             />
 
             <TerminalPanel
@@ -1632,12 +1771,23 @@ export const App: React.FC = () => {
             />
           </div>
 
-          <div
-            onMouseDown={() => setResizingSide('chat')}
-            title="Drag to resize Agent Conductor sidebar"
-            className={`w-1 cursor-col-resize transition-colors shrink-0 ${
-              resizingSide === 'chat' ? 'bg-indigo-500' : 'bg-transparent hover:bg-indigo-500/60'
-            }`}
+          <SplitHandle
+            orientation="vertical"
+            label="Resize agent panel"
+            value={chatWidth}
+            min={MIN_CHAT_WIDTH}
+            max={MAX_CHAT_WIDTH}
+            active={resizingSide === 'chat'}
+            onDragStart={() => setResizingSide('chat')}
+            onChange={setChatWidth}
+            onCommit={next =>
+              updateSettings({
+                explorerWidth,
+                chatWidth: next,
+                agentControlWidth,
+                agentNodeWorkWidth
+              })
+            }
           />
 
           <AgentChat {...agentChatProps} width={chatWidth} />
@@ -1646,6 +1796,7 @@ export const App: React.FC = () => {
 
       <HardwareSettingsModal
         isOpen={isHardwareModalOpen}
+        initialTab={hardwareTab}
         onClose={() => setIsHardwareModalOpen(false)}
         nodes={nodes}
         onUpdateNodes={handleUpdateNodes}
@@ -1678,6 +1829,7 @@ export const App: React.FC = () => {
           }))
         }
       />
+      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} actions={paletteActions} />
     </div>
   );
 };

@@ -1,7 +1,7 @@
 /**
  * Host API: Electron preload in-desktop, WebSocket RPC in the browser web console.
  */
-import type { ElectronAPI } from '../types';
+import type { AppUpdateStatus, ElectronAPI } from '../types';
 
 const TOKEN_KEY = 'la_web_console_token';
 
@@ -110,7 +110,7 @@ export async function logoutWebConsole(token?: string | null) {
 export function createWebHostApi(token: string): Promise<ElectronAPI> {
   return new Promise((resolve, reject) => {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${proto}//${location.host}/ws?token=${encodeURIComponent(token)}`;
+    const wsUrl = `${proto}//${location.host}/ws`;
 
     let ws: WebSocket | null = null;
     let nextId = 1;
@@ -150,6 +150,11 @@ export function createWebHostApi(token: string): Promise<ElectronAPI> {
         ws.send(JSON.stringify({ type: 'rpc', id, method, args }));
       });
 
+    const desktopOnlyUpdateStatus = async (): Promise<AppUpdateStatus> => {
+      const status = await invoke<AppUpdateStatus>('update:getStatus');
+      return { ...status, error: 'Downloading and installing updates is only available in the Studio desktop app.' };
+    };
+
     const scheduleReconnect = () => {
       if (closedForGood || reconnectTimer) return;
       attempt += 1;
@@ -167,6 +172,15 @@ export function createWebHostApi(token: string): Promise<ElectronAPI> {
         try {
           msg = JSON.parse(String(ev.data));
         } catch {
+          return;
+        }
+        if (msg.type === 'hello') {
+          attempt = 0;
+          setWsState('connected');
+          if (!opened) {
+            opened = true;
+            resolve(api);
+          }
           return;
         }
         if (msg.type === 'rpc-result') {
@@ -211,11 +225,10 @@ export function createWebHostApi(token: string): Promise<ElectronAPI> {
       });
 
       socket.addEventListener('open', () => {
-        attempt = 0;
-        setWsState('connected');
-        if (!opened) {
-          opened = true;
-          resolve(api);
+        try {
+          socket.send(JSON.stringify({ type: 'auth', token }));
+        } catch {
+          /* close handler reports it */
         }
       });
     };
@@ -312,17 +325,20 @@ export function createWebHostApi(token: string): Promise<ElectronAPI> {
       mcpCall: spec => invoke('mcp:call', [spec]),
       generateImage: (url, model, prompt) => invoke('image:generate', [url, model, prompt]),
 
-      executeCommand: (command, cwd) => invoke('terminal:execute', [command, cwd]),
+      executeCommand: (command, cwd, opts) => invoke('terminal:execute', [command, cwd, opts]),
+      gitRun: args => invoke('git:run', [args]),
       killCommand: () => invoke('terminal:kill'),
       getTerminalBuffer: opts => invoke('terminal:getBuffer', [opts]),
       clearTerminalBuffer: () => invoke('terminal:clearBuffer'),
       onTerminalOutput: cb => subscribe('terminal:output', p => cb(p as string)),
       onTerminalState: cb => subscribe('terminal:state', p => cb(p as { running: boolean })),
 
-      clusterStatus: nodes => invoke('ollama:status', [nodes]),
+      clusterStatus: (nodes, opts) => invoke('ollama:status', [nodes, opts]),
       chat: (requestId, url, body, nodeType, apiKey) =>
         invoke('ollama:chat', [requestId, url, body, nodeType, apiKey]),
-      benchmarkModel: (node, model) => invoke('ollama:benchmark', [node, model]),
+      benchmarkModel: (node, model, numCtx) => invoke('ollama:benchmark', [node, model, numCtx]),
+      warmModel: (url, model, numCtx, keepAlive) =>
+        invoke('ollama:warm', [url, model, numCtx, keepAlive]),
       onChatEvent: cb => subscribe('ollama:chat-event', p => cb(p as never)),
       pullModel: (requestId, url, model) => invoke('ollama:pull', [requestId, url, model]),
       onPullEvent: cb => subscribe('ollama:pull-event', p => cb(p as never)),
@@ -337,12 +353,9 @@ export function createWebHostApi(token: string): Promise<ElectronAPI> {
 
       getUpdateStatus: () => invoke('update:getStatus'),
       checkForUpdate: () => invoke('update:check'),
-      downloadUpdate: () => invoke('update:download'),
-      installUpdate: async () => {
-        window.alert('Installing updates is only available in the Studio desktop app.');
-        return invoke('update:getStatus');
-      },
-      setUpdateBusy: busy => invoke('update:setBusy', [busy]),
+      downloadUpdate: () => desktopOnlyUpdateStatus(),
+      installUpdate: () => desktopOnlyUpdateStatus(),
+      setUpdateBusy: async () => ({ busy: false, idle: true }),
       onUpdateStatus: cb => subscribe('update:status', p => cb(p as never)),
 
       webConsoleGetStatus: () => invoke('webConsole:getStatus'),

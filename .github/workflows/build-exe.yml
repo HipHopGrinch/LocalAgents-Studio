@@ -1,0 +1,71 @@
+# Unsigned Windows test builds for every branch push (and on demand).
+# Download them from the run's "Artifacts" section. Nothing is published:
+# electron-builder runs with --publish never, so electron-updater never sees these.
+# Code signing is a pending decision (PLAT-10).
+
+name: Build exe
+
+on:
+  push:
+    branches:
+      - "**"
+    paths-ignore:
+      - "**/*.md"
+      - ".github/ISSUE_TEMPLATE/**"
+  workflow_dispatch:
+
+concurrency:
+  group: build-exe-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build unsigned installers
+        shell: pwsh
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx vite build && npx electron-builder --win --publish never --config.directories.output=release
+
+      - name: Name artifact
+        id: meta
+        shell: pwsh
+        run: |
+          $ver = (Get-Content -Raw package.json | ConvertFrom-Json).version
+          $branch = '${{ github.ref_name }}' -replace '[^A-Za-z0-9._-]', '-'
+          $sha = '${{ github.sha }}'.Substring(0, 7)
+          "name=LocalAgents-Studio-$ver-$branch-$sha" >> $env:GITHUB_OUTPUT
+
+      - name: Upload setup and portable exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.name }}
+          path: |
+            release/*-setup.exe
+            release/*-portable.exe
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

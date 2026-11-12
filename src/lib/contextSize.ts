@@ -1,5 +1,6 @@
 import { EndpointNode, OllamaModel } from '../types';
 import { MODEL_CATALOG } from '../config/modelCatalog';
+import { estimateImageTokens } from './images';
 
 /**
  * Rough English-text capacity estimates for a context window.
@@ -126,8 +127,8 @@ export function snapNumCtxToOption(value: number, maxCtx?: number): number {
 }
 
 /**
- * User-configured **maximum** context for this model on this node.
- * Requests use a smaller dynamic num_ctx capped by this value.
+ * User-configured context ceiling for this model on this node.
+ * Live runs send this same value as `num_ctx` on every request ({@link pinnedNumCtx}).
  *
  * Frontier nodes default to {@link DEFAULT_FRONTIER_NUM_CTX} (256k) when no pref
  * is set — never the local agent 16k fallback — so Gemini / Grok / GPT are not
@@ -148,8 +149,37 @@ export function resolveModelNumCtx(
   return fallback > 0 ? Math.floor(fallback) : DEFAULT_MODEL_NUM_CTX;
 }
 
-/** Alias for clarity at call sites that mean "ceiling", not the request size. */
+/** Alias for clarity at call sites that mean "ceiling", not a per-request size. */
 export const resolveModelMaxNumCtx = resolveModelNumCtx;
+
+/**
+ * The `num_ctx` to send on every request to this (node, model) during a run.
+ * This is the configured ceiling. Do not vary it per payload — Ollama sizes the
+ * KV cache at load time, so a different num_ctx reloads the weights.
+ */
+export function pinnedNumCtx(
+  node: Pick<EndpointNode, 'modelPrefs' | 'type' | 'apiKey'> | undefined,
+  model: string,
+  fallback: number = DEFAULT_MODEL_NUM_CTX
+): number {
+  return resolveModelNumCtx(node, model, fallback);
+}
+
+/**
+ * Optional fixed KV sizes. Prefer {@link pinnedNumCtx} (the exact ceiling).
+ * Snap once at run start only if a host cannot pin an arbitrary value.
+ */
+export const NUM_CTX_BUCKETS = [4096, 8192, 12288, 16384, 32768, 65536, 131072, 262144] as const;
+
+/** Smallest bucket that is >= `tokens`, so a snap never shrinks the ceiling. */
+export function nearestNumCtxBucket(tokens: number): number {
+  const n = Math.floor(tokens);
+  if (!Number.isFinite(n) || n <= NUM_CTX_BUCKETS[0]) return NUM_CTX_BUCKETS[0];
+  for (const bucket of NUM_CTX_BUCKETS) {
+    if (n <= bucket) return bucket;
+  }
+  return NUM_CTX_BUCKETS[NUM_CTX_BUCKETS.length - 1];
+}
 
 export function clampNumCtx(value: number, maxCtx?: number): number {
   let n = Math.floor(value);
@@ -158,55 +188,224 @@ export function clampNumCtx(value: number, maxCtx?: number): number {
   return n;
 }
 
-export type DynamicCtxRole = 'coder' | 'planner' | 'reviewer' | 'docs' | 'assist' | 'generic';
+export type DynamicCtxRole =
+  | 'coder'
+  | 'planner'
+  | 'reviewer'
+  | 'docs'
+  | 'assist'
+  | 'generic'
+  | 'pass1'
+  | 'audit';
 
-/** Rough token estimate (chars/4) — same scheme as free-tier assist. */
-export function estimateTextTokens(text: string): number {
-  return Math.ceil((text || '').length / 4);
+export type ContextTier = 'tight' | 'standard' | 'wide';
+
+/**
+ * Code-heavy seed: ~3.2 characters per token (chars/4 under-counts source by 20–30%).
+ * Samples are clamped into this range so one odd `prompt_eval_count` cannot swing the fit.
+ */
+export const CHARS_PER_TOKEN_SEED = 3.2;
+const CHARS_PER_TOKEN_MIN = 2;
+const CHARS_PER_TOKEN_MAX = 5;
+const CALIBRATION_WINDOW = 12;
+
+const tokenCalibration = new Map<string, { avg: number; n: number }>();
+
+/** Rolling chars/token for `modelKey`, seeded at {@link CHARS_PER_TOKEN_SEED} until samples arrive. */
+export function charsPerToken(modelKey?: string): number {
+  const key = modelKey?.trim();
+  if (!key) return CHARS_PER_TOKEN_SEED;
+  const row = tokenCalibration.get(key);
+  if (!row) return CHARS_PER_TOKEN_SEED;
+  return Math.min(CHARS_PER_TOKEN_MAX, Math.max(CHARS_PER_TOKEN_MIN, row.avg));
+}
+
+/**
+ * Record one real prefill. `promptChars` is the character length of the text that
+ * was sent; `promptEvalCount` is Ollama's (or the provider's) prompt token count.
+ * Tiny or non-finite samples are ignored.
+ */
+export function recordPromptSample(modelKey: string, promptChars: number, promptEvalCount: number): void {
+  const key = (modelKey || '').trim();
+  if (!key) return;
+  if (!(promptChars >= 64) || !(promptEvalCount >= 16)) return;
+  const ratio = promptChars / promptEvalCount;
+  if (!Number.isFinite(ratio)) return;
+  const clamped = Math.min(CHARS_PER_TOKEN_MAX, Math.max(CHARS_PER_TOKEN_MIN, ratio));
+  const prev = tokenCalibration.get(key);
+  if (!prev) {
+    tokenCalibration.set(key, { avg: (CHARS_PER_TOKEN_SEED + clamped) / 2, n: 1 });
+    return;
+  }
+  const weight = Math.min(prev.n, CALIBRATION_WINDOW - 1);
+  tokenCalibration.set(key, {
+    avg: (prev.avg * weight + clamped) / (weight + 1),
+    n: prev.n + 1
+  });
+}
+
+/** JSON blob for an optional settings/file persist. Pair with {@link hydrateTokenCalibration}. */
+export function serializeTokenCalibration(): string {
+  const samples: Record<string, { avg: number; n: number }> = {};
+  for (const [key, row] of tokenCalibration) samples[key] = { avg: row.avg, n: row.n };
+  return JSON.stringify({ v: 1, samples });
+}
+
+export function hydrateTokenCalibration(raw: string | null | undefined): void {
+  tokenCalibration.clear();
+  if (!raw) return;
+  try {
+    const data = JSON.parse(raw) as { samples?: Record<string, { avg?: number; n?: number }> };
+    for (const [key, row] of Object.entries(data.samples || {})) {
+      if (!key || !row || typeof row.avg !== 'number' || !Number.isFinite(row.avg)) continue;
+      const avg = Math.min(CHARS_PER_TOKEN_MAX, Math.max(CHARS_PER_TOKEN_MIN, row.avg));
+      const n = typeof row.n === 'number' && row.n > 0 ? Math.floor(row.n) : 1;
+      tokenCalibration.set(key, { avg, n });
+    }
+  } catch {
+    tokenCalibration.clear();
+  }
+}
+
+/** Test hook. Does not affect a hydrated blob the caller still holds. */
+export function resetTokenCalibration(): void {
+  tokenCalibration.clear();
+}
+
+/** Token estimate. Pass `modelKey` to use the calibrated chars/token for that model. */
+export function estimateTextTokens(text: string, modelKey?: string): number {
+  const cpt = charsPerToken(modelKey);
+  return Math.ceil((text || '').length / (cpt > 0 ? cpt : CHARS_PER_TOKEN_SEED));
 }
 
 export function estimateChatPayloadTokens(
-  messages: Array<{ role?: string; content?: unknown }>
+  messages: Array<{ role?: string; content?: unknown; images?: unknown[] }>,
+  modelKey?: string
 ): number {
   let total = 0;
   for (const m of messages) {
     total += 4; // role / message framing
     if (typeof m.content === 'string') {
-      total += estimateTextTokens(m.content);
+      total += estimateTextTokens(m.content, modelKey);
     } else if (Array.isArray(m.content)) {
       for (const part of m.content) {
-        if (typeof part === 'string') total += estimateTextTokens(part);
-        else if (part && typeof part === 'object' && 'text' in part) {
-          total += estimateTextTokens(String((part as { text?: string }).text || ''));
+        if (typeof part === 'string') total += estimateTextTokens(part, modelKey);
+        else if (part && typeof part === 'object' && 'text' in part && !('image_url' in part) && !('image' in part)) {
+          total += estimateTextTokens(String((part as { text?: string }).text || ''), modelKey);
         } else if (part && typeof part === 'object') {
-          // image_url / other parts — coarse budget
-          total += 768;
+          total += estimateImageTokens(part as { width?: number; height?: number });
         }
       }
+    }
+    if (Array.isArray(m.images)) {
+      for (const img of m.images) total += estimateImageTokens(img as { width?: number; height?: number });
     }
   }
   return total;
 }
 
-/** Reserved room for the model's reply (and tool XML). */
-export function expectedOutputTokens(
-  role: DynamicCtxRole = 'generic',
-  opts?: { createIntent?: boolean }
-): number {
+export interface OutputBudgetOpts {
+  createIntent?: boolean;
+  tier?: ContextTier;
+}
+
+/**
+ * `num_predict` cap for a persona. Send this on the request.
+ * Coder 6144 (edits / tight) or 8192 (creates / wide). Planner 3072 or 4096.
+ * Reviewer, Pass-1, and audit 2048. Assist 480.
+ */
+export function outputBudgetFor(role: DynamicCtxRole = 'generic', opts?: OutputBudgetOpts): number {
   switch (role) {
     case 'coder':
-      return opts?.createIntent === false ? 3072 : 6144;
+      if (opts?.tier === 'tight' || opts?.createIntent === false) return 6144;
+      if (opts?.tier === 'wide' || opts?.createIntent === true) return 8192;
+      return 6144;
     case 'planner':
+      if (opts?.tier === 'wide' || opts?.tier === 'standard') return 4096;
       return 3072;
     case 'reviewer':
+    case 'pass1':
+    case 'audit':
       return 2048;
     case 'docs':
       return 3072;
     case 'assist':
-      return 512;
+      return 480;
     default:
       return 2048;
   }
+}
+
+/** Reserved room for the model's reply (and tool XML). Same numbers as {@link outputBudgetFor}. */
+export function expectedOutputTokens(role: DynamicCtxRole = 'generic', opts?: OutputBudgetOpts): number {
+  return outputBudgetFor(role, opts);
+}
+
+export interface FitBudget {
+  pinnedCtx: number;
+  /** num_predict cap for this role. */
+  outputReserve: number;
+  /** Prompt tokens that may be used so the reserved reply still fits in the pinned window. */
+  promptBudget: number;
+}
+
+/**
+ * How many prompt tokens fit in a pinned num_ctx after the output reserve and a
+ * small overhead. Callers shrink the prompt to `promptBudget` instead of changing num_ctx.
+ */
+export function fitBudgetForPinnedCtx(opts: {
+  pinnedCtx: number;
+  role?: DynamicCtxRole;
+  createIntent?: boolean;
+  tier?: ContextTier;
+  /** Tool-schema / framing reserve. Default 256. */
+  overhead?: number;
+}): FitBudget {
+  const pinnedCtx = clampNumCtx(opts.pinnedCtx || DEFAULT_MODEL_NUM_CTX);
+  const outputReserve = outputBudgetFor(opts.role || 'generic', {
+    createIntent: opts.createIntent,
+    tier: opts.tier
+  });
+  const overhead = typeof opts.overhead === 'number' && opts.overhead >= 0 ? Math.floor(opts.overhead) : 256;
+  const promptBudget = Math.max(512, pinnedCtx - outputReserve - overhead);
+  return { pinnedCtx, outputReserve, promptBudget };
+}
+
+/**
+ * Active-file body cap for the model-fit tier. Tight keeps 4,000 characters and,
+ * when `cursorLine` is set, a window around that line instead of the file head.
+ */
+export function capActiveFileForTier(content: string, tier: ContextTier, cursorLine?: number): string {
+  const maxChars = tier === 'tight' ? 4000 : tier === 'wide' ? 14000 : 8000;
+  const text = content || '';
+  if (text.length <= maxChars) return text;
+  const lines = text.split('\n');
+  if (cursorLine && cursorLine > 0 && lines.length > 1) {
+    const target = Math.min(lines.length, Math.max(1, Math.floor(cursorLine))) - 1;
+    let lo = target;
+    let hi = target + 1;
+    let size = lines[target].length + 1;
+    while (lo > 0 || hi < lines.length) {
+      const takeAbove = lo > 0 ? lines[lo - 1].length + 1 : Infinity;
+      const takeBelow = hi < lines.length ? lines[hi].length + 1 : Infinity;
+      const add = Math.min(takeAbove, takeBelow);
+      if (size + add > maxChars - 96) break;
+      if (takeAbove <= takeBelow && lo > 0) {
+        lo -= 1;
+        size += takeAbove;
+      } else if (hi < lines.length) {
+        hi += 1;
+        size += takeBelow;
+      } else break;
+    }
+    const slice = lines.slice(lo, hi).join('\n');
+    const noteHead = lo > 0 ? `…(lines 1–${lo} omitted)\n` : '';
+    const noteTail = hi < lines.length ? `\n…(lines ${hi + 1}–${lines.length} omitted)` : '';
+    const windowed = `${noteHead}${slice}${noteTail}`;
+    if (windowed.length <= maxChars + 80) return windowed;
+  }
+  const head = text.slice(0, Math.max(0, maxChars - 48));
+  return `${head}\n…(active file truncated to ${maxChars} characters)`;
 }
 
 /** Round up for Ollama num_ctx (256-token steps, minimum 1024). */
@@ -217,8 +416,9 @@ export function roundUpNumCtx(tokens: number): number {
 }
 
 /**
- * Smallest practical num_ctx for this request, capped by the user's max.
- * Accounts for messages (system + history + user), expected output, and a small margin.
+ * Legacy per-request window. Live runs should send {@link pinnedNumCtx} and shrink
+ * the prompt to {@link fitBudgetForPinnedCtx} so Ollama does not reload weights.
+ * Kept so existing callers keep compiling.
  */
 export function pickDynamicNumCtx(opts: {
   messages: Array<{ role?: string; content?: unknown }>;

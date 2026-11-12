@@ -28,6 +28,12 @@ interface HeaderProps {
   isTerminalOpen: boolean;
   onToggleTerminal: () => void;
   onOpenHardwareModal: () => void;
+  /**
+   * Opens Hardware on a tab. `stats` from the token counter, `endpoints` from the cluster chip.
+   * App.tsx should set HardwareSettingsModal `initialTab` from this. The existing
+   * `onOpenHardwareModal` still runs so the modal opens before that wiring lands.
+   */
+  onOpenHardware?: (tab?: string) => void;
   localTokens: number;
   frontierTokens: number;
   tokenStatsScope?: 'global' | 'project';
@@ -58,6 +64,7 @@ export const Header: React.FC<HeaderProps> = ({
   isTerminalOpen,
   onToggleTerminal,
   onOpenHardwareModal,
+  onOpenHardware,
   localTokens,
   frontierTokens,
   tokenStatsScope = 'global',
@@ -77,7 +84,12 @@ export const Header: React.FC<HeaderProps> = ({
   const popoverRef = useRef<HTMLDivElement>(null);
   const projectsRef = useRef<HTMLDivElement>(null);
 
-  // Close popover when clicking outside
+  const openHardware = (tab: string) => {
+    onOpenHardware?.(tab);
+    onOpenHardwareModal();
+  };
+
+  // Close popover when clicking outside or pressing Escape
   useEffect(() => {
     if (!showScalePopover) return;
     const handleClickOutside = (e: MouseEvent) => {
@@ -85,8 +97,15 @@ export const Header: React.FC<HeaderProps> = ({
         setShowScalePopover(false);
       }
     };
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowScalePopover(false);
+    };
     window.addEventListener('mousedown', handleClickOutside);
-    return () => window.removeEventListener('mousedown', handleClickOutside);
+    window.addEventListener('keydown', handleKey);
+    return () => {
+      window.removeEventListener('mousedown', handleClickOutside);
+      window.removeEventListener('keydown', handleKey);
+    };
   }, [showScalePopover]);
 
   useEffect(() => {
@@ -96,8 +115,15 @@ export const Header: React.FC<HeaderProps> = ({
         setProjectsOpen(false);
       }
     };
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setProjectsOpen(false);
+    };
     window.addEventListener('mousedown', handleClickOutside);
-    return () => window.removeEventListener('mousedown', handleClickOutside);
+    window.addEventListener('keydown', handleKey);
+    return () => {
+      window.removeEventListener('mousedown', handleClickOutside);
+      window.removeEventListener('keydown', handleKey);
+    };
   }, [projectsOpen]);
 
   const scalePercent = Math.round(uiScale * 100);
@@ -125,6 +151,7 @@ export const Header: React.FC<HeaderProps> = ({
 
         {!compact && (
           <button
+            type="button"
             onClick={onNewProject}
             className="flex items-center space-x-1.5 text-xs text-zinc-300 hover:text-white bg-[#1e1e24] hover:bg-indigo-600/30 border border-[#2e2e38] hover:border-indigo-500/50 px-2.5 py-1 rounded transition shrink-0"
             title="New project: open a folder, clear editor tabs, start a fresh chat"
@@ -142,6 +169,9 @@ export const Header: React.FC<HeaderProps> = ({
               compact ? 'max-w-[9.5rem]' : 'max-w-[11rem]'
             }`}
             title={workspacePath || 'Open a project'}
+            aria-expanded={projectsOpen}
+            aria-haspopup="menu"
+            aria-controls="header-projects-menu"
           >
             <Folder className="w-3.5 h-3.5 text-amber-400 shrink-0" />
             <span className="font-medium text-left leading-tight truncate">
@@ -150,14 +180,19 @@ export const Header: React.FC<HeaderProps> = ({
             <ChevronDown className="w-3 h-3 text-zinc-500 shrink-0" />
           </button>
           {projectsOpen && (
-            <div className="absolute left-0 top-full mt-1 z-[60] w-[min(20rem,calc(100vw-1rem))] max-h-80 overflow-y-auto bg-[#1a1a20] border border-[#2e2e3a] rounded-lg shadow-xl py-1">
-              <div className="px-2.5 py-1.5 text-[10px] uppercase tracking-wide text-zinc-500 font-semibold">
+            <div
+              id="header-projects-menu"
+              role="menu"
+              aria-label="Projects"
+              className="absolute left-0 top-full mt-1 z-[60] w-[min(20rem,calc(100vw-1rem))] max-h-80 overflow-y-auto bg-[#1a1a20] border border-[#2e2e3a] rounded-lg shadow-xl py-1"
+            >
+              <div className="px-2.5 py-1.5 text-[11px] uppercase tracking-wide text-zinc-500 font-semibold">
                 Projects
               </div>
               {workspacePath && (
                 <div className="px-2.5 py-1.5 text-[11px] text-indigo-200 truncate" title={workspacePath}>
                   {workspaceLabel(workspacePath)}
-                  <div className="text-[10px] text-zinc-500 truncate font-mono">{workspacePath}</div>
+                  <div className="text-[11px] text-zinc-500 truncate font-mono">{workspacePath}</div>
                 </div>
               )}
               {recentWorkspaces
@@ -174,7 +209,7 @@ export const Header: React.FC<HeaderProps> = ({
                     title={p}
                   >
                     <div className="truncate">{workspaceLabel(p)}</div>
-                    <div className="text-[10px] text-zinc-500 truncate font-mono">{p}</div>
+                    <div className="text-[11px] text-zinc-500 truncate font-mono">{p}</div>
                   </button>
                 ))}
               <div className="my-1 border-t border-[#2e2e3a]" />
@@ -215,9 +250,10 @@ export const Header: React.FC<HeaderProps> = ({
           <>
             <button
               type="button"
-              onClick={onOpenHardwareModal}
+              onClick={() => openHardware('endpoints')}
               className="flex items-center gap-1.5 px-2 py-1 text-[11px] rounded border bg-[#18181b] border-[#27272a] text-zinc-300"
-              title="Cluster & hardware settings"
+              title="Cluster endpoints"
+              aria-label={`Open cluster endpoints, ${onlineCount} of ${nodes.length} online`}
             >
               <Cpu className="w-3.5 h-3.5 text-indigo-400" />
               <span className="font-mono">
@@ -225,34 +261,28 @@ export const Header: React.FC<HeaderProps> = ({
               </span>
             </button>
             <button
+              type="button"
               onClick={onRefreshNodes}
               className="p-1.5 text-zinc-400 hover:text-white hover:bg-[#27272a] rounded transition"
               title="Refresh cluster"
+              aria-label="Refresh cluster"
             >
               <RefreshCw className="w-3.5 h-3.5" />
             </button>
           </>
         ) : (
           <>
-            <div
-              onClick={onOpenHardwareModal}
-              className="flex flex-wrap items-center gap-x-2 gap-y-0.5 bg-[#18181d] border border-[#272732] px-2.5 py-1 rounded-xl text-[11px] cursor-pointer hover:border-zinc-600 transition min-w-0 max-w-max"
-              title="Click to view token statistics & savings"
-            >
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 bg-[#18181d] border border-[#272732] px-1.5 py-1 rounded-xl text-[11px] min-w-0 max-w-max">
               {onTokenStatsScopeChange && (
                 <div
                   role="group"
                   aria-label="Token stats scope"
                   className="flex items-center rounded-md border border-[#30303a] bg-[#121215] p-0.5 shrink-0"
-                  onClick={e => e.stopPropagation()}
                 >
                   <button
                     type="button"
-                    onClick={e => {
-                      e.stopPropagation();
-                      onTokenStatsScopeChange('global');
-                    }}
-                    className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition ${
+                    onClick={() => onTokenStatsScopeChange('global')}
+                    className={`px-1.5 py-0.5 rounded text-[11px] font-medium transition ${
                       tokenStatsScope === 'global'
                         ? 'bg-zinc-700 text-zinc-100'
                         : 'text-zinc-500 hover:text-zinc-300'
@@ -263,11 +293,8 @@ export const Header: React.FC<HeaderProps> = ({
                   </button>
                   <button
                     type="button"
-                    onClick={e => {
-                      e.stopPropagation();
-                      onTokenStatsScopeChange('project');
-                    }}
-                    className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition ${
+                    onClick={() => onTokenStatsScopeChange('project')}
+                    className={`px-1.5 py-0.5 rounded text-[11px] font-medium transition ${
                       tokenStatsScope === 'project'
                         ? 'bg-zinc-700 text-zinc-100'
                         : 'text-zinc-500 hover:text-zinc-300'
@@ -282,47 +309,57 @@ export const Header: React.FC<HeaderProps> = ({
                   </button>
                 </div>
               )}
-              <div className="flex items-center space-x-1 text-emerald-400 font-mono shrink-0">
-                <Zap className="w-3 h-3" />
-                <span>Local: {localTokens.toLocaleString()} tok</span>
-              </div>
-              <span className="text-zinc-600 shrink-0">•</span>
-              <div className="flex items-center space-x-1 text-sky-400 font-mono shrink-0">
-                <Cloud className="w-3 h-3" />
-                <span>Frontier: {frontierTokens.toLocaleString()} tok</span>
-              </div>
+              <button
+                type="button"
+                onClick={() => openHardware('stats')}
+                className="flex flex-wrap items-center gap-x-2 gap-y-0.5 px-1 py-0.5 rounded-lg hover:bg-white/5 transition min-w-0"
+                title="Open token statistics"
+                aria-label={`Open token statistics. Local ${localTokens.toLocaleString()} tokens, frontier ${frontierTokens.toLocaleString()} tokens.`}
+              >
+                <span className="flex items-center space-x-1 text-emerald-400 font-mono shrink-0">
+                  <Zap className="w-3 h-3" aria-hidden="true" />
+                  <span>Local: {localTokens.toLocaleString()} tok</span>
+                </span>
+                <span className="text-zinc-600 shrink-0" aria-hidden="true">•</span>
+                <span className="flex items-center space-x-1 text-sky-400 font-mono shrink-0">
+                  <Cloud className="w-3 h-3" aria-hidden="true" />
+                  <span>Frontier: {frontierTokens.toLocaleString()} tok</span>
+                </span>
+              </button>
             </div>
 
-            <div
-              onClick={onOpenHardwareModal}
-              className="flex flex-wrap items-center gap-x-2 gap-y-1 bg-[#18181b] border border-[#27272a] hover:border-zinc-700 px-2.5 py-1 rounded cursor-pointer transition min-w-0 max-w-max"
-              title="Click to configure hardware, model recommendations & benchmarks"
+            <button
+              type="button"
+              onClick={() => openHardware('endpoints')}
+              className="flex flex-wrap items-center gap-x-2 gap-y-1 bg-[#18181b] border border-[#27272a] hover:border-zinc-700 px-2.5 py-1 rounded transition min-w-0 max-w-max text-left"
+              title="Open cluster endpoints"
+              aria-label="Open cluster endpoints"
             >
-              <Cpu className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
+              <Cpu className="w-3.5 h-3.5 text-zinc-400 shrink-0" aria-hidden="true" />
               <span className="text-[11px] text-zinc-400 font-medium shrink-0">Cluster:</span>
-              <div className="contents">
+              <span className="contents">
                 {nodes.length === 0 ? (
-                  <span className="text-[10px] text-amber-400 font-medium flex items-center space-x-1">
+                  <span className="text-[11px] text-amber-400 font-medium flex items-center space-x-1">
                     <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
                     <span>No endpoints (Click to configure)</span>
                   </span>
                 ) : (
                   nodes.map(node => (
-                    <div key={node.id} className="flex items-center space-x-1 text-[11px] shrink-0">
+                    <span key={node.id} className="flex items-center space-x-1 text-[11px] shrink-0">
                       <span
                         className={`w-2 h-2 rounded-full ${
                           node.online ? 'bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.5)]' : 'bg-red-500/70'
                         }`}
                       />
-                      <span className="text-zinc-300 font-mono text-[10px]">{node.name.split(' ')[0]}</span>
+                      <span className="text-zinc-300 font-mono text-[11px]">{node.name.split(' ')[0]}</span>
                       {node.online && node.latency !== null && (
-                        <span className="text-[9px] text-emerald-400 font-mono">{node.latency}ms</span>
+                        <span className="text-[11px] text-emerald-400 font-mono">{node.latency}ms</span>
                       )}
-                    </div>
+                    </span>
                   ))
                 )}
-              </div>
-            </div>
+              </span>
+            </button>
 
             {canInstallDeps && onInstallDeps && (
               <button
@@ -338,29 +375,40 @@ export const Header: React.FC<HeaderProps> = ({
             )}
 
             <button
+              type="button"
               onClick={onRefreshNodes}
               className="p-1.5 text-zinc-400 hover:text-white hover:bg-[#27272a] rounded transition shrink-0"
               title="Refresh cluster nodes status"
+              aria-label="Refresh cluster"
             >
               <RefreshCw className="w-3.5 h-3.5" />
             </button>
 
             <div className="relative shrink-0" ref={popoverRef}>
               <button
+                type="button"
                 onClick={() => setShowScalePopover(prev => !prev)}
                 className={`flex items-center space-x-1.5 px-2 py-1 text-xs rounded border transition ${
                   scalePercent !== 100 || showScalePopover
                     ? 'bg-indigo-600/20 border-indigo-500 text-indigo-300 font-medium'
                     : 'bg-[#18181b] border-[#27272a] text-zinc-400 hover:text-white'
                 }`}
-                title="UI & Text Scaling slider (Discord-style) • Ctrl +/- to zoom"
+                title="UI and text scaling"
+                aria-expanded={showScalePopover}
+                aria-haspopup="dialog"
+                aria-controls="header-scale-popover"
               >
                 <Sliders className="w-3.5 h-3.5 text-indigo-400" />
                 <span className="font-mono text-[11px]">{scalePercent}%</span>
               </button>
 
               {showScalePopover && (
-                <div className="absolute right-0 top-full mt-2 w-72 bg-[#161619] border border-[#2e2e38] rounded-xl shadow-2xl p-3.5 flex flex-col space-y-3 z-[60] text-zinc-200">
+                <div
+                  id="header-scale-popover"
+                  role="dialog"
+                  aria-label="UI and text scaling"
+                  className="absolute right-0 top-full mt-2 w-72 bg-[#161619] border border-[#2e2e38] rounded-xl shadow-2xl p-3.5 flex flex-col space-y-3 z-[60] text-zinc-200"
+                >
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-bold text-zinc-100 flex items-center space-x-1.5">
                       <Sliders className="w-3.5 h-3.5 text-indigo-400" />
@@ -382,10 +430,11 @@ export const Header: React.FC<HeaderProps> = ({
                       max="1.75"
                       step="0.05"
                       value={uiScale}
+                      aria-label="UI scale"
                       onChange={e => onUpdateUiScale(parseFloat(e.target.value))}
                       className="w-full accent-indigo-500 cursor-pointer h-1.5 bg-[#25252e] rounded-lg"
                     />
-                    <div className="flex justify-between text-[9px] text-zinc-500 font-mono">
+                    <div className="flex justify-between text-[11px] text-zinc-500 font-mono">
                       <span>75%</span>
                       <span>100%</span>
                       <span>125%</span>
@@ -394,7 +443,7 @@ export const Header: React.FC<HeaderProps> = ({
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-4 gap-1 pt-1 text-[10px]">
+                  <div className="grid grid-cols-4 gap-1 pt-1 text-[11px]">
                     {[0.8, 1.0, 1.25, 1.5].map(val => (
                       <button
                         key={val}
@@ -411,7 +460,7 @@ export const Header: React.FC<HeaderProps> = ({
                     ))}
                   </div>
 
-                  <div className="flex items-center justify-between pt-2 border-t border-[#272730] text-[10px] text-zinc-500">
+                  <div className="flex items-center justify-between pt-2 border-t border-[#272730] text-[11px] text-zinc-500">
                     <span>
                       Shortcuts:{' '}
                       <kbd className="px-1 py-0.5 bg-[#22222a] rounded font-mono text-zinc-400">Ctrl +/-</kbd>
@@ -432,6 +481,7 @@ export const Header: React.FC<HeaderProps> = ({
             </div>
 
             <button
+              type="button"
               onClick={onToggleTerminal}
               className={`flex items-center space-x-1.5 px-2.5 py-1 text-xs rounded border transition shrink-0 ${
                 isTerminalOpen

@@ -1,9 +1,12 @@
-const { spawn } = require('child_process');
+const { spawn, execFile } = require('child_process');
 
 /**
  * One-shot MCP stdio call. Local command only (no remote URL).
  * Supports official MCP NDJSON framing and LSP Content-Length (scripts/mcp-echo.cjs).
  */
+
+const MAX_FRAME_BYTES = 1024 * 1024;
+const tracked = new Set();
 
 function splitArgs(raw) {
   if (Array.isArray(raw)) return raw.map(String);
@@ -32,11 +35,67 @@ function encodeFrame(obj, framing) {
   return Buffer.concat([body, Buffer.from('\n', 'utf8')]);
 }
 
+function killTree(child) {
+  if (!child || child.pid == null) return Promise.resolve();
+  if (process.platform === 'win32') {
+    return new Promise(resolve => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      const timer = setTimeout(finish, 2000);
+      try {
+        execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true }, () => {
+          clearTimeout(timer);
+          finish();
+        });
+      } catch {
+        clearTimeout(timer);
+        try {
+          child.kill();
+        } catch {
+          /* gone */
+        }
+        finish();
+      }
+    });
+  }
+  try {
+    child.kill('SIGKILL');
+  } catch {
+    /* gone */
+  }
+  return Promise.resolve();
+}
+
+function killTracked() {
+  const jobs = [];
+  for (const child of tracked) jobs.push(killTree(child));
+  tracked.clear();
+  return Promise.all(jobs);
+}
+
+function track(child) {
+  if (!child) return child;
+  tracked.add(child);
+  const drop = () => tracked.delete(child);
+  child.once('exit', drop);
+  child.once('error', drop);
+  return child;
+}
+
 function mcpStdioOnce(command, args, method, params, framing, timeoutMs) {
   return new Promise(resolve => {
     let child;
     try {
-      child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+      child = spawn(command, args, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+        shell: false
+      });
+      track(child);
     } catch (err) {
       resolve({ error: err.message || String(err) });
       return;
@@ -50,15 +109,15 @@ function mcpStdioOnce(command, args, method, params, framing, timeoutMs) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      try {
-        child.kill();
-      } catch {
-        /* gone */
-      }
+      killTree(child);
       resolve(payload);
     };
     const send = msg => {
-      child.stdin.write(encodeFrame(msg, framing));
+      try {
+        child.stdin.write(encodeFrame(msg, framing));
+      } catch {
+        /* closed */
+      }
     };
     const rpc = (m, p) =>
       new Promise((res, rej) => {
@@ -80,12 +139,19 @@ function mcpStdioOnce(command, args, method, params, framing, timeoutMs) {
     });
     child.on('error', err => finish({ error: err.message }));
     child.stdout.on('data', chunk => {
+      if (buf.length + chunk.length > MAX_FRAME_BYTES) {
+        finish({ error: 'MCP frame exceeded 1 MB' });
+        return;
+      }
       buf = Buffer.concat([buf, chunk]);
       while (buf.length) {
         const head = buf.toString('utf8', 0, Math.min(buf.length, 20)).toLowerCase();
         if (head.startsWith('content-length')) {
           const headerEnd = buf.indexOf('\r\n\r\n');
-          if (headerEnd < 0) break;
+          if (headerEnd < 0) {
+            if (buf.length > 64 * 1024) finish({ error: 'MCP frame exceeded 1 MB' });
+            break;
+          }
           const header = buf.slice(0, headerEnd).toString('utf8');
           const m = /Content-Length:\s*(\d+)/i.exec(header);
           if (!m) {
@@ -93,6 +159,10 @@ function mcpStdioOnce(command, args, method, params, framing, timeoutMs) {
             continue;
           }
           const len = Number(m[1]);
+          if (!Number.isFinite(len) || len < 0 || len > MAX_FRAME_BYTES) {
+            finish({ error: 'MCP frame exceeded 1 MB' });
+            return;
+          }
           const start = headerEnd + 4;
           if (buf.length < start + len) break;
           const raw = buf.slice(start, start + len).toString('utf8');
@@ -105,7 +175,10 @@ function mcpStdioOnce(command, args, method, params, framing, timeoutMs) {
           continue;
         }
         const nl = buf.indexOf('\n');
-        if (nl < 0) break;
+        if (nl < 0) {
+          if (buf.length > MAX_FRAME_BYTES) finish({ error: 'MCP frame exceeded 1 MB' });
+          break;
+        }
         const line = buf.slice(0, nl).toString('utf8').trim();
         buf = buf.slice(nl + 1);
         if (!line || line.toLowerCase().startsWith('content-length')) continue;
@@ -121,7 +194,7 @@ function mcpStdioOnce(command, args, method, params, framing, timeoutMs) {
         await rpc('initialize', {
           protocolVersion: '2024-11-05',
           capabilities: {},
-          clientInfo: { name: 'localagents-studio', version: '1.2.24' }
+          clientInfo: { name: 'localagents-studio', version: '1.2.26' }
         });
         send({ jsonrpc: '2.0', method: 'notifications/initialized' });
         const result = await rpc(method, params || {});
@@ -159,4 +232,4 @@ function parseMcpServers(raw) {
   }
 }
 
-module.exports = { mcpStdio, parseMcpServers, splitArgs };
+module.exports = { mcpStdio, parseMcpServers, splitArgs, killTracked, killTree };

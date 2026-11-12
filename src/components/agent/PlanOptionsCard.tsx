@@ -21,7 +21,7 @@ export const PlanOptionsCard: React.FC<PlanOptionsCardProps> = ({
 
   return (
     <div className="mt-3 space-y-2 pt-2 border-t border-[#31313e]">
-      <div className="flex items-center space-x-1.5 text-[10px] uppercase font-bold text-amber-300/90 tracking-wider">
+      <div className="flex items-center space-x-1.5 text-[11px] uppercase font-bold text-amber-300/90 tracking-wider">
         <ListChecks className="w-3 h-3" />
         <span>
           {options.some(o => o.action === 'paid' || o.action === 'copy')
@@ -54,20 +54,20 @@ export const PlanOptionsCard: React.FC<PlanOptionsCardProps> = ({
                       <span className="font-mono text-indigo-300">Option {opt.id}</span>
                     )}
                     {deliveryLabel && (
-                      <span className="text-[9px] px-1.5 py-0.5 rounded bg-sky-600/25 text-sky-200 border border-sky-500/30 uppercase tracking-wide">
+                      <span className="text-[11px] px-1.5 py-0.5 rounded bg-sky-600/25 text-sky-200 border border-sky-500/30 uppercase tracking-wide">
                         {deliveryLabel}
                       </span>
                     )}
                     <span className="truncate">{opt.title}</span>
                   </div>
                   {opt.action !== 'copy' && (
-                    <p className="text-[10px] text-zinc-400 mt-1 leading-relaxed">{opt.description}</p>
+                    <p className="text-[11px] text-zinc-400 mt-1 leading-relaxed">{opt.description}</p>
                   )}
                 </div>
                 {selected ? (
                   <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
                 ) : (
-                  <span className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-indigo-600/30 text-indigo-200 border border-indigo-500/30">
+                  <span className="shrink-0 text-[11px] px-1.5 py-0.5 rounded bg-indigo-600/30 text-indigo-200 border border-indigo-500/30">
                     {opt.action === 'paid' ? 'Confirm' : opt.action === 'copy' ? 'Copy' : 'Pick'}
                   </span>
                 )}
@@ -76,7 +76,7 @@ export const PlanOptionsCard: React.FC<PlanOptionsCardProps> = ({
           );
         })}
       </div>
-      <p className="text-[9px] text-zinc-500">
+      <p className="text-[11px] text-zinc-400">
         Click an option, or type <span className="font-mono text-zinc-400">option 1</span>,{' '}
         <span className="font-mono text-zinc-400">2</span>, etc.
       </p>

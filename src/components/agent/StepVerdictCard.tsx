@@ -1,5 +1,5 @@
 import React from 'react';
-import { CheckCircle2, ThumbsDown, ThumbsUp, XCircle } from 'lucide-react';
+import { CheckCircle2, XCircle } from 'lucide-react';
 
 export interface StepVerdictCardProps {
   stepId: string;
@@ -13,7 +13,7 @@ export interface StepVerdictCardProps {
   needsConfirm?: boolean;
 }
 
-/** Reviewer Yay/Nay for the active Planner step. */
+/** Reviewer pass/fail for the active Planner step. `result` stays yay/nay for stored plans. */
 export const StepVerdictCard: React.FC<StepVerdictCardProps> = ({
   stepId,
   stepTitle,
@@ -24,17 +24,17 @@ export const StepVerdictCard: React.FC<StepVerdictCardProps> = ({
   onApply,
   needsConfirm
 }) => {
-  const yay = result === 'yay';
+  const passed = result === 'yay';
   return (
     <div className="mt-3 space-y-2 pt-2 border-t border-[#31313e]">
       <div
-        className={`flex items-center space-x-1.5 text-[10px] uppercase font-bold tracking-wider ${
-          yay ? 'text-emerald-300/90' : 'text-rose-300/90'
+        className={`flex items-center space-x-1.5 text-[11px] uppercase font-bold tracking-wider ${
+          passed ? 'text-emerald-300/90' : 'text-rose-300/90'
         }`}
       >
-        {yay ? <ThumbsUp className="w-3 h-3" /> : <ThumbsDown className="w-3 h-3" />}
+        {passed ? <CheckCircle2 className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
         <span>
-          Step {stepId} · {yay ? 'Yay' : 'Nay'}
+          Step {stepId} · {passed ? 'Pass' : 'Fail'}
         </span>
       </div>
       <p className="text-[11px] text-zinc-300 leading-relaxed">
@@ -50,7 +50,7 @@ export const StepVerdictCard: React.FC<StepVerdictCardProps> = ({
             className={`w-full flex items-center justify-center gap-2 rounded-md px-3 py-2 text-[12px] font-sans font-medium border transition ${
               sent
                 ? 'bg-emerald-600/20 border-emerald-500/40 text-emerald-200 cursor-default'
-                : yay
+                : passed
                   ? 'bg-emerald-600 hover:bg-emerald-500 border-emerald-500/50 text-white'
                   : 'bg-rose-600 hover:bg-rose-500 border-rose-500/50 text-white'
             }`}
@@ -58,24 +58,25 @@ export const StepVerdictCard: React.FC<StepVerdictCardProps> = ({
             {sent ? (
               <>
                 <CheckCircle2 className="w-3.5 h-3.5" />
-                <span>Applied to Planner</span>
+                <span>Applied to plan</span>
               </>
-            ) : yay ? (
+            ) : passed ? (
               <>
-                <ThumbsUp className="w-3.5 h-3.5" />
-                <span>Accept Yay — next step</span>
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                <span>Accept & continue</span>
               </>
             ) : (
               <>
                 <XCircle className="w-3.5 h-3.5" />
-                <span>Accept Nay — send fixes to Coder</span>
+                <span>Accept & send fixes</span>
               </>
             )}
           </button>
           {!sent && (
-            <p className="text-[9px] text-zinc-500">
-              Planner applies this verdict to the durable plan, then advances or re-dispatches the
-              same step.
+            <p className="text-[11px] text-zinc-400">
+              {passed
+                ? 'Accepting a pass advances the plan to the next step.'
+                : 'Accepting a fail sends the fixes to the coder.'}
             </p>
           )}
         </>

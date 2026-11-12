@@ -199,9 +199,39 @@ export function noteUserTurn(log: WorkLog, text: string): WorkLog {
   return { ...log, request, next: oneLine(line, 240) };
 }
 
+/** True when two verify fingerprints are both present and not equal. */
+export function verifyFingerprintChanged(
+  previous?: string | null,
+  next?: string | null
+): boolean {
+  const prev = (previous || '').trim();
+  const cur = (next || '').trim();
+  if (!prev || !cur) return false;
+  return prev !== cur;
+}
+
+/**
+ * A sticky bug clears only when a file it names was written/edited,
+ * or the verify fingerprint changed. An unnamed bug is not cleared by an unrelated write.
+ */
+export function stickyBugCleared(
+  bug: string,
+  paths: string[],
+  fingerprints?: { previous?: string | null; next?: string | null }
+): boolean {
+  if (!bug) return false;
+  if (verifyFingerprintChanged(fingerprints?.previous, fingerprints?.next)) return true;
+  if (!paths.length) return false;
+  const bugFiles = fileNames(bug);
+  if (!bugFiles.length) return false;
+  const saved = paths.map(p => p.replace(/\\/g, '/').toLowerCase());
+  return bugFiles.some(f => saved.some(p => p === f || p.endsWith('/' + f)));
+}
+
 export function noteSavedFiles(
   log: WorkLog,
-  tools: { name: string; status?: string; args?: { path?: string } }[]
+  tools: { name: string; status?: string; args?: { path?: string } }[],
+  fingerprints?: { previous?: string | null; next?: string | null }
 ): WorkLog {
   let done = log.done;
   const savedPaths: string[] = [];
@@ -219,26 +249,16 @@ export function noteSavedFiles(
   }
   let next = log.next;
   let bug = log.bug;
+  const cleared = !!bug && stickyBugCleared(bug, savedPaths, fingerprints);
   if (next && repeatsFinishedFile(done, next)) {
     if (isDurableStep(next)) done = pushUnique(done, next, MAX_DONE);
-    next = bug && !bugClearedByPaths(bug, savedPaths) ? oneLine(bug, 240) : '';
+    next = bug && !cleared ? oneLine(bug, 240) : '';
   }
-  if (bug && bugClearedByPaths(bug, savedPaths)) {
+  if (cleared) {
     bug = '';
     if (next && stepsTooSimilar(next, log.bug)) next = '';
   }
   return { ...log, done, next, bug };
-}
-
-function bugClearedByPaths(bug: string, paths: string[]): boolean {
-  if (!paths.length) return false;
-  const bugFiles = fileNames(bug);
-  const saved = paths.map(p => p.replace(/\\/g, '/').toLowerCase());
-  if (bugFiles.length) {
-    return bugFiles.some(f => saved.some(p => p === f || p.endsWith('/' + f) || p.endsWith('\\' + f)));
-  }
-  // Bug named no file — any successful edit/write counts as progress on it.
-  return paths.length > 0;
 }
 
 /**

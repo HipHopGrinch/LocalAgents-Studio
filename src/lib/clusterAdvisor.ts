@@ -9,14 +9,17 @@ import { MODEL_CATALOG, CatalogModel } from '../config/modelCatalog';
 import {
   estimateInstalledModelFit,
   findCatalogModel,
+  FIT_FACTOR,
   fitSpillsToSystemRam,
   installedModelSizeB,
   normTag,
   parseParams,
-  recommend
+  recommend,
+  recommendQuantVariant
 } from './recommender';
 import { clampNumCtx, resolveModelMaxContext, snapNumCtxToOption } from './contextSize';
 import { extractJsonObject, sanitizeLooseJson, stripThinkBlocks } from './swarmContract';
+import { modelLooksLikeImageGen } from './imageRouting';
 
 export type GpuArchTier = 'blackwell_ada' | 'ampere' | 'pascal_turing' | 'generic' | 'cloud';
 
@@ -317,8 +320,13 @@ export function scoreInstalledModelForNode(
     if (effectiveTps >= 45) baseQuality += 1.0;
   }
 
-  // Fit multiplier: never let a slow RAM-spilling model beat a crisp full-VRAM model
-  const fitMultiplier = fitsVram ? 1.0 : sizeGB <= usableVramGB * 1.15 ? 0.35 : 0.1;
+  // Same partial/cpu penalties as the Model Hub (FIT_FACTOR). A spill must not beat a full-VRAM model.
+  const hwForFit = {
+    ...node.hardware,
+    reserveVramGB: Math.max(0, (node.hardware?.vramGB || 0) - usableVramGB)
+  };
+  const fitAtCtx = estimateInstalledModelFit(model, hwForFit, numCtx);
+  const fitMultiplier = FIT_FACTOR[fitAtCtx.kind];
 
   // Throughput factor (normalized around 35 tok/s)
   const speedFactor = Math.max(0.35, Math.min(1.35, Math.sqrt(Math.max(5, effectiveTps) / 35)));
@@ -374,29 +382,46 @@ function computeRecommendedPulls(
     if (installedSet.has(normTag(tag))) continue;
     const cat = MODEL_CATALOG.find(m => normTag(m.tag) === normTag(tag));
     if (!cat) continue;
-    const fit = estimateInstalledModelFit(
+    let pullTag = cat.tag;
+    let sizeGB = cat.sizeGB;
+    let fit = estimateInstalledModelFit(
       { name: cat.tag, size: cat.sizeGB * 1e9 },
       hw,
       targetCtx
     );
-    if (fitSpillsToSystemRam(fit.kind)) continue;
+    const alt = recommendQuantVariant({ hardware: hw }, cat, targetCtx);
+    if (fitSpillsToSystemRam(fit.kind)) {
+      if (!alt || alt.reason !== 'spill') continue;
+      pullTag = alt.tag;
+      sizeGB = alt.sizeGB;
+      fit = alt.fit;
+    } else if (alt?.reason === 'headroom') {
+      pullTag = alt.tag;
+      sizeGB = alt.sizeGB;
+      fit = alt.fit;
+    }
     out.push({
-      tag: cat.tag,
-      sizeGB: cat.sizeGB,
+      tag: pullTag,
+      sizeGB,
       estimatedTokPerSec: fit.tokensPerSec,
-      reason: cat.notes
+      reason: alt ? `${cat.notes} Quant: ${pullTag}.` : cat.notes
     });
     if (out.length >= 2) break;
   }
 
   if (out.length < 2) {
     for (const r of recs) {
-      if (r.installed || fitSpillsToSystemRam(r.fit.kind)) continue;
-      if (out.some(x => normTag(x.tag) === normTag(r.model.tag))) continue;
+      const suggestion = r.quantSuggestion;
+      const spilled = fitSpillsToSystemRam(r.fit.kind);
+      const useAlt =
+        !!suggestion && (spilled ? suggestion.reason === 'spill' : suggestion.reason === 'headroom');
+      if (r.installed || (spilled && !useAlt)) continue;
+      const pullTag = useAlt && suggestion ? suggestion.tag : r.model.tag;
+      if (out.some(x => normTag(x.tag) === normTag(pullTag))) continue;
       out.push({
-        tag: r.model.tag,
-        sizeGB: r.model.sizeGB,
-        estimatedTokPerSec: r.fit.tokensPerSec,
+        tag: pullTag,
+        sizeGB: useAlt && suggestion ? suggestion.sizeGB : r.model.sizeGB,
+        estimatedTokPerSec: useAlt && suggestion ? suggestion.fit.tokensPerSec : r.fit.tokensPerSec,
         reason: r.model.notes
       });
       if (out.length >= 2) break;
@@ -487,23 +512,39 @@ export function buildClusterAutoConfigPlan(nodes: EndpointNode[]): ClusterAutoCo
     }
 
     const generative = (node.models || []).filter(m => !isEmbeddingModel(m));
-    const scored = generative
+    const explicitImage = node.imageModel?.trim() || '';
+    // Image models stay out of the primary pin so Flux doesn't become the architect coder.
+    const pinPool = generative.filter(
+      m => !modelLooksLikeImageGen(m.name, m.capabilities) && m.name !== explicitImage
+    );
+    const rankPool = pinPool.length ? pinPool : generative;
+    const scoredRank = rankPool
       .map(m => {
         const s = scoreInstalledModelForNode(node, m, usableVramGB, specialty);
         return { model: m, ...s };
       })
       .sort((a, b) => b.score - a.score);
-
-    const primary = scored[0]?.model.name;
+    const primary = scoredRank[0]?.model.name;
+    const scoredByName = new Map(scoredRank.map(s => [s.model.name, s]));
+    const scored = [
+      ...scoredRank,
+      ...generative
+        .filter(m => !scoredByName.has(m.name))
+        .map(m => {
+          const s = scoreInstalledModelForNode(node, m, usableVramGB, specialty);
+          return { model: m, ...s };
+        })
+    ];
     const modelNumCtx: Record<string, number> = {};
     const enabledModels: string[] = [];
     const disabledModels: string[] = [];
 
     // Pin ONLY the #1 primary generative model per local GPU to completely eliminate
     // Ollama multi-GB model unload/reload thrashing mid-workflow!
-    const modelAdvice: NodeModelAdvice[] = scored.map((item, idx) => {
-      const isPrimary = idx === 0;
-      const keepEnabled = isPrimary;
+    const modelAdvice: NodeModelAdvice[] = scored.map(item => {
+      const isPrimary = item.model.name === primary;
+      const explicitImageModel = !!explicitImage && item.model.name === explicitImage;
+      const keepEnabled = isPrimary || explicitImageModel;
       modelNumCtx[item.model.name] = item.recommendedNumCtx;
       if (keepEnabled) {
         enabledModels.push(item.model.name);
@@ -523,9 +564,11 @@ export function buildClusterAutoConfigPlan(nodes: EndpointNode[]): ClusterAutoCo
         isPrimary,
         reason: isPrimary
           ? `★ Pinned in VRAM (${SPECIALTY_META[specialty].label}) · ${item.reason}`
-          : !item.fitsVram
-            ? `Disabled to prevent CPU/RAM spill · ${item.reason}`
-            : `Disabled to prevent VRAM weight-swap thrashing with ${primary}`
+          : explicitImageModel
+            ? `Kept enabled — explicit image model · ${item.reason}`
+            : !item.fitsVram
+              ? `Disabled to prevent CPU/RAM spill · ${item.reason}`
+              : `Disabled to prevent VRAM weight-swap thrashing with ${primary}`
       };
     });
 
@@ -753,11 +796,20 @@ export function mergeCloudAuditIntoPlan(
         : baseNode.roles;
 
       const installedNames = new Set(baseNode.modelAdvice.map(m => m.name));
-      const primaryModel =
+      let primaryModel =
         typeof cloudNode.primaryModel === 'string' &&
         installedNames.has(cloudNode.primaryModel)
           ? cloudNode.primaryModel
           : baseNode.primaryModel;
+      // Cloud must not replace the pinned coder with an image model when a generative primary exists.
+      if (
+        primaryModel &&
+        modelLooksLikeImageGen(primaryModel) &&
+        baseNode.primaryModel &&
+        !modelLooksLikeImageGen(baseNode.primaryModel)
+      ) {
+        primaryModel = baseNode.primaryModel;
+      }
 
       const modelNumCtx = { ...baseNode.modelNumCtx };
       if (cloudNode.modelNumCtx && typeof cloudNode.modelNumCtx === 'object') {
@@ -768,10 +820,13 @@ export function mergeCloudAuditIntoPlan(
         }
       }
 
+      const sideEnabled = baseNode.isFrontier
+        ? []
+        : baseNode.enabledModels.filter(name => name !== baseNode.primaryModel && installedNames.has(name));
       const enabledModels = baseNode.isFrontier
         ? baseNode.enabledModels
         : primaryModel
-          ? [primaryModel]
+          ? Array.from(new Set([primaryModel, ...sideEnabled]))
           : baseNode.enabledModels;
       const disabledModels = baseNode.isFrontier
         ? []

@@ -7,7 +7,7 @@ An autonomous, distributed local-agent IDE built for a multi-PC Ollama cluster w
 
 **Download:** [latest release](https://github.com/HipHopGrinch/LocalAgents-Studio/releases/latest). Use `…-setup.exe` for in-app updates, or `…-portable.exe` for no install. Builds are unsigned, so Windows SmartScreen asks once: choose **More info**, then **Run anyway**.
 
-**User guide:** [GitHub wiki](https://github.com/HipHopGrinch/LocalAgents-Studio/wiki) covers install, Ollama, nodes, models, projects, the agent, durable plans / heal / Model Fit, Swarm, and logs. **What's new:** [1.3 notes](https://github.com/HipHopGrinch/LocalAgents-Studio/wiki/Whats-new) · full [`CHANGELOG.md`](CHANGELOG.md).
+**User guide:** [GitHub wiki](https://github.com/HipHopGrinch/LocalAgents-Studio/wiki) covers install, Ollama, nodes, models, projects, the agent, durable plans / heal / Model Fit, Swarm, and logs. **What's new:** [1.5 notes](https://github.com/HipHopGrinch/LocalAgents-Studio/wiki/Whats-new) · full [`CHANGELOG.md`](CHANGELOG.md).
 
 **Discord:** https://discord.gg/ZVkmUfXwW
 
@@ -38,7 +38,11 @@ A fresh install starts with no nodes. Add your machines in **Hardware & Models �
 
 ### Conductor: Planner, Coder, Reviewer
 - **Planner** locks a durable step plan. **Coder** implements each step. **Reviewer** must answer **Pass** or **Fail**, and a Pass only sticks when the project's typecheck or build passes.
-- Failures **heal** with real compiler output, within a bounded budget. Each step has **Skip**, **Edit**, **Retry**, and **Undo**.
+- Each role can pick its own **computer, model, and context window**, or stay on **Auto** routing.
+- **Verify first:** before a step reaches the Reviewer, Studio runs the project check, removes unused imports itself, and runs up to two targeted compiler heals.
+- **Render check for web projects:** Studio starts the project's own Vite server in a hidden, sandboxed window and checks the page. Console errors, crashes, a blank page, or a collapsed canvas go back to the Coder as errors, and a screenshot is saved to `.localagents/render/last.png`.
+- Failures **heal** with real compiler output, within a bounded budget per step. Each step has **Skip**, **Edit**, **Retry**, and **Undo**.
+- Works with **thinking models** on any role: output room is reserved for reasoning, and a cut-off reply is retried once.
 - **Stop** cancels every stream. One run at a time per chat, and late results are discarded instead of written.
 
 ### Conductor Swarm
@@ -63,8 +67,9 @@ A fresh install starts with no nodes. Add your machines in **Hardware & Models �
 
 ### Chat & Window
 - Context meter, a status line that names the role, computer, model, and file, and inline error cards with **Retry**.
-- **Ctrl+K** command palette, keyboard-resizable panels, and a first-run checklist.
-- Automation switches (Swarm, auto node choice, auto-save, auto-review) live in one **Automation** section and start **off** on a fresh install.
+- **Ctrl+K** command palette and a first-run checklist. The layout resizes for large and full-screen windows: drag any splitter, double-click to reset, or use the arrow keys.
+- Automation switches (**Full auto**, Swarm, auto node choice, auto-save, auto-review) live in one **Automation** section and start **off** on a fresh install. Full auto accepts writes, verdicts, and plan picks and keeps going; destructive commands, paid API calls, and a red typecheck still stop for you.
+- **Run log:** the **Log** button copies a timeline of the Conductor session (turns, models, tokens, verify results, verdicts, heals, and a `waste:` summary) and saves it to `.localagents/logs/`. Prompts, file contents, and API keys are never written.
 
 ### Web Console (optional)
 - A password-protected browser mirror of the desktop session. It listens on this PC only by default; LAN access requires a TLS certificate. API keys are never sent to the browser.
@@ -100,6 +105,8 @@ npm run check:electron
 npm test
 npm run lint
 ```
+
+To see where a saved run spent its time: `npm run analyze-log .localagents/logs/run-<chat>.md`.
 
 ### Windows EXE (self-contained)
 

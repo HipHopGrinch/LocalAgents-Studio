@@ -41,6 +41,32 @@ export function verifyOutputFailed(output: string): boolean {
   return false;
 }
 
+const ABSOLUTE_PATH = /^(?:[A-Za-z]:[\\/]|\/)/;
+
+/**
+ * The text before `(line,col)` / `:line:` can carry prose ("…compilation errors: src/App.tsx").
+ * Keep only the path: the part after the last backtick or ": " separator, then the drive-letter
+ * path or last whitespace-free token if spaces remain. Null when no path-like token is left.
+ */
+function pathFromErrorPrefix(prefix: string): string | null {
+  let p = (prefix || '').trim();
+  const cut = Math.max(p.lastIndexOf('`'), p.lastIndexOf(': '));
+  if (cut >= 0) p = p.slice(cut + (p[cut] === '`' ? 1 : 2));
+  p = p.trim().replace(/^["'(\[]+|["')\]]+$/g, '');
+  if (!p) return null;
+  if (!/\s/.test(p) || ABSOLUTE_PATH.test(p)) return p;
+  const drive = /(?:^|\s)([A-Za-z]:[\\/].*)$/.exec(p);
+  if (drive) return drive[1];
+  const token = /(?:^|\s)([^\s`'"()]+\.[A-Za-z0-9]+)$/.exec(p);
+  return token ? token[1] : null;
+}
+
+function looksLikeFilePath(file: string): boolean {
+  const f = (file || '').trim();
+  if (!f || f.length > 300 || /[`\r\n\u0000]/.test(f)) return false;
+  return !/\s/.test(f) || ABSOLUTE_PATH.test(f);
+}
+
 export function parseCompilerErrors(output: string): CompilerError[] {
   const errors: CompilerError[] = [];
   const seen = new Set<string>();
@@ -59,12 +85,13 @@ export function parseCompilerErrors(output: string): CompilerError[] {
   for (const raw of lines) {
     const line = raw.trimEnd();
     let m = tsRe.exec(line);
-    if (m) {
-      const key = `${m[1]}:${m[2]}:${m[3]}`;
+    const tsFile = m ? pathFromErrorPrefix(m[1]) : null;
+    if (m && tsFile) {
+      const key = `${tsFile}:${m[2]}:${m[3]}`;
       if (!seen.has(key)) {
         seen.add(key);
         errors.push({
-          file: m[1].replace(/\\/g, '/'),
+          file: tsFile.replace(/\\/g, '/'),
           line: Number(m[2]),
           code: m[3],
           message: m[4].trim()
@@ -97,12 +124,13 @@ export function parseCompilerErrors(output: string): CompilerError[] {
     }
 
     m = generic.exec(line.trim());
-    if (m && /error|expected|cannot|undefined/i.test(m[3])) {
-      const key = `${m[1]}:${m[2]}:${m[3].slice(0, 40)}`;
+    const genericFile = m ? pathFromErrorPrefix(m[1]) : null;
+    if (m && genericFile && /error|expected|cannot|undefined/i.test(m[3])) {
+      const key = `${genericFile}:${m[2]}:${m[3].slice(0, 40)}`;
       if (!seen.has(key)) {
         seen.add(key);
         errors.push({
-          file: m[1].replace(/\\/g, '/'),
+          file: genericFile.replace(/\\/g, '/'),
           line: Number(m[2]),
           message: m[3].trim()
         });
@@ -277,5 +305,5 @@ Files to edit: ${files.map(f => `\`${f}\``).join(', ')}`;
 }
 
 export function filesFromErrors(errors: CompilerError[]): string[] {
-  return [...new Set(errors.map(e => e.file.replace(/\\/g, '/')))].slice(0, 12);
+  return [...new Set(errors.filter(e => looksLikeFilePath(e.file)).map(e => e.file.trim().replace(/\\/g, '/')))].slice(0, 12);
 }

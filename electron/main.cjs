@@ -2,7 +2,7 @@
 // Owns everything privileged: filesystem, PowerShell, and all network calls to Ollama nodes.
 // The renderer runs sandboxed with webSecurity on and talks to this file only via IPC (see preload.cjs).
 
-const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsp = require('fs/promises');
@@ -10,6 +10,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { spawn, execFile } = require('child_process');
 const webConsole = require('./webConsole.cjs');
+const { runRenderCheck } = require('./renderCheck.cjs');
 const {
   sanitizePackageJsonContent,
   sanitizePackageJsonObject,
@@ -24,6 +25,7 @@ const {
   agentCommandBlockReason
 } = require('./sandbox.cjs');
 const { buildGitArgv, scrubGitEnv } = require('./gitGuard.cjs');
+const { createLatestWinsQueue } = require('./latestWins.cjs');
 
 /** Releases are unsigned until a real publisher cert is wired up. */
 const VERIFY_UPDATE_CODE_SIGNATURE = false;
@@ -35,8 +37,11 @@ const READ_CAP_BYTES = 5 * 1024 * 1024;
 const TAGS_TTL_MS = 3 * 60 * 1000;
 const MODELS_TTL_MS = 5 * 60 * 1000;
 const PS_TTL_MS = 5 * 1000;
-/** Ceiling for frontier max_tokens. Local num_predict below this is kept. */
-const FRONTIER_MAX_OUTPUT_TOKENS = 8192;
+/**
+ * Ceiling for frontier max_tokens. Local num_predict below this is kept. Reasoning models
+ * spend max_tokens on hidden thinking, so it leaves room for a x4 retry from the 8192 floor.
+ */
+const FRONTIER_MAX_OUTPUT_TOKENS = 16384;
 
 // Per-user settings live under AppData — NEVER inside the install dir or portable EXE.
 // Must be set before app.ready().
@@ -372,6 +377,12 @@ function withWriteLock(filePath, fn) {
   );
   return next;
 }
+
+/**
+ * Chats and settings each carry every conversation (~1 MB) and the renderer saves them on every
+ * message change. Without this, a save slower than the call rate queues one parsed payload per call.
+ */
+const saveCoalescer = createLatestWinsQueue();
 
 function uniqueTmpPath(filePath) {
   return `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
@@ -771,7 +782,11 @@ ipcMain.handle('settings:load', async (e) => {
   }
 });
 
-ipcMain.handle('settings:save', async (e, settings) => {
+ipcMain.handle('settings:save', (e, settings) =>
+  saveCoalescer.enqueue(settingsPath(), e?.webConsole ? 'web' : 'desktop', () => saveSettingsNow(e, settings))
+);
+
+async function saveSettingsNow(e, settings) {
   try {
     await fsp.mkdir(app.getPath('userData'), { recursive: true });
     let existing;
@@ -877,7 +892,7 @@ ipcMain.handle('settings:save', async (e, settings) => {
   } catch (err) {
     return { error: err.message };
   }
-});
+}
 
 // ==========================================
 // LIVE SESSION (desktop ↔ web console remote control)
@@ -931,6 +946,19 @@ ipcMain.handle('session:get', (e) => {
   }
   return snap;
 });
+
+/**
+ * Fan a publish out. The desktop window ignores its own echo (applyLiveSession drops its clientId),
+ * so a desktop publish only reaches web clients. The chat mirror rides along only when this
+ * publish changed it; clients keep the last one they received.
+ */
+function emitPublishedSession(fromWeb, mirrorChanged) {
+  const payload = { ...liveSession };
+  if (!mirrorChanged) delete payload.chatMirror;
+  if (fromWeb && mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('session:changed', payload);
+  if (!webConsole.clientCount()) return;
+  webConsole.broadcast('session:changed', { ...payload, nodes: stripNodeApiKeys(payload.nodes) });
+}
 
 ipcMain.handle('session:publish', (e, snapshot = {}) => {
   try {
@@ -1016,7 +1044,14 @@ ipcMain.handle('session:publish', (e, snapshot = {}) => {
         else delete next.roleRoutes;
         return next;
       })(),
-      chatMirror: snapshot.chatMirror !== undefined ? snapshot.chatMirror : liveSession.chatMirror,
+      // Only a web console reads the mirror. Without a connected client it is never stored, so a
+      // desktop-only run does not hold or re-send the whole conversation on every publish.
+      chatMirror:
+        !fromWeb && !webConsole.clientCount()
+          ? null
+          : snapshot.chatMirror !== undefined
+            ? snapshot.chatMirror
+            : liveSession.chatMirror,
       ...(localTokensGenerated != null ? { localTokensGenerated } : {}),
       ...(frontierTokensUsed != null ? { frontierTokensUsed } : {}),
       ...(tokenStatsScope === 'project' || tokenStatsScope === 'global' ? { tokenStatsScope } : {}),
@@ -1026,7 +1061,7 @@ ipcMain.handle('session:publish', (e, snapshot = {}) => {
       source: snapshot.source || 'renderer',
       clientId: snapshot.clientId || liveSession.clientId || null
     };
-    send('session:changed', { ...liveSession });
+    emitPublishedSession(fromWeb, snapshot.chatMirror !== undefined);
     // Avoid flooding studio.log on rapid node/tab publishes — sample meaningfully.
     if (
       snapshot.chatsRevision !== undefined ||
@@ -1085,6 +1120,11 @@ async function ensureLiveSessionSeeded() {
 webConsole.setHooks({
   onClientConnected: () => {
     void ensureLiveSessionSeeded();
+  },
+  // The desktop renderer republishes the full chat mirror when the first web client attaches.
+  onClientCountChanged: count => {
+    if (count === 0) liveSession = { ...liveSession, chatMirror: null };
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('session:webClients', count);
   }
 });
 
@@ -1285,6 +1325,59 @@ ipcMain.handle('logs:reportToGitHub', async (_e, opts = {}) => {
 });
 
 appendLog('info', `studio start ${app.getVersion()}`);
+
+// ==========================================
+// MEMORY DIAGNOSTICS
+// A quiet heap trail in studio.log plus one heap snapshot per session, so a main-process leak
+// can be proven after the fact instead of guessed at.
+// ==========================================
+
+const MEM_SAMPLE_MS = 60 * 1000;
+const MEM_LOG_DELTA_BYTES = 50 * 1024 * 1024;
+const HEAP_SNAPSHOT_AT_BYTES = 2.5 * 1024 * 1024 * 1024;
+const HEAP_SNAPSHOTS_KEPT = 2;
+let lastLoggedHeapUsed = 0;
+let heapSnapshotTaken = false;
+
+const toMb = bytes => Math.round(bytes / 1048576);
+
+async function pruneHeapSnapshots(dir) {
+  const names = (await fsp.readdir(dir)).filter(n => n.endsWith('.heapsnapshot'));
+  const stamped = await Promise.all(
+    names.map(async name => ({ name, mtime: (await fsp.stat(path.join(dir, name))).mtimeMs }))
+  );
+  stamped.sort((a, b) => b.mtime - a.mtime);
+  for (const old of stamped.slice(HEAP_SNAPSHOTS_KEPT)) {
+    await fsp.rm(path.join(dir, old.name), { force: true });
+  }
+}
+
+function sampleMemory() {
+  const m = process.memoryUsage();
+  if (Math.abs(m.heapUsed - lastLoggedHeapUsed) > MEM_LOG_DELTA_BYTES) {
+    lastLoggedHeapUsed = m.heapUsed;
+    appendLog(
+      'info',
+      `mem rss=${toMb(m.rss)}MB heapUsed=${toMb(m.heapUsed)}MB heapTotal=${toMb(m.heapTotal)}MB external=${toMb(m.external)}MB arrayBuffers=${toMb(m.arrayBuffers)}MB`
+    );
+  }
+  if (heapSnapshotTaken || m.heapUsed < HEAP_SNAPSHOT_AT_BYTES) return;
+  heapSnapshotTaken = true;
+  const dir = path.dirname(logFilePath());
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `main-${new Date().toISOString().replace(/[:.]/g, '-')}.heapsnapshot`);
+    // Synchronous and slow on a multi-GB heap, but the process is already close to dying.
+    require('v8').writeHeapSnapshot(file);
+    appendLog('warn', `heap snapshot written (heapUsed=${toMb(m.heapUsed)}MB): ${file}`);
+    void pruneHeapSnapshots(dir).catch(() => {});
+  } catch (err) {
+    appendLog('warn', `heap snapshot failed: ${err?.message || err}`);
+  }
+}
+
+const memoryTimer = setInterval(sampleMemory, MEM_SAMPLE_MS);
+memoryTimer.unref();
 
 // ==========================================
 // ENCRYPTED NODE SETUP EXPORT / IMPORT
@@ -1697,16 +1790,21 @@ ipcMain.handle('project:saveChats', async (e, root, payload) => {
     if (!root) return { error: 'No workspace' };
     const pinned = e?.webConsole ? assertWithinWorkspace(root, { allowRoot: true }) : pinWorkspaceRoot(root);
     if (!pinned) return { error: 'No workspace folder is open' };
-    const dir = path.join(pinned, '.localagents');
-    await fsp.mkdir(dir, { recursive: true });
-    const body = JSON.stringify({
-      version: 1,
-      activeConversationId: payload?.activeConversationId || null,
-      conversations: Array.isArray(payload?.conversations) ? payload.conversations : []
-    });
     const file = projectChatsPath(pinned);
-    await atomicWriteFile(file, body);
-    return { success: true };
+    return await saveCoalescer.enqueue(file, 'chats', async () => {
+      try {
+        await fsp.mkdir(path.dirname(file), { recursive: true });
+        const body = JSON.stringify({
+          version: 1,
+          activeConversationId: payload?.activeConversationId || null,
+          conversations: Array.isArray(payload?.conversations) ? payload.conversations : []
+        });
+        await atomicWriteFile(file, body);
+        return { success: true };
+      } catch (err) {
+        return { error: err.message };
+      }
+    });
   } catch (err) {
     return { error: err.message };
   }
@@ -2550,6 +2648,42 @@ ipcMain.handle('workspace:typecheck', async (_e, root, opts = {}) => {
     };
   } catch (err) {
     return { ok: false, error: err.message, output: err.message };
+  }
+});
+
+/**
+ * Render smoke check (web projects). Desktop only: it spawns the project's vite dev server and loads
+ * it in a hidden sandboxed window, so it is deliberately absent from the web console RPC allowlist.
+ * Never throws; infrastructure problems come back as `{ ok: true, skipped: true, reason }`.
+ */
+ipcMain.handle('workspace:renderCheck', async (e, root, opts = {}) => {
+  try {
+    if (e?.webConsole) {
+      return { ok: false, skipped: true, reason: 'The render check runs from the desktop app only' };
+    }
+    if (!root || !fs.existsSync(root)) {
+      return { ok: false, skipped: true, reason: 'Workspace root missing' };
+    }
+    let dir;
+    try {
+      dir = assertWithinWorkspace(root, { allowRoot: true });
+    } catch (err) {
+      return { ok: false, skipped: true, reason: err.message };
+    }
+    const safeOpts = opts && typeof opts === 'object' ? opts : {};
+    return await runRenderCheck(
+      dir,
+      { timeoutMs: safeOpts.timeoutMs, settleMs: safeOpts.settleMs },
+      {
+        electron: { BrowserWindow, session },
+        killTree,
+        trackProc,
+        writeFile: atomicWriteFile,
+        log: appendLog
+      }
+    );
+  } catch (err) {
+    return { ok: false, skipped: true, reason: err && err.message ? err.message : String(err) };
   }
 });
 
@@ -3492,6 +3626,16 @@ function writeTagsFromToolCalls(acc) {
   return chunks.join('\n');
 }
 
+// Gemini ends a turn this way when the model emits a native function call and no tools were declared.
+function isMalformedFunctionCall(reason) {
+  return /malformed_function_call|function_call_filter/i.test(String(reason || ''));
+}
+
+const MALFORMED_FUNCTION_CALL_NUDGE =
+  'Your last reply tried a native function call, and this endpoint rejected it. Studio has no native functions. ' +
+  'Use the text tool tags from the system prompt instead (for example <list_dir path="."/> or <read_file path="..."/>), ' +
+  'or answer in plain text. Continue from where you stopped.';
+
 async function streamOpenAI(requestId, url, apiKey, body, channel) {
   const controller = new AbortController();
   streams.set(requestId, controller);
@@ -3608,51 +3752,100 @@ async function streamOpenAI(requestId, url, apiKey, body, channel) {
       throw new Error(`HTTP ${resp.status}: ${msg}`);
     }
 
-    reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    armIdle();
-
-    for (;;) {
-      if (Date.now() - started >= absoluteMs) {
-        stopReason = stopReason || 'absolute';
-        controller.abort();
-        throw Object.assign(new Error('absolute'), { name: 'AbortError' });
-      }
-      const { done, value } = await reader.read();
-      if (done) break;
+    const pump = async response => {
+      reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
       armIdle();
-      buffer += decoder.decode(value, { stream: true });
-      let idx;
-      while ((idx = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, idx).trim();
-        buffer = buffer.slice(idx + 1);
-        if (!line || !line.startsWith('data:')) continue;
-        const dataStr = line.slice(5).trim();
-        if (dataStr === '[DONE]') break;
-        try {
-          const parsed = JSON.parse(dataStr);
-          if (parsed.usage && typeof parsed.usage === 'object') usage = parsed.usage;
-          const choice = parsed.choices?.[0] || {};
-          const delta = choice.delta || {};
-          if (choice.finish_reason) finishReason = choice.finish_reason;
-          absorbToolCall(toolAcc, delta);
-          let content = textFromContent(delta.content ?? delta.text ?? choice.message?.content ?? '');
-          if (!content && Array.isArray(parsed.candidates?.[0]?.content?.parts)) {
-            content = parsed.candidates[0].content.parts.map(part => part.text || '').join('');
-          }
-          const thinking = textFromContent(delta.reasoning_content || delta.thinking || '');
-          if (content || thinking) {
-            if (!firstTokenTime) firstTokenTime = Date.now();
-            if (content) {
-              if (full.length < OUTPUT_CAP_BYTES) full += content;
-              tokenCount += Math.ceil(content.length / 4);
+
+      for (;;) {
+        if (Date.now() - started >= absoluteMs) {
+          stopReason = stopReason || 'absolute';
+          controller.abort();
+          throw Object.assign(new Error('absolute'), { name: 'AbortError' });
+        }
+        const { done, value } = await reader.read();
+        if (done) break;
+        armIdle();
+        buffer += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, idx).trim();
+          buffer = buffer.slice(idx + 1);
+          if (!line || !line.startsWith('data:')) continue;
+          const dataStr = line.slice(5).trim();
+          if (dataStr === '[DONE]') break;
+          try {
+            const parsed = JSON.parse(dataStr);
+            if (parsed.usage && typeof parsed.usage === 'object') usage = addUsage(parsed.usage);
+            const choice = parsed.choices?.[0] || {};
+            const delta = choice.delta || {};
+            if (choice.finish_reason) finishReason = choice.finish_reason;
+            absorbToolCall(toolAcc, delta);
+            let content = textFromContent(delta.content ?? delta.text ?? choice.message?.content ?? '');
+            if (!content && Array.isArray(parsed.candidates?.[0]?.content?.parts)) {
+              content = parsed.candidates[0].content.parts.map(part => part.text || '').join('');
             }
-            send(channel, { requestId, type: 'chunk', content, thinking });
-          }
-        } catch { /* skip malformed SSE */ }
+            const thinking = textFromContent(delta.reasoning_content || delta.thinking || '');
+            if (content || thinking) {
+              if (!firstTokenTime) firstTokenTime = Date.now();
+              if (content) {
+                if (full.length < OUTPUT_CAP_BYTES) full += content;
+                tokenCount += Math.ceil(content.length / 4);
+              }
+              send(channel, { requestId, type: 'chunk', content, thinking });
+            }
+          } catch { /* skip malformed SSE */ }
+        }
+        if (buffer.length > OUTPUT_CAP_BYTES) throw new Error('Stream line exceeded 1 MB');
       }
-      if (buffer.length > OUTPUT_CAP_BYTES) throw new Error('Stream line exceeded 1 MB');
+      reader = null;
+    };
+
+    // Each request reports its own usage; after a retry, add the first request's totals.
+    let usageBase = null;
+    const addUsage = next => {
+      if (!usageBase) return next;
+      const sum = key => (Number(usageBase[key]) || 0) + (Number(next[key]) || 0);
+      return { ...next, prompt_tokens: sum('prompt_tokens'), completion_tokens: sum('completion_tokens') };
+    };
+
+    await pump(resp);
+
+    if (isMalformedFunctionCall(finishReason) && !toolAcc.length) {
+      appendLog('warn', `frontier reply ended with ${finishReason}; retrying once with a text-tag reminder`);
+      usageBase = usage;
+      finishReason = '';
+      const retryPayload = {
+        ...payload,
+        messages: [
+          ...(Array.isArray(payload.messages) ? payload.messages : []),
+          ...(full.trim() ? [{ role: 'assistant', content: full }] : []),
+          { role: 'user', content: MALFORMED_FUNCTION_CALL_NUDGE }
+        ]
+      };
+      armIdle();
+      const retryResp = await postCompletion(retryPayload);
+      if (!retryResp.ok) {
+        const msg = await readErrorMessage(retryResp);
+        throw new Error(`HTTP ${retryResp.status}: ${msg}`);
+      }
+      send(channel, { requestId, type: 'chunk', content: '\n', thinking: '' });
+      full += '\n';
+      await pump(retryResp);
+      if (isMalformedFunctionCall(finishReason) && !toolAcc.length) {
+        send(channel, {
+          requestId,
+          type: 'error',
+          error:
+            `${body.model || 'The cloud model'} tried a native function call twice and the API rejected it (${finishReason}). ` +
+            'Studio tools are text tags such as <list_dir path="."/>. Send the request again, or pick another model for this role.',
+          retriable: true,
+          code: 'malformed_function_call'
+        });
+        completed = true;
+        return false;
+      }
     }
 
     const extra = writeTagsFromToolCalls(toolAcc);
@@ -3672,8 +3865,16 @@ async function streamOpenAI(requestId, url, apiKey, body, channel) {
     const totalDuration = Date.now() - started;
     const promptTokens = usage && Number.isFinite(Number(usage.prompt_tokens)) ? Number(usage.prompt_tokens) : null;
     const completionTokens = usage && Number.isFinite(Number(usage.completion_tokens)) ? Number(usage.completion_tokens) : null;
+    // Providers name this differently: OpenAI/xAI `completion_tokens_details.reasoning_tokens`,
+    // flat `reasoning_tokens`, Gemini `thoughts_token_count` / `thoughtsTokenCount`.
     const reasoningRaw = usage
-      ? Number(usage.completion_tokens_details?.reasoning_tokens ?? usage.reasoning_tokens)
+      ? Number(
+          usage.completion_tokens_details?.reasoning_tokens ??
+          usage.reasoning_tokens ??
+          usage.completion_tokens_details?.thoughts_token_count ??
+          usage.thoughts_token_count ??
+          usage.thoughtsTokenCount
+        )
       : NaN;
     const reasoningTokens = Number.isFinite(reasoningRaw) ? reasoningRaw : undefined;
     let evalCount = tokenCount;
@@ -3956,8 +4157,15 @@ ipcMain.handle('ollama:benchmark', async (e, node, model, numCtx) => {
     };
     await generate(1, 180000);
     const data = await generate(192, 180000);
-    const evalTokPerSec = data.eval_duration ? Math.round(data.eval_count / (data.eval_duration / 1e9)) : 0;
-    const promptTokPerSec = data.prompt_eval_duration ? Math.round(data.prompt_eval_count / (data.prompt_eval_duration / 1e9)) : 0;
+    // Mirrors computeTokPerSec in src/lib/runLog.ts: a tiny sample over a tiny duration is not a speed.
+    const guardedTokPerSec = (count, durationNs) => {
+      if (!Number.isFinite(count) || !Number.isFinite(durationNs)) return 0;
+      if (count < 16 || durationNs < 20_000_000) return 0;
+      const rate = count / (durationNs / 1e9);
+      return rate > 20000 ? 0 : Math.round(rate);
+    };
+    const evalTokPerSec = guardedTokPerSec(data.eval_count, data.eval_duration);
+    const promptTokPerSec = guardedTokPerSec(data.prompt_eval_count, data.prompt_eval_duration);
     const loadMs = Math.round((data.load_duration || 0) / 1e6);
     const totalMs = Math.round((data.total_duration || 0) / 1e6);
     return {

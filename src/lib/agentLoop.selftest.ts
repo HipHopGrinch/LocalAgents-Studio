@@ -8,7 +8,9 @@ import {
   capToolResultText,
   createEditRepeatGuard,
   editOutcomeKey,
+  executeTool,
   formatEditMismatch,
+  isUnchangedWrite,
   fulfillInOrder,
   historyForModel,
   isRepeatedEditStop,
@@ -81,6 +83,27 @@ const tightPrompt = buildContinuationUserPrompt(
 );
 assert.ok(tightPrompt.length < 9000);
 assert.match(tightPrompt, /error TS2322/);
+
+// A frontier Reviewer on a 262K window reads a 60 KB file whole: no middle lines dropped.
+const appFile = Array.from({ length: 1100 }, (_, i) => `const row${i} = ${i}; // ${'y'.repeat(30)}`).join('\n');
+assert.ok(appFile.length > 55000 && appFile.length < 65000);
+const wideCapped = capToolResultText(appFile, 'wide');
+assert.notEqual(wideCapped, appFile, 'wide tier alone still truncates');
+assert.match(wideCapped, /more lines/);
+assert.equal(capToolResultText(appFile, 'wide', 262144), appFile);
+assert.equal(capToolResultText(appFile, 'tight', 131072), appFile);
+assert.equal(capToolResultText(appFile, 'tight', 65536).length < appFile.length, true, 'below the roomy window the tier cap stays');
+const roomyPrompt = buildContinuationUserPrompt(
+  [{ id: 'rr', name: 'read_file', args: { path: 'src/App.tsx' }, status: 'done', result: appFile } as ToolCall],
+  { tier: 'wide', maxCtx: 262144 }
+);
+assert.ok(roomyPrompt.includes('row700 = 700'), 'middle of the file is shown');
+assert.doesNotMatch(roomyPrompt, /lines omitted|more lines/);
+const wideOnlyPrompt = buildContinuationUserPrompt(
+  [{ id: 'rr', name: 'read_file', args: { path: 'src/App.tsx' }, status: 'done', result: appFile } as ToolCall],
+  { tier: 'wide' }
+);
+assert.doesNotMatch(wideOnlyPrompt, /row700 = 700/);
 
 assert.equal(stripThinkingForHistory('<think>hidden forever'), '');
 assert.equal(stripThinkingForHistory('<think>hidden</think> visible'), 'visible');
@@ -188,3 +211,49 @@ for (const cmd of [
 ]) {
   assert.equal(isDestructiveCommand(cmd), false, 'should allow: ' + cmd);
 }
+
+// A repeated write whose bytes are already on disk is done ("unchanged"), not an error that
+// forces a Nay. If the file changed since, the same write goes through again.
+void (async () => {
+  const disk: Record<string, string> = {};
+  const writes: string[] = [];
+  (globalThis as any).window = {
+    electronAPI: {
+      execTool: async (_root: string, name: string, args: { path: string }) =>
+        name === 'read_file' && args.path in disk ? { content: disk[args.path] } : { error: 'missing' }
+    }
+  };
+  const deps = {
+    workspacePath: 'D:/ws',
+    editProgress: createEditRepeatGuard(),
+    onExecuteToolCommand: async () => '',
+    onApplyFileWrite: async (p: string, c: string) => {
+      disk[p] = c;
+      writes.push(p);
+      return true;
+    }
+  };
+  const write = (): ToolCall =>
+    ({ id: 'w1', name: 'write_file', args: { path: 'src/ai.ts' }, body: 'export const x = 1;\n', status: 'pending' }) as ToolCall;
+  const first = await executeTool(write(), deps);
+  assert.equal(first.status, 'done');
+  const again = await executeTool(write(), deps);
+  assert.equal(again.status, 'done');
+  assert.equal(isUnchangedWrite(again.result), true);
+  assert.equal(writes.length, 1);
+  assert.equal(shouldContinueFromTools([again]), false);
+  disk['src/ai.ts'] = 'reverted';
+  const afterRevert = await executeTool(write(), deps);
+  assert.equal(afterRevert.status, 'done');
+  assert.equal(isUnchangedWrite(afterRevert.result), false);
+  assert.equal(disk['src/ai.ts'], 'export const x = 1;\n');
+  // Without a way to read the file, a repeat still stops as before.
+  (globalThis as any).window = {};
+  const blind = await executeTool(write(), deps);
+  assert.equal(blind.status, 'error');
+  assert.equal(isRepeatedEditStop(blind.result), true);
+  delete (globalThis as any).window;
+})().catch(err => {
+  console.error(err);
+  process.exit(1);
+});

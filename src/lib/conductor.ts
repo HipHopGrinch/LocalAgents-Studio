@@ -111,6 +111,72 @@ function stamp(plan: PlannerPlan, patch: Partial<PlannerPlan> = {}): PlannerPlan
   return { ...plan, ...patch, updatedAt: Date.now() };
 }
 
+/**
+ * A Reviewer Nay leaves the active step `failed`. A rework must run that same step again,
+ * not let `activateNextStep` skip it. A step whose heal budget is spent (`healExhausted`),
+ * an abandoned step, or a plan with no failed active step comes back unchanged.
+ * `healAttempts` survives so a rework cannot reset the per-plan heal budget.
+ */
+export function reopenActiveStepForRework(plan: PlannerPlan): PlannerPlan {
+  const active = plan.activeStepId
+    ? plan.steps.find(s => String(s.id) === String(plan.activeStepId))
+    : undefined;
+  if (!active || active.status !== 'failed' || active.healExhausted) return plan;
+  const reopened = retryFailedStep(plan, active.id);
+  if (reopened === plan) return plan;
+  return { ...reopened, healAttempts: plan.healAttempts || 0, blockedReason: plan.blockedReason };
+}
+
+/** Coder rounds one review-fix task may take before the loop stops. */
+export const MAX_REVIEW_FIX_ROUNDS = 3;
+
+export function reviewFixKey(taskId: string, title: string): string {
+  return `${taskId}:${(title || '').trim().toLowerCase().replace(/\s+/g, ' ').slice(0, 80)}`;
+}
+
+/**
+ * Count one Coder round for a review-fix task. Past the cap the counter does not move,
+ * so a repeated entry stays capped instead of drifting upward.
+ */
+export function takeReviewFixRound(
+  rounds: Record<string, number>,
+  key: string,
+  max = MAX_REVIEW_FIX_ROUNDS
+): { rounds: Record<string, number>; round: number; capped: boolean } {
+  const round = (rounds[key] || 0) + 1;
+  if (round > max) return { rounds, round, capped: true };
+  return { rounds: { ...rounds, [key]: round }, round, capped: false };
+}
+
+/**
+ * Review-fix task ids in the same turn that are still open. Open review-fix work wins over
+ * dispatching the mirrored `review-fixes` plan as an ordinary plan step.
+ */
+export function reviewFixesOwnTheTurn(opts: {
+  openTasks: boolean;
+  activeStepId?: string | null;
+  planId?: string | null;
+}): boolean {
+  if (!opts.openTasks) return false;
+  return opts.activeStepId === 'review-fixes' || !!opts.planId?.startsWith('plan-review-');
+}
+
+/** Targeted Coder heals one step gets for a logic Nay that survives its reworks while verify passes. */
+export const MAX_LOGIC_HEAL_ROUNDS = 2;
+
+/** One-line chat notice when Full auto/heal moves past a step that never passed review. */
+export function leftFailedNotice(
+  stepId: string | number,
+  nextId: string | number,
+  nextTitle: string,
+  opts?: { logicIssue?: boolean }
+): string {
+  const why = opts?.logicIssue
+    ? 'verify passes but the Reviewer still found a logic issue; rework and logic heal budget spent'
+    : 'rework and heal budget spent';
+  return `Step #${stepId} was left FAILED (${why}) — continuing with step #${nextId}: ${nextTitle}`;
+}
+
 function stepIdOf(plan: PlannerPlan, explicit?: string): string {
   return String(explicit || plan.activeStepId || '');
 }

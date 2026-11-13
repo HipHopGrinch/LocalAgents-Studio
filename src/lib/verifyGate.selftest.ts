@@ -7,7 +7,9 @@ import {
   annotateMissingDependencies,
   beginVerify,
   errorFingerprint,
+  filesFromErrors,
   formatErrorsForCoder,
+  parseCompilerErrors,
   isNpmInstallCommand,
   isNpxTscCommand,
   localTscPowerShellCommand,
@@ -103,5 +105,39 @@ assert.equal(verifyOutputFailed('Exit code: 0'), false);
 assert.equal(commandOutputFailed('Exit code: 0\nall good'), false);
 assert.equal(commandOutputFailed('Exit code: -1'), true);
 assert.equal(commandOutputFailed('command timed out'), true);
+
+// A Reviewer Nay sentence before the path must not become the "file"
+const nay =
+  'Type mismatch between App.tsx and Board3D.tsx: Board3D props expects `onCellClick: (col: number, layer: number) => void`, but App.tsx passed a different shape, causing compilation errors: src/App.tsx(56,30): error TS2322: Type X is not assignable to type Y.';
+const nayErrors = parseCompilerErrors(nay);
+assert.equal(nayErrors.length, 1);
+assert.equal(nayErrors[0].file, 'src/App.tsx');
+assert.equal(nayErrors[0].line, 56);
+assert.equal(nayErrors[0].code, 'TS2322');
+assert.deepEqual(filesFromErrors(nayErrors), ['src/App.tsx']);
+assert.equal(parseCompilerErrors('see `src/App.tsx(3,4): error TS2304: Cannot find name x.')[0].file, 'src/App.tsx');
+
+const winSpaces = parseCompilerErrors("D:\\cursor\\LocalAgents Studio\\src\\x.ts(1,2): error TS2304: Cannot find name 'y'.");
+assert.equal(winSpaces[0].file, 'D:/cursor/LocalAgents Studio/src/x.ts');
+assert.equal(parseCompilerErrors("C:/Program Files/foo/bar.ts(7,1): error TS1005: ';' expected.")[0].file, 'C:/Program Files/foo/bar.ts');
+assert.equal(parseCompilerErrors('/home/me/my proj/a.ts(7,1): error TS1005: x.')[0].file, '/home/me/my proj/a.ts');
+
+const plain = parseCompilerErrors("src\\game\\logic.ts(10,5): error TS2339: Property 'a' does not exist.");
+assert.equal(plain[0].file, 'src/game/logic.ts');
+assert.equal(parseCompilerErrors('src/a.ts(1,1): error TS2304: x')[0].file, 'src/a.ts');
+
+// Prose prefix with spaces and no separator falls back to the trailing path token
+assert.equal(parseCompilerErrors('The build failed in src/b.ts(2,3): error TS2304: x')[0].file, 'src/b.ts');
+// Generic path:line: form gets the same cleanup
+assert.equal(parseCompilerErrors('Check the results in src/c.py:12: cannot import name x')[0].file, 'src/c.py');
+// Nothing path-like left: no entry, and filesFromErrors skips sentence "files"
+assert.equal(parseCompilerErrors('Something went wrong badly (1,2): error TS2304: x').length, 0);
+assert.deepEqual(
+  filesFromErrors([
+    { file: 'Type mismatch between App and Board', line: 1, message: 'x' },
+    { file: 'src/ok.ts', line: 1, message: 'x' }
+  ]),
+  ['src/ok.ts']
+);
 
 console.log('verifyGate.selftest ok');

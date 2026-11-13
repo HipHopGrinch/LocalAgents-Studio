@@ -8,6 +8,7 @@ import {
   formatApprovedPlanContext
 } from './planOptions';
 import { DELIVERY_POLICY, TOOLCHAIN_PLAYBOOK } from './deliveryIntent';
+import { assignedTwinPath, pathKey } from './workspacePaths';
 import { formatClusterInventory, type ModelFitTier } from './clusterInventory';
 import { findCatalogModel, installedModelSizeB, parseParams } from './recommender';
 import {
@@ -90,6 +91,31 @@ export interface ParsedResponse {
   pendingTool?: { name: string; path?: string };
 }
 
+const MASKED_LT = '\u0001';
+const toolOpenTokenRe = new RegExp(`<(?=(?:${TOOL_ALT})\\b)`, 'gi');
+
+/**
+ * A tool tag whose opening token sits inside a single-line inline code span (`<run_command>`,
+ * `<read_file path="x"/>`) is prose. Its `<` is swapped for a sentinel so no tool regex sees it.
+ * Same length as the input, so indexes carry over.
+ */
+function maskInlineToolOpenings(text: string): string {
+  if (!text.includes('`')) return text;
+  return text.replace(toolOpenTokenRe, (_m: string, offset: number) => {
+    const lineStart = text.lastIndexOf('\n', offset - 1) + 1;
+    const nl = text.indexOf('\n', offset);
+    const lineEnd = nl === -1 ? text.length : nl;
+    const spanTicks = (s: string) => (s.match(/`+/g) || []).filter(run => run.length < 3).length;
+    const before = spanTicks(text.slice(lineStart, offset));
+    const after = spanTicks(text.slice(offset + 1, lineEnd));
+    return before % 2 === 1 && after >= 1 ? MASKED_LT : '<';
+  });
+}
+
+function unmaskToolOpenings(text: string): string {
+  return text.includes(MASKED_LT) ? text.split(MASKED_LT).join('<') : text;
+}
+
 /** True when the user asked to create/build/write files (enables markdown fallback writes). */
 export function looksLikeCreateIntent(text: string): boolean {
   return /\b(create|build|make|write|generate|implement|scaffold|add|fix|new)\b/i.test(text)
@@ -136,11 +162,27 @@ export function parseResponse(
   const blockRe = new RegExp(`<(${TOOL_ALT})\\b([^>]*?)(?<!/)>([\\s\\S]*?)</\\1\\s*>`, 'gi');
   const selfRe = new RegExp(`<(${TOOL_ALT})\\b([^>]*?)/>`, 'gi');
 
+  work = maskInlineToolOpenings(work);
+
   // Replace each call with a numbered placeholder, then read placeholders back in document order
   const found: { name: ToolName; attrs: string; body?: string }[] = [];
-  work = work.replace(blockRe, (_m, name: string, attrs, body) => {
-    found.push({ name: name.toLowerCase() as ToolName, attrs, body });
-    return `\u0000${found.length - 1}\u0000`;
+  work = work.replace(blockRe, (_m, name: string, attrs: string, body: string) => {
+    const lower = name.toLowerCase();
+    let prefix = '';
+    // File bodies may legitimately quote a same-named opening tag (docs, READMEs), so only re-anchor the rest.
+    if (lower !== 'write_file' && lower !== 'edit_file') {
+      const reopenRe = new RegExp(`<${lower}\\b([^>]*?)(?<!/)>`, 'gi');
+      let last: RegExpExecArray | null = null;
+      let reopen: RegExpExecArray | null;
+      while ((reopen = reopenRe.exec(body)) !== null) last = reopen;
+      if (last) {
+        prefix = `<${name}${attrs}>${body.slice(0, last.index)}`;
+        attrs = last[1];
+        body = body.slice(last.index + last[0].length);
+      }
+    }
+    found.push({ name: lower as ToolName, attrs, body });
+    return `${prefix}\u0000${found.length - 1}\u0000`;
   });
   work = work.replace(selfRe, (_m, name: string, attrs) => {
     found.push({ name: name.toLowerCase() as ToolName, attrs });
@@ -174,6 +216,12 @@ export function parseResponse(
         work = `${work.slice(0, lastOpen.index)}\u0000${idx}\u0000`;
       }
     }
+  }
+
+  work = unmaskToolOpenings(work);
+  for (const f of found) {
+    f.attrs = unmaskToolOpenings(f.attrs);
+    if (f.body !== undefined) f.body = unmaskToolOpenings(f.body);
   }
 
   const order: number[] = [];
@@ -216,7 +264,7 @@ export function parseResponse(
   let pendingTool: ParsedResponse['pendingTool'];
   if (streaming) {
     const openRe = new RegExp(`<(${TOOL_ALT})\\b([^>]*)>?[\\s\\S]*$`, 'i');
-    const open = display.match(openRe);
+    const open = maskInlineToolOpenings(display).match(openRe);
     if (open) {
       pendingTool = { name: open[1].toLowerCase(), path: parseAttrs(open[2] || '').path };
       display = display.slice(0, open.index);
@@ -732,7 +780,7 @@ Do NOT write deliverable files. End with exactly one block:
 <option id="2" delivery="python" title="Python">What this choice builds.</option>
 </plan_options>`,
   'lock-plan': `### Required output (last)
-Do NOT write deliverable files. End with exactly one block:
+Do NOT write deliverable files. Every file (task \`file\` and any named in a description) is a full repo-relative path like \`src/game/types.ts\`, never a bare name or a path missing its leading folders. End with exactly one block:
 
 <execution_plan>
 <summary>One-line goal</summary>
@@ -964,9 +1012,30 @@ const TOOL_RESULT_CAPS: Record<
 
 const TOOL_RESULT_ERROR_RE = /(?:\berror\b|\bexception\b|\bfailed\b|\bTS\d{3,}\b|^\s*at\s+\S)/i;
 
-/** Keep error lines plus a head and a tail so one read cannot fill an 8K window. */
-export function capToolResultText(text: string, tier: ModelFitTier = 'standard'): string {
-  const caps = TOOL_RESULT_CAPS[tier] || TOOL_RESULT_CAPS.standard;
+/** From this window up (frontier only) one tool result is shown whole, up to the char ceiling. */
+export const ROOMY_TOOL_RESULT_CTX = 131072;
+/** One result, in characters. A 60 KB source file fits twice over. */
+export const ROOMY_TOOL_RESULT_MAX_CHARS = 120000;
+const ROOMY_TOOL_RESULT_CAPS = { head: 2000, tail: 2000, errors: 60, maxChars: ROOMY_TOOL_RESULT_MAX_CHARS };
+
+/** True when `maxCtx` (a frontier node's window) is big enough to show tool results whole. */
+export function isRoomyToolResultWindow(maxCtx?: number): boolean {
+  return typeof maxCtx === 'number' && Number.isFinite(maxCtx) && maxCtx >= ROOMY_TOOL_RESULT_CTX;
+}
+
+/**
+ * Keep error lines plus a head and a tail so one read cannot fill an 8K window.
+ * Pass `maxCtx` only for a frontier model: from {@link ROOMY_TOOL_RESULT_CTX} up, a result of
+ * up to {@link ROOMY_TOOL_RESULT_MAX_CHARS} characters is returned whole, with no middle lines dropped.
+ */
+export function capToolResultText(
+  text: string,
+  tier: ModelFitTier = 'standard',
+  maxCtx?: number
+): string {
+  const caps = isRoomyToolResultWindow(maxCtx)
+    ? ROOMY_TOOL_RESULT_CAPS
+    : TOOL_RESULT_CAPS[tier] || TOOL_RESULT_CAPS.standard;
   const normalized = (text || '').replace(/\r\n/g, '\n');
   if (!normalized) return '';
   const lines = normalized.split('\n');
@@ -995,7 +1064,10 @@ export function capToolResultText(text: string, tier: ModelFitTier = 'standard')
   return joined;
 }
 
-export function formatToolResult(call: ToolCall, opts?: { tier?: ModelFitTier }): string {
+export function formatToolResult(
+  call: ToolCall,
+  opts?: { tier?: ModelFitTier; maxCtx?: number }
+): string {
   const attrs = call.args.path
     ? ` path="${call.args.path}"`
     : call.name === 'run_command'
@@ -1003,7 +1075,7 @@ export function formatToolResult(call: ToolCall, opts?: { tier?: ModelFitTier })
       : call.name === 'read_terminal' && call.args.lines
         ? ` lines="${call.args.lines}"`
         : '';
-  const body = capToolResultText(call.result ?? '', opts?.tier ?? 'standard');
+  const body = capToolResultText(call.result ?? '', opts?.tier ?? 'standard', opts?.maxCtx);
   return `<tool_result name="${call.name}"${attrs} status="${call.status}">\n${body}\n</tool_result>`;
 }
 
@@ -1127,6 +1199,21 @@ export function continuationClosedWrite(before: string, after: string): boolean 
   return !!hasUnclosedWrite(before) && !hasUnclosedWrite(after);
 }
 
+/** Real content a continuation must add (beyond close tags and fences) before a length-cut write is trusted. */
+export const MIN_CONTINUATION_CHARS = 16;
+
+/**
+ * A reply cut off by the output cap that "continues" with only a close tag, whitespace or a few
+ * characters would turn a partial file into a complete-looking one. False for those.
+ */
+export function continuationAddsContent(extra: string): boolean {
+  const body = (extra || '')
+    .replace(/<\/(?:write_file|edit_file)\s*>/gi, '')
+    .replace(/```[a-z0-9]*/gi, '')
+    .trim();
+  return body.length >= MIN_CONTINUATION_CHARS;
+}
+
 /** Error card for a write/edit that stayed open after the one continuation. Not applied to disk. */
 export function truncatedWriteToolCall(
   text: string,
@@ -1161,7 +1248,7 @@ export function hasUnclosedWrite(text: string): { name: 'write_file' | 'edit_fil
   return { name: last[1].toLowerCase() as 'write_file' | 'edit_file', path };
 }
 
-/** Point an absolute or missing write path at the file this worker was assigned. */
+/** Point an absolute, missing or twin (suffix/case spelling) write path at the file this worker was assigned. */
 export function anchorWritePath(tool: ToolCall, expectedFilePath?: string): ToolCall {
   if (tool.name !== 'write_file' && tool.name !== 'edit_file') return tool;
   const p = (tool.args?.path || '').trim();
@@ -1173,6 +1260,14 @@ export function anchorWritePath(tool: ToolCall, expectedFilePath?: string): Tool
     /(^|[\\/])\.\.([\\/]|$)/.test(p);
   if (outside && expectedFilePath) {
     return { ...tool, args: { ...tool.args, path: expectedFilePath } };
+  }
+  // A suffix/case twin of the assigned file (`game/types.ts` for `src/game/types.ts`) is that file.
+  const twin = expectedFilePath && p ? assignedTwinPath([expectedFilePath], p) : null;
+  if (twin) {
+    return {
+      ...tool,
+      args: { ...tool.args, path: twin, ...(pathKey(twin) !== pathKey(p) ? { redirectedFrom: p } : {}) }
+    };
   }
   return tool;
 }

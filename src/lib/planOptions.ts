@@ -111,6 +111,7 @@ Break the chosen option into **ordered steps**. Each step has concrete coder tas
 3. **Dependency order:** put shared types / models / headers in earlier steps (or earlier tasks) than files that import them. Never put a consumer file in an earlier step than its dependency.
 4. Do NOT write deliverable project files.
 5. End with exactly one machine-readable \`<execution_plan>\` block.
+6. Every \`file\` and every file named in a task description is the full repo-relative path (e.g. \`src/game/types.ts\`), never a bare file name or a path missing its leading folders.
 
 <execution_plan>
 <summary>One-line plan goal</summary>

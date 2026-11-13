@@ -1,6 +1,6 @@
 {
   "name": "local-agents-ide",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Distributed Local LLM Agent IDE for Windows",
   "author": "LocalAgents",
   "license": "MIT",
@@ -17,6 +17,7 @@
     "check:electron": "tsc -p tsconfig.electron.json --noEmit && node scripts/check-electron.cjs",
     "test": "node scripts/run-selftests.cjs",
     "lint": "eslint src",
+    "analyze-log": "node scripts/analyze-run-log.cjs",
     "release": "node scripts/release.cjs"
   },
   "build": {

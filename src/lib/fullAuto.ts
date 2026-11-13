@@ -8,6 +8,63 @@ export const VERDICT_REASK_PROMPT =
 
 export const MISSING_VERDICT_NOTE = 'Reviewer gave no explicit verdict.';
 
+/**
+ * Re-ask for a verdict that still names the step and carries what the first prompt had.
+ * The re-ask runs in a fresh context, so without the header the Reviewer does not know which
+ * step it is judging and goes reading files (or judges the wrong step).
+ */
+export function verdictReaskPromptWithContext(input: {
+  stepId: string;
+  /** `formatStepForReviewer(plan, step)` for the step being judged. */
+  header: string;
+  filesHint?: string;
+  filesBody?: string;
+  /** Green-verify statement, when Studio just saw one. */
+  verifyStatement?: string;
+  /** End-of-plan pass on a step that was marked failed. */
+  debt?: boolean;
+}): string {
+  const files = input.filesBody?.trim() || '(No file bodies were loaded for this step.)';
+  return `${input.header}
+
+${input.filesHint ? `${input.filesHint}\n\n` : ''}${files}
+${input.verifyStatement ? `\n${input.verifyStatement}\n` : ''}
+Your previous reply had no <step_verdict>. Judge plan step #${input.stepId} now${
+    input.debt ? ' (an end-of-plan pass on a step that was marked failed)' : ''
+  }, and no other step. The files above are already loaded: do not read files or call tools.
+${VERDICT_REASK_PROMPT}`;
+}
+
+/** One short reviewer turn when a review-fix task verdict tag was missing. */
+export function reviewDeltaReaskPrompt(taskId: string): string {
+  return `Reply with ONLY a <review_delta task_id="${taskId}"> block: <verdict>completed|failed</verdict><notes>...</notes></review_delta>`;
+}
+
+/** {@link reviewDeltaReaskPrompt} with the task header and the file bodies the first prompt had. */
+export function reviewDeltaReaskPromptWithContext(
+  taskId: string,
+  input: { header: string; filesHint?: string; filesBody?: string }
+): string {
+  const files = input.filesBody?.trim() || '(No file bodies were loaded for this task.)';
+  return `${input.header}
+
+${input.filesHint ? `${input.filesHint}\n\n` : ''}${files}
+
+Your previous reply had no <review_delta>. Verify ONLY task #${taskId} now. The files above are already loaded: do not read files or call tools.
+${reviewDeltaReaskPrompt(taskId)}`;
+}
+
+export const MISSING_DELTA_NOTE = 'Reviewer gave no verdict on the fix task after one re-ask — treated as Fail.';
+
+/** What the review-fix path records for a reply that never named completed or failed. */
+export function missingDeltaAsFail(taskId: string): {
+  taskId: string;
+  verdict: 'failed';
+  notes: string;
+} {
+  return { taskId, verdict: 'failed', notes: MISSING_DELTA_NOTE };
+}
+
 export const CODER_WRITES_FAILED_NOTE = 'Coder writes failed or are still pending.';
 
 const NOTE_CAP = 600;
@@ -25,6 +82,60 @@ export function plainNote(text: string, cap = NOTE_CAP): string {
 /** Nay notes when the reviewer never emitted an explicit yay/nay. */
 export function nayNotesFromReviewerProse(text: string, cap = NOTE_CAP): string {
   return plainNote(text, cap) || MISSING_VERDICT_NOTE;
+}
+
+/** Recorded on a step that advanced on green verify because the Reviewer never gave a verdict. */
+export function noVerdictAdvanceNote(stepId: string): string {
+  return `Reviewer gave no verdict for step #${stepId}; project verify passed, so the step advanced without a Reviewer verdict.`;
+}
+
+const FINDING_WORDS =
+  /\b(bug|error|wrong|incorrect|missing|broken|fails?|failing|failed|stubs?|placeholder|mismatch|undefined|unwired|unused|never called|not (?:implemented|wired|handled|exported|imported)|does(?:n't| not)|do(?:n't| not)|should)\b/i;
+
+/**
+ * True when a reply with no verdict tag still lists real problems (a prose Nay), as opposed to
+ * an empty reply, tool calls only, or a short "let me look" line.
+ */
+export function hasProseFindings(text: string): boolean {
+  const plain = plainNote(text, 4000);
+  return plain.length >= 80 && FINDING_WORDS.test(plain);
+}
+
+export interface ProseVerdict {
+  result: 'yay' | 'nay';
+  notes: string;
+}
+
+const PROSE_EDGE = '[\\s>*_#`"\'(\\[-]*';
+const PROSE_LEAD_YN = new RegExp(`^${PROSE_EDGE}(yay|nay)\\b`, 'i');
+// Bare pass/fail only count as a lone leading word ("PASS", "Fail — ..."), never as "Pass the ...".
+const PROSE_LEAD_PF = new RegExp(`^${PROSE_EDGE}(pass|fail)\\b\\s*(?:[:.,;!\\-–—)\\]*_\`]|$)`, 'i');
+const PROSE_LABELED =
+  /\b(?:final\s+)?(?:verdict|result|decision)\s*(?:is|[:=\-–—])\s*[*_`"'(\[]*\s*(yay|nay|pass(?:ed)?|fail(?:ed)?|approved?|rejected?)\b/gi;
+
+function proseWordResult(word: string): 'yay' | 'nay' {
+  return /^(yay|pass|approve)/i.test(word) ? 'yay' : 'nay';
+}
+
+/**
+ * Verdict from a reply that has no `<step_verdict>` tag: a leading yay/nay/PASS/FAIL, or an
+ * explicit "Verdict: yay" / "result: fail" label. Text that gives both answers, or neither,
+ * is null so the caller keeps its missing-verdict handling.
+ */
+export function parseProseVerdict(text: string): ProseVerdict | null {
+  const plain = plainNote(text, 4000);
+  if (!plain) return null;
+  const found = new Set<'yay' | 'nay'>();
+  const lead = PROSE_LEAD_YN.exec(plain) || PROSE_LEAD_PF.exec(plain);
+  if (lead) found.add(proseWordResult(lead[1]));
+  for (const match of plain.matchAll(PROSE_LABELED)) found.add(proseWordResult(match[1]));
+  if (found.size !== 1) return null;
+  const result = [...found][0];
+  const body = (lead ? plain.slice(lead[0].length) : plain)
+    .replace(/^[\s:.,;!\-–—*_`]+/, '')
+    .trim()
+    .slice(0, NOTE_CAP);
+  return { result, notes: body || (result === 'yay' ? 'Reviewer passed the step.' : 'Reviewer failed the step.') };
 }
 
 /** Nay notes from failed or still-pending write/edit tool rows. */
@@ -166,6 +277,30 @@ export function pickExplicitStepVerdict<T extends ReviewVerdictMessage>(
           result: stored.result,
           notes: stored.notes || ''
         }
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Newest Reviewer reply with no usable `<step_verdict>` whose prose still states a verdict
+ * (see {@link parseProseVerdict}). Callers try {@link pickExplicitStepVerdict} first.
+ */
+export function pickProseStepVerdict<T extends ReviewVerdictMessage>(
+  messages: T[],
+  activeStepId?: string
+): { message: T; parsed: ExplicitStepVerdict } | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (!looksLikeReviewer(message)) continue;
+    const text = message.raw || message.display || '';
+    if (/<step_verdict\b/i.test(text)) continue;
+    const prose = parseProseVerdict(text);
+    if (prose) {
+      return {
+        message,
+        parsed: { stepId: activeStepId != null ? String(activeStepId) : '', result: prose.result, notes: prose.notes }
       };
     }
   }

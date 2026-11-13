@@ -14,7 +14,18 @@ import {
   stepLooksLikeFixStep,
   writePlannerPlan
 } from './plannerPlan';
-import { createConductorSession, decideConductorEnter, transition } from './conductor';
+import {
+  createConductorSession,
+  decideConductorEnter,
+  leftFailedNotice,
+  MAX_LOGIC_HEAL_ROUNDS,
+  MAX_REVIEW_FIX_ROUNDS,
+  reopenActiveStepForRework,
+  reviewFixesOwnTheTurn,
+  reviewFixKey,
+  takeReviewFixRound,
+  transition
+} from './conductor';
 
 function step(partial: Partial<PlannerStep> & Pick<PlannerStep, 'id' | 'title' | 'status'>): PlannerStep {
   return { tasks: [], ...partial };
@@ -380,3 +391,77 @@ assert.deepEqual(
   }),
   { action: 'refuse' }
 );
+
+// A Reviewer Nay must rework the SAME step, not skip to the next one.
+const nayed = transition(demo(), {
+  type: 'VERDICT',
+  stepId: '1',
+  result: 'nay',
+  notes: 'The button does not toggle.'
+}).plan;
+assert.equal(nayed.steps[0].status, 'failed');
+assert.equal(nayed.activeStepId, '1');
+// What dispatchActiveStep did before the fix: the failed active step is skipped.
+assert.equal(activateNextStep(nayed).activeStepId, '2');
+const reworked = reopenActiveStepForRework({ ...nayed, healAttempts: 2 });
+assert.equal(reworked.activeStepId, '1');
+assert.equal(reworked.steps[0].status, 'in_progress');
+assert.equal(reworked.steps[1].status, 'pending');
+assert.equal(reworked.steps[0].reworkCount, 1);
+assert.equal(reworked.steps[0].reviewNote, 'The button does not toggle.');
+assert.equal(reworked.healAttempts, 2);
+// After the reopen, activateNextStep keeps the step in progress.
+assert.equal(activateNextStep(reworked).activeStepId, '1');
+// Nothing to reopen: unchanged plan, same reference.
+const inProgressPlan = demo();
+assert.equal(reopenActiveStepForRework(inProgressPlan), inProgressPlan);
+// A step past its heal budget is debt: it is not reopened.
+const spent = demo({
+  steps: [
+    step({ id: '1', title: 'Core', status: 'failed', healExhausted: true }),
+    step({ id: '2', title: 'UI', status: 'pending' })
+  ]
+});
+assert.equal(reopenActiveStepForRework(spent), spent);
+const abandonedPlan = demo({
+  steps: [
+    step({ id: '1', title: 'Core', status: 'abandoned' }),
+    step({ id: '2', title: 'UI', status: 'pending' })
+  ]
+});
+assert.equal(reopenActiveStepForRework(abandonedPlan), abandonedPlan);
+assert.match(leftFailedNotice('1', '2', 'UI'), /left FAILED/);
+assert.match(leftFailedNotice('1', '2', 'UI'), /step #2: UI/);
+assert.doesNotMatch(leftFailedNotice('1', '2', 'UI'), /logic/);
+assert.match(leftFailedNotice('1', '2', 'UI', { logicIssue: true }), /logic issue/);
+assert.match(leftFailedNotice('1', '2', 'UI', { logicIssue: true }), /step #2: UI/);
+assert.equal(MAX_LOGIC_HEAL_ROUNDS, 2);
+
+// Review-fix loop cap: three Coder rounds per task, then capped without drifting.
+const fixKey = reviewFixKey('1', ' Fix  the Board ');
+assert.equal(fixKey, reviewFixKey('1', 'fix the board'));
+assert.notEqual(fixKey, reviewFixKey('2', 'fix the board'));
+let fixRounds: Record<string, number> = {};
+for (let i = 1; i <= MAX_REVIEW_FIX_ROUNDS; i += 1) {
+  const taken = takeReviewFixRound(fixRounds, fixKey);
+  assert.equal(taken.capped, false);
+  assert.equal(taken.round, i);
+  fixRounds = taken.rounds;
+}
+const overCap = takeReviewFixRound(fixRounds, fixKey);
+assert.equal(overCap.capped, true);
+assert.equal(overCap.rounds, fixRounds);
+assert.equal(takeReviewFixRound(fixRounds, reviewFixKey('9', 'other')).capped, false);
+// An escalation resets one task to cap-1: exactly one more round, then capped again.
+const afterEscalation = { ...fixRounds, [fixKey]: MAX_REVIEW_FIX_ROUNDS - 1 };
+const lastRound = takeReviewFixRound(afterEscalation, fixKey);
+assert.equal(lastRound.capped, false);
+assert.equal(takeReviewFixRound(lastRound.rounds, fixKey).capped, true);
+
+// Open review-fix tasks outrank the mirrored review-fixes plan.
+assert.equal(reviewFixesOwnTheTurn({ openTasks: true, activeStepId: 'review-fixes' }), true);
+assert.equal(reviewFixesOwnTheTurn({ openTasks: true, planId: 'plan-review-abc' }), true);
+assert.equal(reviewFixesOwnTheTurn({ openTasks: false, activeStepId: 'review-fixes' }), false);
+assert.equal(reviewFixesOwnTheTurn({ openTasks: true, activeStepId: '3', planId: 'plan-1' }), false);
+
+console.log('conductor.selftest ok');

@@ -4,6 +4,7 @@ import { parseFinalReview } from './continuationReview';
 import { CHARS_PER_TOKEN_SEED, fitBudgetForPinnedCtx, type DynamicCtxRole } from './contextSize';
 import { pickExplicitStepVerdict } from './fullAuto';
 import { parseReviewDelta, parseReviewPlan } from './planOptions';
+import { parseCompilerErrors } from './verifyGate';
 
 /**
  * Non-plan answer turn. Tool tags in that reply are not executed.
@@ -85,6 +86,9 @@ export function reviewPreloadCaps(pinnedCtx: number, maxFiles = 8): ReviewPreloa
   return { maxFiles: files, maxCharsPerFile, maxTotalChars };
 }
 
+/** Ceiling for the tool results of one follow-up, so a million-token window is not filled. */
+export const REVIEW_FOLLOWUP_MAX_TOOL_CHARS = 400000;
+
 /** How many characters of tool results a follow-up may paste for this pinned window. */
 export function reviewFollowUpBudget(pinnedCtx: number, role: DynamicCtxRole = 'reviewer'): {
   pinnedCtx: number;
@@ -95,7 +99,7 @@ export function reviewFollowUpBudget(pinnedCtx: number, role: DynamicCtxRole = '
   return {
     pinnedCtx: fit.pinnedCtx,
     promptBudget: fit.promptBudget,
-    toolChars: fileCharBudget(pinnedCtx, role)
+    toolChars: Math.min(REVIEW_FOLLOWUP_MAX_TOOL_CHARS, fileCharBudget(pinnedCtx, role))
   };
 }
 
@@ -168,4 +172,56 @@ export function needsReviewVerdictTurn(input: ReviewVerdictTurnInput): boolean {
 export function nonPlanReviewLacksMarkup(raw: string): boolean {
   const text = raw || '';
   return !parseReviewPlan(text) && !parseReviewDelta(text);
+}
+
+/** Said in the step-verdict prompt only when Studio saw a green verify just before review. */
+export function verifyPassedStatement(detail = 'exit 0'): string {
+  return `Project verify: PASSED just now (${detail}). Compiler errors quoted in earlier notes or the work log are already fixed; do not Nay for them. Judge the current files.`;
+}
+
+export interface FreshVerifyResult {
+  ok: boolean;
+  output: string;
+}
+
+function normalizeCitedPath(file: string): string {
+  return (file || '').trim().replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+}
+
+function samePath(a: string, b: string): boolean {
+  if (a === b) return true;
+  return a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
+}
+
+/** File + TS code pairs a Nay quotes. One note line can carry several errors back to back. */
+function citedCompilerPairs(notes: string): Array<{ file: string; code: string }> {
+  const split = (notes || '').replace(/(\S+\(\d+,\d+\):\s*error\s+TS\d+)/gi, '\n$1');
+  return parseCompilerErrors(split)
+    .filter(e => !!e.file && !!e.code)
+    .map(e => ({ file: normalizeCitedPath(e.file), code: String(e.code).toUpperCase() }));
+}
+
+/** True when the notes quote at least one compiler error with a file and code. */
+export function nayCitesCompilerErrors(notes: string): boolean {
+  return citedCompilerPairs(notes).length > 0;
+}
+
+/**
+ * True when a Nay quotes compiler errors, a verify that just ran is green, and none of the
+ * quoted file+code pairs show up in that verify's output. The Reviewer is then repeating
+ * errors an earlier verify reported and a later edit fixed.
+ */
+export function isStaleCompilerNay(notes: string, verify: FreshVerifyResult | null | undefined): boolean {
+  if (!verify?.ok) return false;
+  const cited = citedCompilerPairs(notes);
+  if (!cited.length) return false;
+  const current = citedCompilerPairs(verify.output || '');
+  return cited.every(c => !current.some(cur => cur.code === c.code && samePath(cur.file, c.file)));
+}
+
+/** One re-ask after a stale-error Nay. */
+export function staleNayReaskPrompt(statement: string): string {
+  return `${statement}
+
+Your Nay quoted compiler errors that this verify does not report. Re-check the current files and reply with ONLY a <step_verdict> block: <step_verdict><result>yay|nay</result><notes>...</notes></step_verdict>. Answer yay unless there is a real non-compiler problem (stubs, missing behavior, wrong wiring); if you answer nay, name the file and the fix.`;
 }

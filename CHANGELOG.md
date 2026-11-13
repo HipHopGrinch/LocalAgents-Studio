@@ -2,6 +2,30 @@
 
 All notable changes to LocalAgents Studio are listed here. Older releases are summarized in [`AGENTS.md`](AGENTS.md) §6 and the [wiki](https://github.com/HipHopGrinch/LocalAgents-Studio/wiki/Whats-new).
 
+## 1.5.0 — 2026-11-13
+
+Conductor reliability from repeated Full-auto runs: Studio now checks that web projects actually render, keeps the project green before review, and handles thinking models on every role.
+
+### Added
+
+- **Render check for web projects.** After a step that touches page files, Studio starts the project's own Vite server on a free local port (with its own dependency cache, so your `npm run dev` is not disturbed) and loads it in a hidden, sandboxed window. Console errors, uncaught exceptions, the Vite error overlay, a blank page, and a collapsed canvas (such as 1280×150) are reported to the Coder as errors (TS91xx). A screenshot is saved to `.localagents/render/last.png`.
+- **Verify first, then review.** Before a step goes to the Reviewer, Studio runs the project check, removes unused imports itself, and runs up to two targeted compiler heals. The Reviewer is not asked while the check is red.
+- **Run-log waste report.** Run logs start with a `waste:` line (time spent on failed verifies, cut-off replies, read-only turns and reworks that changed nothing). `npm run analyze-log <file>` prints the same report for a saved log.
+
+### Changed
+
+- **Thinking models on any role.** Studio tracks whether a model thinks, reserves output room for its reasoning, strips inline `<think>` blocks, and retries a cut-off reply once with a larger budget (cloud) or with thinking off (local). This includes Swarm Pass 1.
+- **One rule for file paths.** Bare or partial names in plans (`index.css`, `game/types.ts`) are matched to the real file (`src/index.css`) when the plan is resolved, duplicate tasks are merged, and a write to a twin of an assigned file goes to the assigned file. Root project files such as `index.html` or `package.json` are never redirected into `src/`.
+- **Repair and heal turns include whole files** and end with one forced "edit or rewrite" turn instead of looping on reads.
+
+### Fixed
+
+- Reviewer verdicts cut off by a thinking model's reasoning were counted as Nay; a verdict with no feedback no longer triggers a blind rework, and re-asks carry the step being judged.
+- A Nay that cited compiler errors the check no longer reports caused reworks that broke working code.
+- Later Swarm workers in a step now see the signatures earlier workers just wrote.
+- New requests always start on the Planner tab, and project chats no longer reload (and mark work stopped) on every tab switch.
+- Bursts of whole-file saves are queued so only the newest pending save runs; the context meter always reads one model's prompt against that same model's window.
+
 ## 1.4.0 — 2026-11-13
 
 Per-role computer, model and context picks; Full auto; the Conductor run log; and a resizable layout. This release also fixes 110 bugs from the 2026-11-13 bug hunt, including security fixes to the command denylist, workspace jail, in-app git and web console.

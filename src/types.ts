@@ -702,6 +702,15 @@ export interface ElectronAPI {
     missingTsc?: boolean;
     mode?: string;
   }>;
+  /**
+   * Render smoke check for a Vite web workspace (desktop only; never offered to the web console).
+   * Starts the project's own dev server, loads it in a hidden sandboxed window and returns raw
+   * measurements for `evaluateRenderCheck`. Never rejects; infrastructure trouble is `skipped`.
+   */
+  renderCheckWorkspace?: (
+    root: string,
+    opts?: { timeoutMs?: number; settleMs?: number }
+  ) => Promise<import('./lib/renderGate').RenderCheckRaw>;
   installWorkspaceDeps: (
     root: string,
     opts?: { timeoutMs?: number }
@@ -825,6 +834,8 @@ export interface ElectronAPI {
     error?: string;
   }>;
   onLiveSession?: (cb: (session: LiveStudioSession) => void) => () => void;
+  /** Desktop only: web console client count. The full chat mirror is published only when > 0. */
+  onWebClientCount?: (cb: (count: number) => void) => () => void;
 }
 
 /** Live node row mirrored to web clients (includes online/models from desktop poll). */

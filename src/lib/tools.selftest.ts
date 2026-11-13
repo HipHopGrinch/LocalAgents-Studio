@@ -8,8 +8,13 @@ import {
   applyEdits,
   buildSystemPrompt,
   buildVolatileContextBlock,
+  capToolResultText,
   formatToolResult,
+  isRoomyToolResultWindow,
+  ROOMY_TOOL_RESULT_CTX,
+  ROOMY_TOOL_RESULT_MAX_CHARS,
   parseEditBlocks,
+  continuationAddsContent,
   continuationClosedWrite,
   parseResponse,
   pickBestModelForComplexity,
@@ -222,6 +227,17 @@ assert.match(capped, /error TS2322/);
 assert.doesNotMatch(capped, /MID_ONLY/);
 assert.match(capped, /lines omitted/);
 
+// A frontier window (>= 131072) shows a 60 KB result whole; other windows keep the tier cap.
+const bigRead = Array.from({ length: 1100 }, (_, i) => `const row${i} = ${i}; // ${'y'.repeat(30)}`).join('\n');
+assert.ok(isRoomyToolResultWindow(262144) && isRoomyToolResultWindow(ROOMY_TOOL_RESULT_CTX));
+assert.ok(!isRoomyToolResultWindow(65536) && !isRoomyToolResultWindow(undefined) && !isRoomyToolResultWindow(NaN));
+assert.equal(capToolResultText(bigRead, 'wide', 262144), bigRead);
+assert.match(capToolResultText(bigRead, 'wide'), /lines omitted/);
+assert.match(capToolResultText(bigRead, 'wide', 65536), /lines omitted/);
+assert.equal(formatToolResult({ ...call, result: bigRead }, { tier: 'wide', maxCtx: 262144 }).includes(bigRead), true);
+const huge = 'z'.repeat(ROOMY_TOOL_RESULT_MAX_CHARS * 2);
+assert.ok(capToolResultText(huge, 'wide', 262144).length <= ROOMY_TOOL_RESULT_MAX_CHARS, 'a roomy window still has a ceiling');
+
 const closed = parseResponse('<write_file path="a.ts">\nexport const a = 1;\n</write_file>', 'c1', false);
 assert.equal(closed.toolCalls[0]?.name, 'write_file');
 assert.match(closed.toolCalls[0]?.body || '', /export const a/);
@@ -243,6 +259,10 @@ assert.equal(truncated?.status, 'error');
 assert.equal(truncated?.name, 'write_file');
 assert.equal(truncated?.result, 'output truncated; file not written');
 assert.equal(truncated?.args.path, 'a.ts');
+assert.equal(continuationAddsContent('</write_file>'), false, 'a bare close tag is not a continuation');
+assert.equal(continuationAddsContent('\n```\n</write_file>\n'), false);
+assert.equal(continuationAddsContent('}'), false);
+assert.equal(continuationAddsContent('  return x;\n}\n\nexport default App;\n</write_file>'), true);
 
 const plain = parseEditBlocks('SEARCH\nline2\n=======\nLINE2\nREPLACE\n');
 assert.equal(plain.length, 1);
@@ -491,5 +511,38 @@ assert.deepEqual(
   hasUnclosedWrite('<write_file path="a.ts">ok</write_file>\n<write_file path="b.ts">cut'),
   { name: 'write_file', path: 'b.ts' }
 );
+
+// A tag named in inline backticks is prose; only the real call below it runs
+const proseTag = parseResponse(
+  "I'll run `<run_command>` to make sure everything compiles properly.\n\n<run_command>npm run build</run_command>",
+  'm-prose'
+);
+assert.equal(proseTag.toolCalls.length, 1);
+assert.equal(proseTag.toolCalls[0].name, 'run_command');
+assert.equal(proseTag.toolCalls[0].body, 'npm run build');
+assert.match(proseTag.display, /I'll run `<run_command>` to make sure/);
+
+const proseSelfClosing = parseResponse('Next I will use `<read_file path="x"/>` to check it.', 'm-prose-read');
+assert.equal(proseSelfClosing.toolCalls.length, 0);
+assert.match(proseSelfClosing.display, /`<read_file path="x"\/>`/);
+assert.equal(parseResponse('<read_file path="x"/>', 'm-real-read').toolCalls.length, 1);
+
+// A same-name opening left unclosed in prose re-anchors to the last opening before the close
+const reopened = parseResponse('first <run_command> then\n<run_command>npm test</run_command>', 'm-reopen');
+assert.equal(reopened.toolCalls.length, 1);
+assert.equal(reopened.toolCalls[0].body, 'npm test');
+
+// Fenced tool tags still parse, and the emptied fence is dropped
+const fenced = parseResponse('Here:\n```xml\n<run_command>npm test</run_command>\n```\nDone.', 'm-fenced');
+assert.equal(fenced.toolCalls.length, 1);
+assert.equal(fenced.toolCalls[0].body, 'npm test');
+assert.doesNotMatch(fenced.display, /```/);
+
+// A write_file body full of backticks and template literals stays intact
+const tickBody = 'const msg = `hi ${name}`;\nconst tag = `<run_command>`;\nexport const f = () => `a${1}b`;\n';
+const tickWrite = parseResponse(`<write_file path="src/a.ts">\n${tickBody}</write_file>`, 'm-ticks');
+assert.equal(tickWrite.toolCalls.length, 1);
+assert.equal(tickWrite.toolCalls[0].args.path, 'src/a.ts');
+assert.equal(tickWrite.toolCalls[0].body, tickBody.trim());
 
 console.log('tools.selftest ok');

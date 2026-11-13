@@ -1,5 +1,6 @@
 import type { DeliveryTarget } from '../types';
 import type { DeliveryStack } from './deliveryIntent';
+import { ownedTailTwin, parallelModulePath } from './workspacePaths';
 
 /** Durable project memory — survives New Chat and compaction. */
 export interface ProjectBrain {
@@ -31,6 +32,54 @@ export function emptyProjectBrain(): ProjectBrain {
     todo: [],
     updatedAt: Date.now()
   };
+}
+
+/** True when the brain holds nothing worth keeping (a fresh folder, or one just reset). */
+export function isBlankProjectBrain(brain: ProjectBrain): boolean {
+  return (
+    !brain.brief &&
+    !brain.delivery &&
+    !brain.stack &&
+    !brain.contractFile &&
+    !brain.contractLocked &&
+    !brain.verifyCommand &&
+    !brain.lastVerifyNote &&
+    !brain.lastDistNote &&
+    !brain.lastTerminal &&
+    brain.ownedFiles.length === 0 &&
+    brain.todo.length === 0
+  );
+}
+
+/**
+ * The brain file is gone from disk but memory still holds a brain: the folder was deleted and
+ * recreated (or swapped) under the same path, so that memory belongs to the old folder.
+ */
+export function brainIsStaleForFolder(brainFileExists: boolean, brain: ProjectBrain): boolean {
+  return !brainFileExists && !isBlankProjectBrain(brain);
+}
+
+/** Identity of one opened folder: the same path string opened again is a new key. */
+export function brainWorkspaceKey(workspacePath: string, epoch: number): string {
+  return `${(workspacePath || '').replace(/[\\/]+$/, '').toLowerCase()}#${epoch}`;
+}
+
+export type BrainWriteDecision = 'write' | 'memory-only' | 'drop';
+
+/**
+ * Where a brain commit may go.
+ * - `drop`: the commit came from a closure for a folder that is no longer open.
+ * - `memory-only`: this folder is open, but its brain has not been loaded/initialised yet.
+ * - `write`: the in-memory brain belongs to this folder and may be saved under it.
+ */
+export function brainWriteDecision(
+  callerKey: string,
+  openKey: string,
+  loadedKey: string
+): BrainWriteDecision {
+  if (callerKey !== openKey) return 'drop';
+  if (loadedKey !== openKey) return 'memory-only';
+  return 'write';
 }
 
 export function projectBrainPath(root: string): string {
@@ -122,20 +171,16 @@ export function shouldPreserveContract(existing: string, incoming: string): bool
   return oldNames.length >= 3 && lost.length >= 2;
 }
 
-function stemOf(path: string): string {
-  const base = path.replace(/\\/g, '/').split('/').pop() || path;
-  const name = base.replace(/\.[^.]+$/, '');
-  const prefix = /^(checkers|game|app)/i.exec(name);
-  const next = prefix ? name.charAt(prefix[0].length) : '';
-  const stripPrefix = !!prefix && (/[^A-Za-z0-9]/.test(next) || (/[A-Z]/.test(next) && name !== name.toUpperCase()));
-  return (stripPrefix ? name.slice(prefix![0].length) : name).toLowerCase().replace(/[^a-z0-9]/g, '');
-}
-
 /**
  * If a worker invents a parallel file for a module we already own
  * (`Board.tsx` vs `CheckersBoard.tsx`), return the existing path.
+ * The path-identity rules live in `workspacePaths`.
  */
-/** Block a second entrypoint (`src/app.ts` beside `src/App.tsx`). */
+export function preferredExistingPath(owned: string[], candidate: string): string | null {
+  return parallelModulePath(owned, candidate);
+}
+
+/** Block a second entrypoint (`src/app.ts` beside `src/App.tsx`) or a dir-suffix twin (`game/types.ts`). */
 export function shadowOwnedPath(owned: string[], candidate: string): string | null {
   const rel = (candidate || '').replace(/\\/g, '/').replace(/^\.?\//, '');
   const lower = rel.toLowerCase();
@@ -145,41 +190,11 @@ export function shadowOwnedPath(owned: string[], candidate: string): string | nu
     const overlay = owned.find(o => /uioverlay\.tsx$/i.test(o.replace(/\\/g, '/')));
     if (overlay) return overlay.replace(/\\/g, '/');
   }
+  // Root project files legitimately repeat in subfolders; an exact match is the same file.
+  const tail = ownedTailTwin(owned, rel);
+  if (tail) return tail;
   return preferredExistingPath(owned, rel);
 }
-
-const GENERIC_STEMS = new Set([
-  'index',
-  'main',
-  'mod',
-  'types',
-  'test',
-  'tests',
-  'util',
-  'utils',
-  'config',
-  'common',
-  'contract',
-  'app'
-]);
-
-export function preferredExistingPath(owned: string[], candidate: string): string | null {
-  const rel = (candidate || '').replace(/\\/g, '/');
-  if (!rel) return null;
-  const cStem = stemOf(rel);
-  if (cStem.length < 4 || GENERIC_STEMS.has(cStem)) return null;
-  const isHtml = (p: string) => /\.html?$/i.test(p);
-  const candIsHtml = isHtml(rel);
-  for (const o of owned) {
-    const ownedRel = o.replace(/\\/g, '/');
-    if (ownedRel.toLowerCase() === rel.toLowerCase()) return null;
-    if (candIsHtml !== isHtml(ownedRel)) continue;
-    const oStem = stemOf(ownedRel);
-    if (oStem.length >= 4 && !GENERIC_STEMS.has(oStem) && oStem === cStem) return ownedRel;
-  }
-  return null;
-}
-
 export function formatProjectBrainForPrompt(
   brain: ProjectBrain,
   rules?: string,

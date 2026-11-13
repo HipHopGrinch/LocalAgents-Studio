@@ -23,7 +23,16 @@ import {
   rememberVerdictReask,
   takeCoderRedispatch,
   takeVerdictReask,
-  VERDICT_REASK_PROMPT
+  VERDICT_REASK_PROMPT,
+  MISSING_DELTA_NOTE,
+  missingDeltaAsFail,
+  reviewDeltaReaskPrompt,
+  hasProseFindings,
+  noVerdictAdvanceNote,
+  parseProseVerdict,
+  pickProseStepVerdict,
+  reviewDeltaReaskPromptWithContext,
+  verdictReaskPromptWithContext
 } from './fullAuto';
 
 assert.equal(mergeSettings(null).fullAuto, false);
@@ -317,5 +326,89 @@ assert.equal(stepThreeGate.stepId, '3');
 assert.equal(releaseCoderRedispatch(stepThreeGate, '2'), stepThreeGate);
 assert.equal(stepThreeGate.verdictReasked, true);
 assert.equal(releaseCoderRedispatch(null, '2'), null);
+
+// Review-fix path: a reply with no verdict is a Fail after one re-ask, never a pass.
+assert.equal(
+  reviewDeltaReaskPrompt('2'),
+  'Reply with ONLY a <review_delta task_id="2"> block: <verdict>completed|failed</verdict><notes>...</notes></review_delta>'
+);
+assert.deepEqual(missingDeltaAsFail('2'), { taskId: '2', verdict: 'failed', notes: MISSING_DELTA_NOTE });
+// Prose verdicts: a leading or labeled yay/pass/nay/fail counts; both or neither keeps "missing".
+const proseYay = parseProseVerdict(
+  'yay Reviewed `src/App.tsx` for step #5 alongside the passing verify run. Caveats: lines 81–317 were omitted.'
+);
+assert.equal(proseYay?.result, 'yay');
+assert.ok(proseYay?.notes.startsWith('Reviewed'));
+assert.equal(parseProseVerdict('Yay — all tasks are implemented.')?.result, 'yay');
+assert.equal(parseProseVerdict('**Verdict: yay** the board renders.')?.result, 'yay');
+assert.equal(parseProseVerdict('Result: pass. Everything is wired.')?.result, 'yay');
+assert.equal(parseProseVerdict('PASS')?.result, 'yay');
+assert.equal(parseProseVerdict('PASS: step done')?.result, 'yay');
+assert.equal(parseProseVerdict('result: yay')?.result, 'yay');
+assert.equal(parseProseVerdict('Nay. The handler is a stub.')?.result, 'nay');
+assert.equal(parseProseVerdict('FAIL - ai.ts never calls minimax')?.result, 'nay');
+assert.equal(parseProseVerdict('Verdict: failed because the worker is unwired.')?.result, 'nay');
+assert.equal(parseProseVerdict('<think>nay</think> yay it works')?.result, 'yay');
+assert.equal(parseProseVerdict('yay it works. Verdict: nay on the HUD.'), null, 'both answers stay missing');
+assert.equal(parseProseVerdict('Looks good to me. Ship it.'), null);
+assert.equal(parseProseVerdict('Pass the config through to the worker.'), null, 'bare pass is not a verdict');
+assert.equal(parseProseVerdict('Failed to read src/a.ts, trying again.'), null);
+assert.equal(parseProseVerdict(''), null);
+assert.equal(parseProseVerdict('<read_file path="src/a.ts"/>'), null);
+
+const proseMsgs = [
+  { id: 'tools', role: 'assistant', personaHandle: 'reviewer', raw: '<read_file path="a.ts"/>' },
+  { id: 'verdict', role: 'assistant', personaHandle: 'reviewer', raw: 'yay Reviewed src/App.tsx.' }
+];
+const prosePick = pickProseStepVerdict(proseMsgs, '4');
+assert.equal(prosePick?.message.id, 'verdict');
+assert.equal(prosePick?.parsed.result, 'yay');
+assert.equal(prosePick?.parsed.stepId, '4');
+assert.equal(pickExplicitStepVerdict(proseMsgs, '4'), null, 'prose is not an explicit tag verdict');
+assert.equal(pickProseStepVerdict(proseOnly, '4'), null);
+assert.equal(
+  pickProseStepVerdict(
+    [{ id: 't', role: 'assistant', personaHandle: 'reviewer', raw: 'yay <step_verdict><result></result></step_verdict>' }],
+    '4'
+  ),
+  null,
+  'a reply with a tag is the tag parser job'
+);
+
+// A no-verdict reply is a Nay only when its prose lists real problems.
+assert.equal(hasProseFindings(''), false);
+assert.equal(hasProseFindings('<read_file path="src/game/ai.ts"/>'), false);
+assert.equal(hasProseFindings('Let me look at the files.'), false);
+assert.equal(
+  hasProseFindings('The worker handler in src/game/aiWorker.ts is a stub and never calls minimax, so the AI does not move.'),
+  true
+);
+assert.match(noVerdictAdvanceNote('4'), /step #4.*verify passed.*without a Reviewer verdict/);
+
+// Re-asks name the step and carry its files, so a fresh-context Reviewer does not roam or judge another step.
+const reask = verdictReaskPromptWithContext({
+  stepId: '4',
+  header: '## Active step to verify (#4)\nTitle: AI worker',
+  filesHint: 'Files to verify:\nsrc/game/ai.ts',
+  filesBody: '## Files already on disk\n### src/game/ai.ts\n```\nexport const x = 1;\n```',
+  verifyStatement: 'Project verify: PASSED just now (exit 0).',
+  debt: true
+});
+assert.match(reask, /Active step to verify \(#4\)/);
+assert.match(reask, /Files to verify:\nsrc\/game\/ai\.ts/);
+assert.match(reask, /export const x = 1;/);
+assert.match(reask, /Project verify: PASSED/);
+assert.match(reask, /Judge plan step #4 now \(an end-of-plan pass/);
+assert.match(reask, /do not read files or call tools/);
+assert.ok(reask.endsWith(VERDICT_REASK_PROMPT));
+assert.match(verdictReaskPromptWithContext({ stepId: '2', header: 'H' }), /No file bodies were loaded/);
+const deltaReask = reviewDeltaReaskPromptWithContext('3', {
+  header: '## Fix task #3',
+  filesHint: 'Files just written:\nsrc/a.ts',
+  filesBody: 'BODY'
+});
+assert.match(deltaReask, /## Fix task #3/);
+assert.match(deltaReask, /BODY/);
+assert.ok(deltaReask.endsWith(reviewDeltaReaskPrompt('3')));
 
 console.log('fullAuto.selftest ok');

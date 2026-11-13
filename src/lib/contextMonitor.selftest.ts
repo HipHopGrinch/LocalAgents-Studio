@@ -6,6 +6,7 @@ import {
   contextWasExhausted,
   estimatePromptTokens,
   fitPromptToContext,
+  outputCapWasHit,
   promptFillsContext,
   shrinkUserPacket
 } from './contextMonitor';
@@ -265,6 +266,25 @@ assert.equal(
 assert.equal(contextWasExhausted({ doneReason: 'length', evalCount: 10 }, 16384), true);
 assert.equal(contextWasExhausted({ promptEvalCount: 15000, evalCount: 10 }, 16384), true);
 assert.equal(contextWasExhausted({ promptEvalCount: 1000, evalCount: 400, doneReason: 'stop' }, 16384), false);
+
+// Real log: coder stopped at its 6144 output cap with a 928-token prompt in a 16K window.
+const capStop = { promptEvalCount: 928, evalCount: 6144, doneReason: 'length' };
+assert.equal(contextWasExhausted(capStop, 16384, 16384), false);
+assert.equal(outputCapWasHit(capStop, 16384), true);
+assert.equal(outputCapWasHit(capStop, 16384, 6144), true);
+assert.equal(outputCapWasHit(capStop, 16384, 8192), false);
+// length with a nearly full window is still context exhaustion
+const fullStop = { promptEvalCount: 12000, evalCount: 3000, doneReason: 'length' };
+assert.equal(contextWasExhausted(fullStop, 16384, 16384), true);
+assert.equal(outputCapWasHit(fullStop, 16384), false);
+const bigPrompt = { promptEvalCount: 14500, evalCount: 40, doneReason: 'length' };
+assert.equal(contextWasExhausted(bigPrompt, 16384, 16384), true);
+assert.equal(outputCapWasHit(bigPrompt, 16384), false);
+assert.equal(contextWasExhausted({ doneReason: 'context', evalCount: 5 }, 16384), true);
+// no prompt count: can't prove the window had room
+assert.equal(outputCapWasHit({ doneReason: 'length', evalCount: 6144 }, 16384), false);
+assert.equal(outputCapWasHit({ promptEvalCount: 900, evalCount: 300, doneReason: 'stop' }, 16384), false);
+assert.equal(outputCapWasHit(undefined, 16384), false);
 
 const fat = `REPO MAP\n${'file.ts\n'.repeat(4000)}\n## Task\n${'x'.repeat(20000)}`;
 const fatShrunk = shrinkUserPacket(fat, 2);

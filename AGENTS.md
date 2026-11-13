@@ -4,7 +4,7 @@
 >
 > **Repo:** https://github.com/HipHopGrinch/LocalAgents-Studio  
 > **Wiki / What’s new:** https://github.com/HipHopGrinch/LocalAgents-Studio/wiki  
-> **Current version (as of this briefing):** **1.4.0** (see [`CHANGELOG.md`](CHANGELOG.md))  
+> **Current version (as of this briefing):** **1.5.0** (see [`CHANGELOG.md`](CHANGELOG.md))  
 > **Discord:** https://discord.gg/ZVkmUfXwW
 
 This document is the fast path from zero → productive. It covers *why the product exists*, *what was built in order*, *where the code lives*, *how the reference cluster is supposed to behave*, and *how we ship*.
@@ -173,6 +173,7 @@ Full notes: [Wiki → What’s new](https://github.com/HipHopGrinch/LocalAgents-
 
 | Ver | Theme |
 |-----|--------|
+| **1.5.0** | Render smoke check for web projects, verify-first review, one path canonicalizer, thinking-model budgets and retries, run-log waste analyzer, sturdier heals/reworks/verdicts |
 | **1.4.0** | Per-role computer/model/context picks, Full auto, run log, resizable layout; 110-bug fix sweep (denylist, jail, git config, web console, exit codes, verdicts, Swarm after Stop, editor data loss) |
 | **1.3.1** | Work no longer shows as running after it finished, failed or was stopped (Node Work cards, retries, Swarm, spinners, review tasks) |
 | **1.3.0** | 2026-11 audit: security hardening, Conductor run control + gates, pinned context / model efficiency, chat UX, CI + exe builds, Electron 45 |

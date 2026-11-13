@@ -120,7 +120,7 @@ const loginAttempts = new Map();
 /** @type {Set<import('ws').WebSocket>} */
 const clients = new Set();
 
-/** @type {{ invokeRpc: (channel: string, args: any[]) => Promise<any>, getDistDir: () => string, getViteDevUrl: () => string | null, appendLog?: (level: string, msg: string) => void, onClientConnected?: () => void } | null} */
+/** @type {{ invokeRpc: (channel: string, args: any[]) => Promise<any>, getDistDir: () => string, getViteDevUrl: () => string | null, appendLog?: (level: string, msg: string) => void, onClientConnected?: () => void, onClientCountChanged?: (count: number) => void } | null} */
 let deps = null;
 
 /** @type {{ enabled: boolean, port: number, passwordHash?: string, passwordSalt?: string, lanEnabled: boolean, allowShell: boolean, tlsCertPath: string, tlsKeyPath: string, tls: boolean, tlsError: string, bindHost: string }} */
@@ -555,6 +555,7 @@ function attachWebSocket() {
           socket.__token = String(msg.token);
           clearTimeout(authTimer);
           clients.add(socket);
+          notifyClientCount();
           try {
             socket.send(JSON.stringify({ type: 'hello', status: getStatus() }));
           } catch {
@@ -583,7 +584,7 @@ function attachWebSocket() {
 
     socket.on('close', () => {
       clearTimeout(authTimer);
-      clients.delete(socket);
+      if (clients.delete(socket)) notifyClientCount();
     });
   });
 }
@@ -630,11 +631,40 @@ async function handleWsMessage(socket, raw) {
   }
 }
 
+/** Authenticated clients only; the desktop uses this to decide whether to publish the chat mirror. */
+function clientCount() {
+  return clients.size;
+}
+
+function notifyClientCount() {
+  if (typeof deps?.onClientCountChanged !== 'function') return;
+  try {
+    deps.onClientCountChanged(clients.size);
+  } catch {
+    /* ignore */
+  }
+}
+
+// A stalled browser must not make the main process buffer every snapshot for it.
+const SNAPSHOT_SKIP_BUFFERED_BYTES = 4 * 1024 * 1024;
+const SLOW_CLIENT_CLOSE_BUFFERED_BYTES = 64 * 1024 * 1024;
+
 function broadcast(channel, payload) {
   if (!clients.size) return;
   const packet = JSON.stringify({ type: 'event', channel, payload });
   for (const socket of clients) {
     if (socket.readyState === 1 && socket.__authed) {
+      const buffered = Number(socket.bufferedAmount) || 0;
+      // Snapshots are superseded by the next one; dropping a stale one is safe. Stream chunks are not.
+      if (channel === 'session:changed' && buffered > SNAPSHOT_SKIP_BUFFERED_BYTES) continue;
+      if (buffered > SLOW_CLIENT_CLOSE_BUFFERED_BYTES) {
+        try {
+          socket.close(1013, 'Client too slow');
+        } catch {
+          /* ignore */
+        }
+        continue;
+      }
       try {
         socket.send(packet);
       } catch {
@@ -657,7 +687,9 @@ function stopServer(opts = {}) {
       /* ignore */
     }
   }
+  const hadClients = clients.size > 0;
   clients.clear();
+  if (hadClients) notifyClientCount();
   if (clearSessions) sessions.clear();
   if (wss) {
     try {
@@ -852,6 +884,7 @@ module.exports = {
   createPasswordRecord,
   clearPassword,
   getStatus,
+  clientCount,
   broadcast,
   stopServer,
   startServer,

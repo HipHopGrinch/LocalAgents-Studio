@@ -1,7 +1,15 @@
 import { ChatMessage, ToolCall } from '../types';
-import { applyEdits, formatToolResult, parseEditBlocks, READ_ONLY_TOOLS } from './tools';
+import {
+  applyEdits,
+  formatToolResult,
+  isRoomyToolResultWindow,
+  parseEditBlocks,
+  READ_ONLY_TOOLS,
+  ROOMY_TOOL_RESULT_MAX_CHARS
+} from './tools';
 import { shouldRejectPlannerWrite } from './swarmContract';
 import { shadowOwnedPath } from './projectBrain';
+import { assignedTwinPath, pathKey } from './workspacePaths';
 import { coderModelToRewarm, pickImageTarget, placeholderSvg } from './imageRouting';
 import { pinnedNumCtx } from './contextSize';
 import { symbolHitsForQuery, type RepoMap } from './repoMap';
@@ -74,16 +82,22 @@ export function isDestructiveCommand(cmd: string): boolean {
 
 export type ToolResultTier = 'tight' | 'standard' | 'wide';
 
-export function continuationCharCap(tier: ToolResultTier = 'standard'): number {
+/** `maxCtx` is set only for a frontier model; a roomy window keeps one result whole. */
+export function continuationCharCap(tier: ToolResultTier = 'standard', maxCtx?: number): number {
+  if (isRoomyToolResultWindow(maxCtx)) return ROOMY_TOOL_RESULT_MAX_CHARS;
   if (tier === 'tight') return 8000;
   if (tier === 'wide') return 32000;
   return 16000;
 }
 
 /** Error lines plus a head and tail, capped by fit tier. Short results pass through. */
-export function capToolResultText(text: string, tier: ToolResultTier = 'standard'): string {
+export function capToolResultText(
+  text: string,
+  tier: ToolResultTier = 'standard',
+  maxCtx?: number
+): string {
   const raw = text || '';
-  const cap = continuationCharCap(tier);
+  const cap = continuationCharCap(tier, maxCtx);
   if (raw.length <= cap) return raw;
   const lines = raw.split(/\r?\n/);
   const errorLines = lines.filter(l => /\berror\b|exception|\bTS\d+\b|failed/i.test(l)).slice(0, 40);
@@ -245,6 +259,31 @@ export function isRepeatedEditStop(result?: string): boolean {
   return (result || '').includes('REPEATED_EDIT:');
 }
 
+/** A repeated write whose bytes are already on disk: the intent is met, nothing was written. */
+export const UNCHANGED_WRITE_PREFIX = 'UNCHANGED:';
+
+export function isUnchangedWrite(result?: string): boolean {
+  return (result || '').startsWith(UNCHANGED_WRITE_PREFIX);
+}
+
+function unchangedWriteResult(filePath: string): string {
+  return `${UNCHANGED_WRITE_PREFIX} ${filePath} already has exactly this content (same write as an earlier attempt). Nothing new was written.`;
+}
+
+function sameFileText(a: string, b: string): boolean {
+  return a.replace(/\r\n/g, '\n') === b.replace(/\r\n/g, '\n');
+}
+
+async function readFileForRepeat(deps: ToolExecutorDeps, filePath: string): Promise<string | undefined> {
+  if (typeof window === 'undefined' || !window.electronAPI?.execTool) return undefined;
+  try {
+    const res = await window.electronAPI.execTool(deps.workspacePath, 'read_file', { path: filePath, raw: true });
+    return res?.error ? undefined : res?.content;
+  } catch {
+    return undefined;
+  }
+}
+
 function editGuardOf(deps: ToolExecutorDeps): EditRepeatGuard {
   return deps.editProgress || defaultEditGuard;
 }
@@ -304,6 +343,12 @@ export interface ToolExecutorDeps {
   searxngUrl?: string;
   /** Live owned-file list so writes cannot invent a parallel module. */
   getOwnedFiles?: () => string[];
+  /**
+   * Files the current worker/turn was assigned (plan step files). A write or edit to a suffix/case
+   * twin of one of them (`game/types.ts` for `src/game/types.ts`) is redirected to the assigned file
+   * instead of being rejected after the model spent the whole generation.
+   */
+  getAssignedFiles?: () => string[];
   /** Cheap repo map so search can lead with symbol hits. */
   getRepoMap?: () => RepoMap | null;
   /** Local MCP servers JSON from settings. Empty = MCP calls fail closed. */
@@ -317,6 +362,12 @@ export interface ToolExecutorDeps {
   toolResultTier?: ToolResultTier;
   /** Called once with the finished tool. Must not change the result. */
   onTool?: (tool: ToolCall) => void;
+}
+
+/** ` (redirected from x)` for a write the executor or `anchorWritePath` moved onto the assigned file. */
+function redirectNoteFor(tool: ToolCall, askedTwin: string): string {
+  const from = askedTwin || tool.args?.redirectedFrom || '';
+  return from ? ` (redirected from ${from})` : '';
 }
 
 /** Execute one tool without mutating the input; returns a new ToolCall. */
@@ -337,7 +388,13 @@ async function executeToolBody(tool: ToolCall, deps: ToolExecutorDeps): Promise<
 
   try {
     if (tool.name === 'write_file') {
-      const filePath = tool.args?.path || 'file';
+      const asked = tool.args?.path || 'file';
+      // A suffix/case twin of a file this turn was assigned (`game/types.ts` for the assigned
+      // `src/game/types.ts`) is the assigned file: redirect instead of rejecting a finished generation.
+      const twin = assignedTwinPath(deps.getAssignedFiles?.() || [], asked);
+      const filePath = twin || asked;
+      if (twin) next = { ...next, args: { ...next.args, path: twin } };
+      const redirectNote = redirectNoteFor(tool, twin && pathKey(twin) !== pathKey(asked) ? asked : '');
       let content = tool.body || '';
       if (shouldRejectPlannerWrite(filePath, content)) {
         return {
@@ -360,19 +417,28 @@ async function executeToolBody(tool: ToolCall, deps: ToolExecutorDeps): Promise<
       }
       const repeatedWrite = repeatedEditResult(deps, filePath, content, content);
       if (repeatedWrite) {
-        return { ...next, status: 'error', result: repeatedWrite };
+        // Same bytes as before. Already on disk → done, nothing to do. Reverted since → write again.
+        const onDisk = await readFileForRepeat(deps, filePath);
+        if (onDisk === undefined) return { ...next, status: 'error', result: repeatedWrite };
+        if (sameFileText(onDisk, content)) {
+          return { ...next, status: 'done', result: unchangedWriteResult(filePath) };
+        }
       }
       const ok = await deps.onApplyFileWrite(filePath, content);
       if (ok) commitEditOutcome(deps, filePath, content, content);
       return {
         ...next,
         status: ok ? 'done' : 'error',
-        result: ok ? `Wrote file ${filePath}` : `Failed to write file ${filePath}`
+        result: ok ? `Wrote file ${filePath}${redirectNote}` : `Failed to write file ${filePath}`
       };
     }
 
     if (tool.name === 'edit_file') {
-      const filePath = tool.args?.path || 'file';
+      const asked = tool.args?.path || 'file';
+      const twin = assignedTwinPath(deps.getAssignedFiles?.() || [], asked);
+      const filePath = twin || asked;
+      if (twin) next = { ...next, args: { ...next.args, path: twin } };
+      const redirectNote = redirectNoteFor(tool, twin && pathKey(twin) !== pathKey(asked) ? asked : '');
       const body = tool.body || '';
       if (!window.electronAPI) {
         return { ...next, status: 'error', result: 'Electron API unavailable' };
@@ -394,15 +460,15 @@ async function executeToolBody(tool: ToolCall, deps: ToolExecutorDeps): Promise<
         return { ...next, status: 'error', result: repeated || mismatch };
       }
       const repeatedEdit = repeatedEditResult(deps, filePath, body, editRes.content);
-      if (repeatedEdit) {
-        return { ...next, status: 'error', result: repeatedEdit };
+      if (repeatedEdit && sameFileText(readRes.content, editRes.content)) {
+        return { ...next, status: 'done', result: unchangedWriteResult(filePath) };
       }
       const ok = await deps.onApplyFileWrite(filePath, editRes.content);
       if (ok) commitEditOutcome(deps, filePath, body, editRes.content);
       return {
         ...next,
         status: ok ? 'done' : 'error',
-        result: ok ? `Applied diff to ${filePath}` : `Failed to write patched ${filePath}`
+        result: ok ? `Applied diff to ${filePath}${redirectNote}` : `Failed to write patched ${filePath}`
       };
     }
 
@@ -591,6 +657,7 @@ async function maybeInstallAfterPackageJsonWrite(
     t =>
       isWritableTool(t.name) &&
       t.status === 'done' &&
+      !isUnchangedWrite(t.result) &&
       isPackageJsonToolPath(t)
   );
   if (!wrotePkg || !deps.workspacePath || !window.electronAPI?.installWorkspaceDeps) {
@@ -971,13 +1038,13 @@ export function isReadOnlyToolBatch(tools: ToolCall[]): boolean {
 
 export function buildContinuationUserPrompt(
   feedbackTools: ToolCall[],
-  opts?: { finalCommandAttempt?: boolean; tier?: ToolResultTier }
+  opts?: { finalCommandAttempt?: boolean; tier?: ToolResultTier; maxCtx?: number }
 ): string {
   const tier = opts?.tier ?? 'standard';
   const shown = feedbackTools.map(t =>
-    t.result ? { ...t, result: capToolResultText(t.result, tier) } : t
+    t.result ? { ...t, result: capToolResultText(t.result, tier, opts?.maxCtx) } : t
   );
-  const resultsXml = shown.map(t => formatToolResult(t, { tier })).join('\n\n');
+  const resultsXml = shown.map(t => formatToolResult(t, { tier, maxCtx: opts?.maxCtx })).join('\n\n');
   if (shown.some(t => isRepeatedEditStop(t.result))) {
     return `Edit repeated:\n${resultsXml}\n\nYou repeated an edit that produced the same file result. Stop. Do not emit the same SEARCH/REPLACE or the same write_file body again. Say what is blocked in one short sentence.`;
   }

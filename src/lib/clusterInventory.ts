@@ -1,6 +1,8 @@
 import type { EndpointNode, NodeRole } from '../types';
 import {
+  CHARS_PER_TOKEN_SEED,
   DEFAULT_FRONTIER_NUM_CTX,
+  fitBudgetForPinnedCtx,
   isFrontierEndpoint,
   isWideFrontierModel,
   resolveModelMaxNumCtx
@@ -169,11 +171,50 @@ ${rules}`;
 export const TIGHT_PACKING_LINE =
   'Implement the listed items as an explicit checklist in the target file(s); do not invent a parallel redesign.';
 
-export function fileContextCapsForTier(tier: ModelFitTier): {
+export interface FileContextCaps {
   maxFiles: number;
   maxCharsPerFile: number;
   maxTotalChars: number;
-} {
+}
+
+/** From this window up, whole files fit comfortably; local-tier caps would only truncate them. */
+export const ROOMY_CTX = 131072;
+const ROOMY_PROMPT_SHARE = 0.5;
+const ROOMY_MAX_CHARS_PER_FILE = 120000;
+
+/**
+ * Caps for a window of `maxCtx` tokens, or null below {@link ROOMY_CTX}. Total chars are
+ * half the prompt budget (after the reviewer output reserve); one file may take 120K chars.
+ */
+export function roomyFileCaps(maxCtx: number): FileContextCaps | null {
+  if (!(maxCtx >= ROOMY_CTX)) return null;
+  const promptBudget = fitBudgetForPinnedCtx({ pinnedCtx: maxCtx, role: 'reviewer' }).promptBudget;
+  const maxTotalChars = Math.floor(promptBudget * ROOMY_PROMPT_SHARE * CHARS_PER_TOKEN_SEED);
+  return {
+    maxFiles: 40,
+    maxCharsPerFile: Math.min(ROOMY_MAX_CHARS_PER_FILE, maxTotalChars),
+    maxTotalChars
+  };
+}
+
+/**
+ * Preload caps for a Reviewer. A frontier model with a roomy window gets {@link roomyFileCaps}
+ * (never less than `localCaps`); a local model keeps `localCaps` unchanged.
+ */
+export function resolveReviewerFileCaps(maxCtx: number, localCaps: FileContextCaps): FileContextCaps {
+  const roomy = roomyFileCaps(maxCtx);
+  if (!roomy) return localCaps;
+  return {
+    maxFiles: Math.max(localCaps.maxFiles, roomy.maxFiles),
+    maxCharsPerFile: Math.max(localCaps.maxCharsPerFile, roomy.maxCharsPerFile),
+    maxTotalChars: Math.max(localCaps.maxTotalChars, roomy.maxTotalChars)
+  };
+}
+
+/** Per-tier caps; pass the model's `maxCtx` so a roomy window (≥131072) gets whole-file caps. */
+export function fileContextCapsForTier(tier: ModelFitTier, maxCtx?: number): FileContextCaps {
+  const roomy = maxCtx === undefined ? null : roomyFileCaps(maxCtx);
+  if (roomy) return roomy;
   if (tier === 'tight') {
     return { maxFiles: 4, maxCharsPerFile: 4000, maxTotalChars: 12000 };
   }
@@ -213,7 +254,7 @@ export function resolveModelFit(
       maxCtx,
       tier
     }),
-    caps: fileContextCapsForTier(tier),
+    caps: fileContextCapsForTier(tier, maxCtx),
     packingLine: tier === 'tight' ? TIGHT_PACKING_LINE : null
   };
 }

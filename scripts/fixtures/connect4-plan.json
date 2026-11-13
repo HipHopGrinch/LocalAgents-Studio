@@ -1,0 +1,187 @@
+{
+  "id": "plan-1794606169174",
+  "summary": "Build a 3D Connect 4 web game with Vite, React, TypeScript, React Three Fiber, and a Web Worker Alpha-Beta AI opponent",
+  "status": "active",
+  "steps": [
+    {
+      "id": "1",
+      "uid": "s-mwfi6edy-pnvynr",
+      "title": "Project scaffolding and Vite + TypeScript configuration",
+      "status": "completed",
+      "tasks": [
+        {
+          "id": "1a",
+          "title": "Configure dependencies and scripts",
+          "description": "Define scripts (dev, build, preview, test) and compatible dependencies: react@^18.3.1, react-dom@^18.3.1, three@^0.169.0, @react-three/fiber@^8.17.10, @react-three/drei@^9.114.0, @types/react, @types/react-dom, @types/three, @vitejs/plugin-react, typescript, vite, and vitest.",
+          "file": "package.json",
+          "status": "completed"
+        },
+        {
+          "id": "1b",
+          "title": "Configure TypeScript compiler",
+          "description": "Set strict TypeScript options, JSX react-jsx, ES2020 target, bundler moduleResolution, and Vite client types.",
+          "file": "tsconfig.json",
+          "status": "completed"
+        },
+        {
+          "id": "1c",
+          "title": "Configure Vite and Vitest",
+          "description": "Configure @vitejs/plugin-react and worker format ('es') so Web Workers bundle cleanly in dev and production builds.",
+          "file": "vite.config.ts",
+          "status": "completed"
+        },
+        {
+          "id": "1d",
+          "title": "Create HTML entry page",
+          "description": "Add root div, viewport meta, page title (\"3D Connect 4\"), and module script pointing to /src/main.tsx.",
+          "file": "index.html",
+          "status": "completed"
+        }
+      ],
+      "reviewNote": "All Step 1 tasks are concretely implemented and consistent: - package.json (#1a) configures dev, build, preview, and test scripts along with compatible React 18, Three.js, @react-three/fiber, @react-three/drei, TypeScript, Vite, and Vitest versions. - tsconfig.json (#1b) enables strict mode, ES2020 target, react-jsx, bundler moduleResolution, and vite/client types scoped to src. - vite.config.ts (#1c) configures @vitejs/plugin-react and ES module Web Worker bundling (`worker.format: 'es'`). - index.html (#1d) provides viewport meta, title \"3D Connect 4\", body background styling, a non-empty `<div id=\"root\">Loading…</div>` placeholder, and module entrypoint `/src/main.tsx`.",
+      "reworkCount": 0,
+      "healExhausted": false
+    },
+    {
+      "id": "2",
+      "uid": "s-mwfi6edy-11oa0p",
+      "title": "Core game rules, Alpha-Beta Minimax AI, Web Worker, and tests",
+      "status": "completed",
+      "tasks": [
+        {
+          "id": "2a",
+          "title": "Define core game types and constants",
+          "description": "Export ROWS=6, COLS=7, Player (1 | 2), Cell (0 | Player), Board, Coord, Difficulty ('easy' | 'medium' | 'hard'), GameMode ('ai' | 'pvp'), GameStatus, WinResult, and MoveRecord types.",
+          "file": "src/game/types.ts",
+          "status": "completed"
+        },
+        {
+          "id": "2b",
+          "title": "Implement 7x6 board rules and win detection",
+          "description": "Depends on types.ts. Implement createBoard, cloneBoard, getLegalColumns, getNextOpenRow, dropDisc, isBoardFull, and checkWin (returning winning Player and array of winning Coords across horizontal, vertical, and both diagonals).",
+          "file": "src/game/board.ts",
+          "status": "completed"
+        },
+        {
+          "id": "2c",
+          "title": "Implement Alpha-Beta Minimax AI",
+          "description": "Depends on types.ts and board.ts. Implement chooseBestMove with center-first column ordering [3,2,4,1,5,0,6], immediate win/block shortcuts, 4-cell window heuristic scoring, and difficulty-scaled search depth (easy=2 with occasional suboptimal noise, medium=4, hard=6).",
+          "file": "src/game/ai.ts",
+          "status": "completed"
+        },
+        {
+          "id": "2d",
+          "title": "Wrap AI search in a Web Worker",
+          "description": "Depends on types.ts and ai.ts. Listen for WorkerRequest messages ({ requestId, board, aiPlayer, difficulty }) and post back { requestId, col } from chooseBestMove without blocking the main UI/3D render thread.",
+          "file": "src/game/ai.worker.ts",
+          "status": "completed"
+        },
+        {
+          "id": "2e",
+          "title": "Add Vitest unit tests for rules and AI",
+          "description": "Depends on board.ts and ai.ts. Test legal move generation, horizontal/vertical/diagonal win detection returning 4 coordinates, AI taking immediate winning move, and AI blocking opponent's 3-in-a-row threat.",
+          "file": "src/game/ai.test.ts",
+          "status": "completed"
+        }
+      ],
+      "reviewNote": "All Step 2 tasks (#2a–#2e) are concretely implemented and consistent across the workspace: - `src/game/types.ts` (#2a): Exports `ROWS=6`, `COLS=7`, `Player`, `Cell`, `Board`, `Coord`, `Difficulty`, `GameMode`, `GameStatus`, `WinResult`, and `MoveRecord`. - `src/game/board.ts` (#2b): Implements `createBoard`, `cloneBoard`, `getLegalColumns`, `getNextOpenRow`, `dropDisc`, `isBoardFull`, and `checkWin` across horizontal, vertical, and both diagonal directions returning the winning player and coordinates. - `src/game/ai.ts` (#2c): Implements `chooseBestMove` with center-first column ordering `[3, 2, 4, 1, 5, 0, 6]`, immediate win/block shortcuts, 4-cell window heuristic evaluation, alpha-beta minimax pruning, and difficulty-scaled search depths (`easy=2` with 30% noise, `medium=4`, `hard=6`). - `src/game/ai.worker.ts` (#2d): Listens for `{ requestId, board, aiPlayer, difficulty }` messages, runs `chooseBestMove`, and posts back `{ requestId, col }`. - `src/game/ai.test.ts` (#2e): Covers board rules, legal moves, horizontal/vertical/both-diagonal win detection with 4 coordinates, AI immediate win, and AI blocking a 3-in-a-row threat (note: Vitest test execution output was not included in the prompt, though workspace `tsc` passed with exit code 0).",
+      "reworkCount": 0
+    },
+    {
+      "id": "3",
+      "uid": "s-mwfi6edy-9657e8",
+      "title": "Audio feedback and 3D scene components (Board, Discs, Lighting, Camera)",
+      "status": "completed",
+      "tasks": [
+        {
+          "id": "3a",
+          "title": "Create Web Audio API sound effects",
+          "description": "Implement lightweight synthesized sound effects (dropWhoosh, discLand, winChime, uiClick) with mute support and safe AudioContext initialization on user gesture.",
+          "file": "src/utils/sound.ts",
+          "status": "completed"
+        },
+        {
+          "id": "3b",
+          "title": "Define 3D spatial layout constants",
+          "description": "Depends on src/game/types.ts. Export CELL_SIZE, DISC_RADIUS, DISC_THICKNESS, BOARD_THICKNESS, colToX(col), and rowToY(row) so board holes, discs, and ghost previews align accurately.",
+          "file": "src/scene/constants.ts",
+          "status": "completed"
+        },
+        {
+          "id": "3c",
+          "title": "Render animated 3D game discs",
+          "description": "Depends on types.ts and scene/constants.ts. Render a beveled cylinder disc for Player 1 (red) / Player 2 (gold-yellow) using useFrame gravity acceleration + damped bounce from drop start height to target row Y, plus pulsing emissive highlight when winning.",
+          "file": "src/scene/Disc3D.tsx",
+          "status": "completed"
+        },
+        {
+          "id": "3d",
+          "title": "Render 3D slotted rack and column interaction",
+          "description": "Depends on types.ts, scene/constants.ts, and scene/Disc3D.tsx. Build extruded front/back faceplates with 7x6 circular holes (THREE.Shape + holes), side rails, sturdy base pedestal, translucent hover ghost disc above hovered/selected column, and invisible column raycast meshes for pointer hover/click.",
+          "file": "src/scene/Board3D.tsx",
+          "status": "completed"
+        },
+        {
+          "id": "3e",
+          "title": "Assemble R3F Canvas, studio lighting, and OrbitControls",
+          "description": "Depends on types.ts, scene/Board3D.tsx, and scene/Disc3D.tsx. Set up R3F Canvas with shadows, directional + fill lighting, subtle tabletop shadow plane, OrbitControls with clamped polar/azimuth angles, and imperative resetCamera ref handler.",
+          "file": "src/scene/GameScene.tsx",
+          "status": "completed"
+        }
+      ],
+      "reviewNote": "All Step 3 tasks (#3a–#3e) are concretely implemented and the previous Disc3D positioning bug is fixed: - `src/utils/sound.ts` (#3a): Implements Web Audio API synthesized effects (`dropWhoosh`, `discLand`, `winChime`, `uiClick`), `playSound`, `initAudio`, `setMuted`, and `isMuted` with lazy `AudioContext` creation/resumption. - `src/scene/constants.ts` (#3b): Defines `COLS`, `ROWS`, `CELL_SIZE`, `DISC_RADIUS`, `DISC_THICKNESS`, `BOARD_THICKNESS`, `colToX`, `rowToY`, `cellCenter`, `getDropPosition`, `getGhostPosition`, physics/color constants, and camera/orbit bounds aligned with `src/game/types.ts`. - `src/scene/Disc3D.tsx` (#3c): Renders a beveled disc with gravity + damped bounce animation in `useFrame`, pulsing emissive highlight when `isWinning` is true, and drop/land audio triggers. The previous `[0, 0, 0]` inline `position` prop bug is resolved by passing `position-x={colToX(col)}` and `position-z={0}` so re-renders preserve `meshRef.current.position.y`. - `src/scene/Board3D.tsx` (#3d): Builds extruded front/back faceplates with 7x6 circular holes via `THREE.Shape`, side rails, base pedestal, translucent hover ghost disc, and invisible column raycast meshes for hover/click interactions. - `src/scene/GameScene.tsx` (#3e): Configures R3F `<Canvas shadows>`, key/fill directional + ambient/point lighting, tabletop shadow plane, clamped `OrbitControls`, audio initialization on pointer down, and a `resetCamera` window event handler (note: uses a `resetCamera` custom window event rather than `forwardRef`/`useImperativeHandle`, and `LatheGeometry` in `Disc3D.tsx` omits a bottom center point `(0, -DISC_THICKNESS / 2)` before the side segment, though both compile and function with `src/App.tsx`).",
+      "reworkCount": 0,
+      "healExhausted": false
+    },
+    {
+      "id": "4",
+      "uid": "s-mwfi6edy-z47zai",
+      "title": "HUD, game state orchestration, styling, and entrypoint",
+      "status": "in_progress",
+      "tasks": [
+        {
+          "id": "4a",
+          "title": "Style responsive 3D viewport and HUD overlay",
+          "description": "Define full-viewport canvas layout, glassmorphic HUD header/controls, player turn badges, win/draw modal banner, and keyboard shortcut badges.",
+          "file": "src/styles.css",
+          "status": "in_progress"
+        },
+        {
+          "id": "4b",
+          "title": "Implement HUD controls and status overlay",
+          "description": "Depends on src/game/types.ts. Render player vs AI score tally, active turn / AI thinking indicator, game mode toggle (vs AI / 2 Players), difficulty selector (Easy / Medium / Hard), mute toggle, Undo, New Game, Reset Camera button, and win/draw banner.",
+          "file": "src/components/HUD.tsx",
+          "status": "in_progress"
+        },
+        {
+          "id": "4c",
+          "title": "Wire game state, AI Web Worker, keyboard controls, and 3D scene",
+          "description": "Depends on game/types.ts, game/board.ts, utils/sound.ts, scene/GameScene.tsx, and components/HUD.tsx. Manage board state, move history & smart undo, async Web Worker AI calls with stale-request cancellation, column selection via click or keyboard (1-7, arrows, Enter/Space, R for camera reset), and score tracking.",
+          "file": "src/App.tsx",
+          "status": "in_progress"
+        },
+        {
+          "id": "4d",
+          "title": "Mount React application",
+          "description": "Depends on App.tsx and styles.css. Render App inside React.StrictMode into #root.",
+          "file": "src/main.tsx",
+          "status": "in_progress"
+        }
+      ],
+      "reviewNote": "Step 4 has concrete bugs in `src/App.tsx` and duplicate parallel modules on disk: 1. **`src/App.tsx` (`handleResetCamera` + `onResetCamera` prop) — Infinite recursion on camera reset**: `handleResetCamera` dispatches `window.dispatchEvent(new Event(\"resetCamera\"))` and is also passed as `onResetCamera={handleResetCamera}` to `<GameScene>`. In `src/scene/GameScene.tsx`, the `\"resetCamera\"` window event listener calls `handleResetCamera()`, which in turn invokes `onResetCamera()`. Triggering \"Reset Camera\" or pressing `R` causes synchronous infinite recursion (`RangeError: Maximum call stack size exceeded`). Fix: do not pass `handleResetCamera` as `onResetCamera` (omit `onResetCamera` or pass a non-dispatching callback). 2. **`src/App.tsx` (`handleUndo`) — Undo wipes the entire board and mis-sets turn in PvP**: `handleUndo` initializes `let newBoard = createBoard();` and sets `newBoard[last.row][last.col] = 0;`, which resets the entire board to empty while keeping earlier moves in `newHistory`. Fix: clone the current `board` with `cloneBoard(board)` before clearing the popped moves (or rebuild `newBoard` by replaying `newHistory`), and compute the next player from `newHistory.length % 2 === 0 ? 1 : 2` (and if in `'ai'` mode when `currentPlayer === 2` / `aiThinking`, handle undoing 1 vs 2 plies cleanly). 3. **Duplicate parallel modules remain in the workspace**: Root-level `game/types.ts` and `components/HUD.tsx`, plus `src/ui/HUD.tsx`, duplicate `src/game/types.ts` and `src/components/HUD.tsx` (with incompatible props and CSS class names). Remove the unused duplicates so each concern has a single canonical module.",
+      "reworkCount": 2,
+      "healExhausted": false
+    }
+  ],
+  "activeStepId": "4",
+  "updatedAt": 1794608077867,
+  "conversationId": "chat-mwfi5gyr-67b3u",
+  "chosenOptionId": "1",
+  "chosenOptionTitle": "Web — Vite + React + Three.js (R3F)",
+  "delivery": "web",
+  "resumePhase": "coder",
+  "healAttempts": 0,
+  "verifyCommand": "node_modules/.bin/tsc --noEmit --incremental --tsBuildInfoFile \".localagents/tsconfig.tsbuildinfo\"",
+  "lastVerifyOk": true,
+  "lastErrorFingerprint": "none"
+}

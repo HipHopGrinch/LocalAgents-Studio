@@ -115,6 +115,8 @@ type RunLogBody =
       promptEvalCount?: number;
       evalCount?: number;
       reasoningTokens?: number;
+      /** Thinking mode requested for this turn: on/off, or a level such as `low`/`high`. */
+      think?: boolean | string;
       doneReason?: string;
       totalDurationNs?: number;
       evalDurationNs?: number;
@@ -582,10 +584,21 @@ function parseExitCode(result: string | undefined): number | undefined {
   return Number.isFinite(code) ? code : undefined;
 }
 
-function computeTokPerSec(evalCount: number | undefined, evalDurationNs: number | undefined): number | undefined {
+/** Turns shorter than this say nothing about throughput (1 token over ~1 µs reads as 1M tok/s). */
+export const MIN_TOKPS_EVAL_COUNT = 16;
+export const MIN_TOKPS_DURATION_NS = 20_000_000;
+const MAX_PLAUSIBLE_TOKPS = 20_000;
+
+/** tok/s for one turn, or undefined when the sample is too small or the timing is implausible. */
+export function computeTokPerSec(
+  evalCount: number | undefined,
+  evalDurationNs: number | undefined
+): number | undefined {
   if (evalCount == null || evalDurationNs == null) return undefined;
-  if (evalCount < 0 || evalDurationNs <= 0) return undefined;
-  return evalCount / (evalDurationNs / 1e9);
+  if (!Number.isFinite(evalCount) || !Number.isFinite(evalDurationNs)) return undefined;
+  if (evalCount < MIN_TOKPS_EVAL_COUNT || evalDurationNs < MIN_TOKPS_DURATION_NS) return undefined;
+  const rate = evalCount / (evalDurationNs / 1e9);
+  return rate > MAX_PLAUSIBLE_TOKPS ? undefined : rate;
 }
 
 function inheritedIds(input: RunLogInput, active: ActiveRun | null): InheritedIds {
@@ -644,6 +657,7 @@ function normalize(input: RunLogInput, t: number, inherited: InheritedIds): RunL
       const promptEvalCount = optNum(input.promptEvalCount);
       const evalCount = optNum(input.evalCount);
       const reasoningTokens = optNum(input.reasoningTokens);
+      const think = typeof input.think === 'boolean' ? input.think : optStr(input.think, 40);
       const doneReason = optStr(input.doneReason, 80);
       const totalDurationNs = optNum(input.totalDurationNs);
       const evalDurationNs = optNum(input.evalDurationNs);
@@ -664,6 +678,7 @@ function normalize(input: RunLogInput, t: number, inherited: InheritedIds): RunL
         ...(promptEvalCount != null ? { promptEvalCount } : {}),
         ...(evalCount != null ? { evalCount } : {}),
         ...(reasoningTokens != null ? { reasoningTokens } : {}),
+        ...(think !== undefined ? { think } : {}),
         ...(doneReason ? { doneReason } : {}),
         ...(totalDurationNs != null ? { totalDurationNs } : {}),
         ...(evalDurationNs != null ? { evalDurationNs } : {}),
@@ -870,8 +885,13 @@ function noteTurn(rolls: Map<string, RollAcc>, longTurns: RunLogLongTurn[], even
   }
   acc.count += 1;
   if (event.evalCount != null) acc.evalTokens += event.evalCount;
-  if (event.tokPerSec != null) {
-    acc.tokSum += event.tokPerSec;
+  // Re-check: logs written before the sample-size guard can hold 1-token "1,000,000 tok/s" turns.
+  const tokPerSec =
+    event.tokPerSec != null && computeTokPerSec(event.evalCount, event.evalDurationNs) != null
+      ? event.tokPerSec
+      : undefined;
+  if (tokPerSec != null) {
+    acc.tokSum += tokPerSec;
     acc.tokN += 1;
   }
   const wallMs = turnWallMs(event);
@@ -883,7 +903,7 @@ function noteTurn(rolls: Map<string, RollAcc>, longTurns: RunLogLongTurn[], even
     model: event.model,
     wallMs,
     evalCount: event.evalCount ?? 0,
-    tokPerSec: event.tokPerSec ?? null,
+    tokPerSec: tokPerSec ?? null,
     ...(event.doneReason ? { doneReason: event.doneReason } : {})
   });
 }
@@ -1013,6 +1033,397 @@ function collect(list: readonly RunLogEvent[], dropped: number): RunLogStats {
   };
 }
 
+/** A write the workspace refused as a second copy of an existing module. */
+const REJECTED_WRITE_RE = /\bRejected\b[^\n]*\balready exists\b|instead of creating a second copy/i;
+const REPEATED_EDIT_RE = /\bREPEATED_EDIT\b/;
+const NO_OP_REWORK_RE = /changed nothing|wrote the same bytes/i;
+const YAY_TO_NAY_RE = /yay\s*->\s*nay|\(verify failed\)/i;
+/** `done=length` turns whose reasoning took this share of the generated tokens ate the budget. */
+const THINKING_SHARE = 0.8;
+
+export interface RunWasteBucket {
+  count: number;
+  /** Wall time of the distinct turns that produced the waste. */
+  ms: number;
+}
+
+export interface RunWastePair {
+  /** The path as dispatched. */
+  file: string;
+  /** The other dispatched path it resolves to (same file modulo leading folders or case). */
+  duplicateOf: string;
+  stepId?: string;
+}
+
+export interface RunWasteReport {
+  /** Writes refused as duplicates after a full generation. ms = the turns that produced them. */
+  rejectedWrites: RunWasteBucket;
+  /** Swarm tasks in one `swarm-assign` that name the same file. */
+  duplicateDispatch: { count: number; pairs: RunWastePair[] };
+  /** Reviewer turns spent while verify was red, or that ended as `yay->nay (verify failed)`. */
+  reviewerOnRed: RunWasteBucket & { redBeforeReview: number; yayToNay: number };
+  /** Verdict turns that stopped at `done=length` or generated fewer than 16 tokens. */
+  cutOffVerdicts: RunWasteBucket;
+  /** Reworks that changed nothing, plus REPEATED_EDIT tool errors. */
+  noOpReworks: RunWasteBucket & { changedNothing: number; repeatedEdits: number };
+  /** Failing verifies whose compiler fingerprint was already seen in the same run. */
+  repeatedFingerprint: { count: number; fingerprints: Array<{ fingerprint: string; count: number }> };
+  /** Non-verdict turns that hit `done=length` with a tiny or reasoning-dominated output. */
+  thinkingAteBudget: RunWasteBucket;
+  /** Distinct wasted turns, each counted once even when several patterns blame it. */
+  wastedMs: number;
+  /** Wall time of every turn that reported one. */
+  totalTurnMs: number;
+}
+
+interface WasteTurnRef {
+  index: number;
+  ms: number | undefined;
+}
+
+interface WasteReviewTurn extends WasteTurnRef {
+  counted: boolean;
+}
+
+interface WasteBucketAcc extends RunWasteBucket {
+  turns: Set<number>;
+}
+
+function newBucket(): WasteBucketAcc {
+  return { count: 0, ms: 0, turns: new Set<number>() };
+}
+
+function normalizeWastePath(raw: string): string {
+  return raw
+    .replace(/\\/g, '/')
+    .toLowerCase()
+    .replace(/\/{2,}/g, '/')
+    .replace(/^(?:\.\/)+/, '')
+    .replace(/^\/+/, '')
+    .replace(/\/+$/, '')
+    .trim();
+}
+
+/** Assignments that duplicate another assignment in the same list (equal path or `/`-boundary suffix). */
+function duplicateAssignments(items: readonly RunLogAssignment[]): RunWastePair[] {
+  const live = items
+    .filter(item => item.file && !item.skippedReason)
+    .map(item => ({ raw: item.file as string, key: normalizeWastePath(item.file as string) }))
+    .filter(item => item.key.length > 0);
+  const pairs: RunWastePair[] = [];
+  for (let i = 0; i < live.length; i += 1) {
+    const mine = live[i];
+    if (!mine) continue;
+    for (let j = 0; j < live.length; j += 1) {
+      const other = live[j];
+      if (i === j || !other) continue;
+      const same = other.key === mine.key && j < i;
+      const longer = other.key !== mine.key && other.key.endsWith(`/${mine.key}`);
+      if (same || longer) {
+        pairs.push({ file: mine.raw, duplicateOf: other.raw });
+        break;
+      }
+    }
+  }
+  return pairs;
+}
+
+/**
+ * Turns the structured events into counts and estimated wasted wall time per known waste pattern.
+ * Pure: the same events always give the same report. Turn events precede the tool events they
+ * produced, so a tool event is blamed on the most recent turn of the same run.
+ */
+export function analyzeRunWaste(events: readonly RunLogEvent[]): RunWasteReport {
+  const rejected = newBucket();
+  const onRed = newBucket();
+  const cutOff = newBucket();
+  const noOp = newBucket();
+  const thinking = newBucket();
+  const wasted = new Map<number, number>();
+  const pairs: RunWastePair[] = [];
+  const fpCounts = new Map<string, { fingerprint: string; count: number }>();
+  const fpSeen = new Set<string>();
+  let redBeforeReview = 0;
+  let yayToNay = 0;
+  let changedNothing = 0;
+  let repeatedEdits = 0;
+  let repeatedFp = 0;
+  let totalTurnMs = 0;
+  let turnIndex = 0;
+  let runKey: number | undefined;
+  let started = false;
+  let lastTurn: WasteTurnRef | undefined;
+  let reviewTurn: WasteReviewTurn | undefined;
+  let verifyOk: boolean | undefined;
+  let lastNoOpText = '';
+  let step: string | undefined;
+
+  const hit = (bucket: WasteBucketAcc, turn: WasteTurnRef | undefined): void => {
+    bucket.count += 1;
+    if (!turn || turn.ms == null) return;
+    if (!bucket.turns.has(turn.index)) {
+      bucket.turns.add(turn.index);
+      bucket.ms += turn.ms;
+    }
+    wasted.set(turn.index, turn.ms);
+  };
+
+  for (const event of events) {
+    if (!started || event.runId !== runKey) {
+      started = true;
+      runKey = event.runId;
+      lastTurn = undefined;
+      reviewTurn = undefined;
+      verifyOk = undefined;
+      lastNoOpText = '';
+      step = undefined;
+    }
+    if ('stepId' in event && event.stepId) step = event.stepId;
+    switch (event.kind) {
+      case 'turn': {
+        const ms = turnWallMs(event);
+        const ref: WasteTurnRef = { index: turnIndex, ms };
+        turnIndex += 1;
+        if (ms != null) totalTurnMs += ms;
+        lastTurn = ref;
+        const done = event.doneReason?.toLowerCase();
+        const tiny = event.evalCount != null && event.evalCount < MIN_TOKPS_EVAL_COUNT;
+        if (event.phase === 'verdict') {
+          reviewTurn = { ...ref, counted: false };
+          if (!event.aborted && (done === 'length' || tiny)) hit(cutOff, ref);
+          if (verifyOk === false) {
+            redBeforeReview += 1;
+            hit(onRed, ref);
+            reviewTurn.counted = true;
+          }
+        } else if (!event.aborted && done === 'length') {
+          const reasoningHeavy =
+            event.reasoningTokens != null &&
+            event.evalCount != null &&
+            event.evalCount > 0 &&
+            event.reasoningTokens >= event.evalCount * THINKING_SHARE;
+          if (tiny || reasoningHeavy) hit(thinking, ref);
+        }
+        break;
+      }
+      case 'tool': {
+        const result = event.result ?? '';
+        if (toolStatusIsError(event.status) && REJECTED_WRITE_RE.test(result)) hit(rejected, lastTurn);
+        if (REPEATED_EDIT_RE.test(result)) {
+          repeatedEdits += 1;
+          hit(noOp, lastTurn);
+        }
+        break;
+      }
+      case 'verify': {
+        verifyOk = event.ok;
+        const fp = event.fingerprint;
+        if (!event.ok && fp && fp.toLowerCase() !== 'none') {
+          const key = `${event.runId ?? ''}|${fp}`;
+          const seen = fpCounts.get(fp) ?? { fingerprint: fp, count: 0 };
+          if (fpSeen.has(key)) {
+            repeatedFp += 1;
+            seen.count += 1;
+            fpCounts.set(fp, seen);
+          } else {
+            fpSeen.add(key);
+          }
+        }
+        break;
+      }
+      case 'verdict': {
+        if (event.result === 'nay' && event.text && YAY_TO_NAY_RE.test(event.text)) {
+          if (!reviewTurn?.counted) {
+            yayToNay += 1;
+            hit(onRed, reviewTurn);
+          }
+        }
+        reviewTurn = undefined;
+        break;
+      }
+      case 'info':
+      case 'notice':
+      case 'escalate':
+      case 'error': {
+        if (NO_OP_REWORK_RE.test(event.text) && event.text !== lastNoOpText) {
+          lastNoOpText = event.text;
+          changedNothing += 1;
+          noOp.count += 1;
+        }
+        break;
+      }
+      case 'swarm-assign': {
+        for (const pair of duplicateAssignments(event.assignments)) {
+          pairs.push(step ? { ...pair, stepId: step } : pair);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  let wastedMs = 0;
+  for (const ms of wasted.values()) wastedMs += ms;
+  const fingerprints = [...fpCounts.values()].sort(
+    (a, b) => b.count - a.count || compareText(a.fingerprint, b.fingerprint)
+  );
+  return {
+    rejectedWrites: { count: rejected.count, ms: rejected.ms },
+    duplicateDispatch: { count: pairs.length, pairs },
+    reviewerOnRed: { count: onRed.count, ms: onRed.ms, redBeforeReview, yayToNay },
+    cutOffVerdicts: { count: cutOff.count, ms: cutOff.ms },
+    noOpReworks: { count: noOp.count, ms: noOp.ms, changedNothing, repeatedEdits },
+    repeatedFingerprint: { count: repeatedFp, fingerprints },
+    thinkingAteBudget: { count: thinking.count, ms: thinking.ms },
+    wastedMs,
+    totalTurnMs
+  };
+}
+
+/** `4s`, `6m12s`. Sub-second waste reads `<1s` so a nonzero item never shows as zero. */
+export function formatWasteDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '0s';
+  const total = Math.round(ms / 1000);
+  if (total < 1) return '<1s';
+  if (total < 60) return `${total}s`;
+  return `${Math.floor(total / 60)}m${String(total % 60).padStart(2, '0')}s`;
+}
+
+/** Header lines for the Markdown log: only nonzero items, then the estimated total. */
+export function formatRunWasteLines(report: RunWasteReport): string[] {
+  const parts: string[] = [];
+  const add = (label: string, count: number, ms?: number): void => {
+    if (count <= 0) return;
+    parts.push(ms != null && ms > 0 ? `${label} ${count} (~${formatWasteDuration(ms)})` : `${label} ${count}`);
+  };
+  add('rejected-writes', report.rejectedWrites.count, report.rejectedWrites.ms);
+  add('duplicate-dispatch', report.duplicateDispatch.count);
+  add('reviewer-on-red', report.reviewerOnRed.count, report.reviewerOnRed.ms);
+  add('cut-off-verdicts', report.cutOffVerdicts.count, report.cutOffVerdicts.ms);
+  add('no-op-reworks', report.noOpReworks.count, report.noOpReworks.ms);
+  add('repeated-fingerprint', report.repeatedFingerprint.count);
+  add('thinking-ate-budget', report.thinkingAteBudget.count, report.thinkingAteBudget.ms);
+  if (parts.length === 0) return ['waste: none'];
+  const lines = [`waste: ${parts.join(', ')}`];
+  if (report.wastedMs > 0 && report.totalTurnMs > 0) {
+    lines.push(
+      `est. wasted ~${formatWasteDuration(report.wastedMs)} of ${formatWasteDuration(report.totalTurnMs)} total`
+    );
+  }
+  return lines;
+}
+
+export interface RunStepSummary {
+  /** `-` for turns before any step started (the first Planner turns). */
+  stepId: string;
+  coderMs: number;
+  reviewMs: number;
+  /** Planner, assist and any other role. */
+  otherMs: number;
+  turns: number;
+  reworks: number;
+  heals: number;
+  verifyFailures: number;
+  /** In order: `yay`, `nay`, `yay->nay`, `missing`. */
+  verdicts: string[];
+}
+
+export interface RunTurnCost {
+  t: number;
+  runId?: number;
+  stepId: string;
+  role: string;
+  model: string;
+  phase?: string;
+  wallMs: number;
+  evalCount: number;
+  doneReason?: string;
+}
+
+/**
+ * Per-step time and event rollup plus the most expensive turns. Turn events carry no step id, so
+ * a turn belongs to the last step id seen before it in the same run.
+ */
+export function summarizeRunSteps(
+  events: readonly RunLogEvent[],
+  topN = TOP_TURNS
+): { steps: RunStepSummary[]; topTurns: RunTurnCost[] } {
+  const order: string[] = [];
+  const rows = new Map<string, RunStepSummary>();
+  const costs: RunTurnCost[] = [];
+  const rowFor = (id: string): RunStepSummary => {
+    let row = rows.get(id);
+    if (!row) {
+      row = {
+        stepId: id,
+        coderMs: 0,
+        reviewMs: 0,
+        otherMs: 0,
+        turns: 0,
+        reworks: 0,
+        heals: 0,
+        verifyFailures: 0,
+        verdicts: []
+      };
+      rows.set(id, row);
+      order.push(id);
+    }
+    return row;
+  };
+  let runKey: number | undefined;
+  let started = false;
+  let current = '-';
+  for (const event of events) {
+    if (!started || event.runId !== runKey) {
+      started = true;
+      runKey = event.runId;
+      current = '-';
+    }
+    if ('stepId' in event && event.stepId) current = event.stepId;
+    switch (event.kind) {
+      case 'turn': {
+        const row = rowFor(current);
+        const ms = turnWallMs(event) ?? 0;
+        row.turns += 1;
+        if (event.phase === 'verdict') row.reviewMs += ms;
+        else if (event.role === 'coder') row.coderMs += ms;
+        else row.otherMs += ms;
+        costs.push({
+          t: event.t,
+          ...(event.runId != null ? { runId: event.runId } : {}),
+          stepId: current,
+          role: event.role,
+          model: event.model,
+          ...(event.phase ? { phase: event.phase } : {}),
+          wallMs: ms,
+          evalCount: event.evalCount ?? 0,
+          ...(event.doneReason ? { doneReason: event.doneReason } : {})
+        });
+        break;
+      }
+      case 'verdict': {
+        const label = event.result === 'nay' && event.text && YAY_TO_NAY_RE.test(event.text) ? 'yay->nay' : event.result;
+        rowFor(current).verdicts.push(label);
+        break;
+      }
+      case 'heal':
+        rowFor(current).heals += 1;
+        break;
+      case 'verify':
+        if (!event.ok) rowFor(current).verifyFailures += 1;
+        break;
+      case 'info':
+        if (/^Rework #\d+ of step/i.test(event.text)) rowFor(current).reworks += 1;
+        break;
+      default:
+        break;
+    }
+  }
+  costs.sort((a, b) => b.wallMs - a.wallMs || b.evalCount - a.evalCount || a.t - b.t);
+  return { steps: order.map(id => rows.get(id) as RunStepSummary), topTurns: costs.slice(0, Math.max(0, topN)) };
+}
+
 function compareText(a: string, b: string): number {
   if (a < b) return -1;
   if (a > b) return 1;
@@ -1037,7 +1448,7 @@ function render(
   lines.push('');
   lines.push(heading('SUMMARY', mode));
   lines.push('');
-  for (const line of summaryLines(stats, anchors, unscoped)) lines.push(line);
+  for (const line of summaryLines(stats, anchors, unscoped, list)) lines.push(line);
   lines.push('');
   lines.push(heading('TIMELINE', mode));
   lines.push('');
@@ -1104,7 +1515,12 @@ function settingLines(settings: RunLogSettings): string[] {
   return lines;
 }
 
-function summaryLines(stats: RunLogStats, anchors: Map<number, RunAnchor>, unscoped: number | undefined): string[] {
+function summaryLines(
+  stats: RunLogStats,
+  anchors: Map<number, RunAnchor>,
+  unscoped: number | undefined,
+  list: readonly RunLogEvent[]
+): string[] {
   const lines: string[] = [];
   if (stats.turns.length === 0) lines.push('turns: none');
   else {
@@ -1117,6 +1533,7 @@ function summaryLines(stats: RunLogStats, anchors: Map<number, RunAnchor>, unsco
   const counts = kindCountLine(stats);
   lines.push(counts ? `counts: ${counts}` : 'counts: none');
   lines.push(`failures: ${failureLine(stats.failures)}`);
+  for (const line of formatRunWasteLines(analyzeRunWaste(list))) lines.push(line);
   if (stats.repeatedErrors.length === 0) lines.push('repeated-errors: none');
   else {
     lines.push('repeated-errors:');
@@ -1315,6 +1732,7 @@ function viewTurn(event: StoredTurn & { t: number; runId?: number; conversationI
       event.promptEvalCount != null ? `promptEval=${event.promptEvalCount}` : undefined,
       event.evalCount != null ? `eval=${event.evalCount}` : undefined,
       event.reasoningTokens != null ? `reasoning=${event.reasoningTokens}` : undefined,
+      event.think !== undefined ? `think=${thinkLabel(event.think)}` : undefined,
       event.tokPerSec != null ? `${formatRate(event.tokPerSec)} tok/s` : undefined,
       event.doneReason ? `done=${oneLine(event.doneReason, 40)}` : undefined,
       event.wallMs != null ? `wall=${formatDuration(event.wallMs)}` : undefined,
@@ -1326,6 +1744,11 @@ function viewTurn(event: StoredTurn & { t: number; runId?: number; conversationI
     ...(err.detail ? { detail: err.detail } : {}),
     fence: false
   };
+}
+
+function thinkLabel(value: boolean | string): string {
+  if (typeof value === 'boolean') return value ? 'on' : 'off';
+  return oneLine(value, 40);
 }
 
 function viewTool(event: Extract<RunLogEvent, { kind: 'tool' }>, rel: string): EventView {

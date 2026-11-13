@@ -55,7 +55,8 @@ assert.equal(next.activeStepId, '4');
 assert.equal(next.steps.find(s => s.id === '3')?.status, 'failed');
 assert.match(next.steps.find(s => s.id === '3')?.reviewNote || '', /TS2488/);
 assert.equal(next.steps.find(s => s.id === '4')?.status, 'in_progress');
-assert.equal(next.healAttempts, 3);
+// The next step gets its own heal budget; the failed step stays exhausted.
+assert.equal(next.healAttempts, 0);
 assert.equal(next.steps.find(s => s.id === '3')?.healExhausted, true);
 
 const last = continuePastFailedStep(
@@ -67,6 +68,7 @@ assert.equal(last.status, 'active');
 assert.equal(last.blockedReason, undefined);
 assert.equal(planHasDebt(last), true);
 assert.equal(last.activeStepId, null);
+assert.equal(last.healAttempts, 3);
 
 const brain = emptyProjectBrain();
 const rules = 'never add a second Board component. ' + 'x'.repeat(8000);

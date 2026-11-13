@@ -1,5 +1,10 @@
 import { ChatEvent, PullEvent } from '../types';
 import { detectRepeatedToolTagSpam } from './agentLoop';
+import {
+  frontierThinkLabel,
+  noteReasoningObservation,
+  splitInlineThinking
+} from './modelProfile';
 
 export type StreamFailureCode = 'idle_timeout' | 'absolute_timeout' | 'stall' | 'aborted' | 'stream_error';
 
@@ -73,6 +78,8 @@ export interface ChatResult {
   /** User cancel or tool-spam cut. Do not apply tool calls when this is true. */
   aborted: boolean;
   stats: ChatEvent['stats'];
+  /** `think` the request carried (local), or 'hidden' for a known reasoning frontier model. */
+  think?: boolean | string;
   /** Stream stopped because the model repeated the same tool tag. */
   toolSpamAborted?: boolean;
   abortReason?: 'user' | 'tool_spam';
@@ -113,6 +120,10 @@ export function streamChat(
   let frame = 0;
   let spamAborted = false;
   let settled = false;
+  const frontier = nodeType === 'openai' || !!apiKey;
+  const sentThink = body.think as boolean | string | undefined;
+  // Local: the `think` value sent. Frontier: 'hidden' when the model is known to reason.
+  const thinkLabel: boolean | string | undefined = frontier ? frontierThinkLabel(String(body.model || '')) : sentThink;
 
   const fail = (
     reject: (err: StreamChatError) => void,
@@ -173,7 +184,25 @@ export function streamChat(
         if (spamAborted || settled) return;
         if (frame) cancelAnimationFrame(frame);
         onDelta(content, thinking);
-        if (e.type === 'done') settle({ content, thinking, aborted: false, stats: e.stats });
+        if (e.type === 'done') {
+          // Inline <think> blocks belong to `thinking`, never to the reply that tools/verdicts parse.
+          const split = splitInlineThinking(content);
+          const stats = e.stats;
+          if (frontier) {
+            noteReasoningObservation(String(body.model || ''), {
+              reasoningTokens: stats?.reasoningTokens,
+              doneReason: stats?.doneReason,
+              visibleContent: split.content
+            });
+          }
+          settle({
+            content: split.content,
+            thinking: split.thinking ? (thinking ? `${thinking}\n${split.thinking}` : split.thinking) : thinking,
+            aborted: false,
+            stats,
+            ...(thinkLabel !== undefined ? { think: thinkLabel } : {})
+          });
+        }
         else if (e.type === 'aborted') {
           // A timeout that the main process reports as an abort is still a retriable failure.
           const cls = classifyStreamError(e.error, { retriable: e.retriable, code: e.code });

@@ -52,6 +52,9 @@ import {
 import { isWebConsoleClient } from './lib/hostApi';
 import { stopUnfinishedConversation } from './lib/nodeWork';
 
+/** Minimum gap between live-session publishes that carry the full chat mirror. */
+const MIRROR_MIN_INTERVAL_MS = 750;
+
 /** Token totals mirrored from the desktop live session onto the web console. */
 type SessionTokenMirror = {
   localTokensGenerated: number;
@@ -59,6 +62,11 @@ type SessionTokenMirror = {
   tokenStatsScope?: 'global' | 'project';
   workspaceTokenUsage?: AppSettings['workspaceTokenUsage'];
 };
+
+/** New chats start on Planner so a request gets a plan, whatever tab the last run left selected. */
+const PLANNER_AGENT_ID =
+  DEFAULT_SETTINGS.agents.find(a => a.handle === 'planner' || a.id === 'planner')?.id ||
+  DEFAULT_SETTINGS.agents[0].id;
 
 function finiteToken(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
@@ -247,10 +255,7 @@ export const App: React.FC = () => {
       loaded: []
     }))
   );
-  const [selectedAgentId, setSelectedAgentId] = useState<string>(
-    DEFAULT_SETTINGS.agents.find(a => a.handle === 'planner' || a.id === 'planner')?.id ||
-      DEFAULT_SETTINGS.agents[0].id
-  );
+  const [selectedAgentId, setSelectedAgentId] = useState<string>(PLANNER_AGENT_ID);
   const [activeConversationId, setActiveConversationId] = useState<string | undefined>(undefined);
   const loadedWorkspaceRef = useRef('');
   const forceNewChatRef = useRef(false);
@@ -342,6 +347,12 @@ export const App: React.FC = () => {
     messages: ChatMessage[];
   } | null>(null);
   const [conductorTick, setConductorTick] = useState(0);
+  /** Desktop only: authenticated web console clients. The chat mirror is published only while > 0. */
+  const [webClientCount, setWebClientCount] = useState(0);
+  const webClientCountRef = useRef(0);
+  const lastMirrorSentRef = useRef<{ conversationId: string; messages: ChatMessage[] } | null>(null);
+  const lastMirrorSentAtRef = useRef(0);
+  const mirrorTrailTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /** Bump after local chat writes so every peer reloads from disk. */
   const markChatsSaved = useCallback(() => {
@@ -719,6 +730,36 @@ export const App: React.FC = () => {
     };
   }, [isRemoteClient, applyLiveSession]);
 
+  // The desktop learns when a web console attaches so it can publish the chat mirror for it.
+  useEffect(() => {
+    if (isRemoteClient || !window.electronAPI?.onWebClientCount) return;
+    let cancelled = false;
+    const apply = (count: number) => {
+      const next = Number.isFinite(count) && count > 0 ? Math.floor(count) : 0;
+      if (cancelled || next === webClientCountRef.current) return;
+      webClientCountRef.current = next;
+      // A new or returning client has no mirror yet; the next publish must carry it.
+      lastMirrorSentRef.current = null;
+      setWebClientCount(next);
+    };
+    const unsub = window.electronAPI.onWebClientCount(apply);
+    void window.electronAPI.webConsoleGetStatus?.().then(status => {
+      const count = (status as { clientCount?: number } | undefined)?.clientCount;
+      if (typeof count === 'number') apply(count);
+    });
+    return () => {
+      cancelled = true;
+      unsub?.();
+    };
+  }, [isRemoteClient]);
+
+  useEffect(
+    () => () => {
+      if (mirrorTrailTimerRef.current) clearTimeout(mirrorTrailTimerRef.current);
+    },
+    []
+  );
+
   // Every surface publishes so peers mirror workspace / chat / tab focus.
   useEffect(() => {
     if (!window.electronAPI?.publishLiveSession) return;
@@ -726,6 +767,30 @@ export const App: React.FC = () => {
     if (publishTimerRef.current) clearTimeout(publishTimerRef.current);
     publishTimerRef.current = setTimeout(() => {
       if (applyingRemoteRef.current) return;
+      // Send the full conversation only to a web console, only when it changed, and at most every
+      // 750 ms so a streaming turn does not re-serialize ~1 MB several times a second.
+      let chatMirror: typeof localChatMirrorRef.current | undefined;
+      if (isRemoteClient || webClientCountRef.current > 0) {
+        const mirror = localChatMirrorRef.current;
+        const sent = lastMirrorSentRef.current;
+        const changed = !(
+          mirror === sent ||
+          (mirror && sent && mirror.conversationId === sent.conversationId && mirror.messages === sent.messages)
+        );
+        if (changed) {
+          const wait = MIRROR_MIN_INTERVAL_MS - (Date.now() - lastMirrorSentAtRef.current);
+          if (wait <= 0 || !sent) {
+            chatMirror = mirror;
+            lastMirrorSentRef.current = mirror;
+            lastMirrorSentAtRef.current = Date.now();
+          } else if (!mirrorTrailTimerRef.current) {
+            mirrorTrailTimerRef.current = setTimeout(() => {
+              mirrorTrailTimerRef.current = null;
+              setConductorTick(t => t + 1);
+            }, wait);
+          }
+        }
+      }
       const tokenMirror =
         !isRemoteClient && settingsReady
           ? {
@@ -745,7 +810,7 @@ export const App: React.FC = () => {
         activeTabPath: activeTabPath || null,
         openTabPaths: openTabs.map(t => t.path),
         conductor: localConductorRef.current,
-        chatMirror: localChatMirrorRef.current,
+        chatMirror,
         // Desktop owns token totals. Web clients omit them so a zero snapshot cannot wipe the mirror.
         ...tokenMirror,
         source: isRemoteClient ? 'web' : 'desktop',
@@ -770,7 +835,8 @@ export const App: React.FC = () => {
     chatsTick,
     activeTabPath,
     openTabs,
-    conductorTick
+    conductorTick,
+    webClientCount
   ]);
 
   const handleLiveConductorPublish = useCallback(
@@ -876,12 +942,12 @@ export const App: React.FC = () => {
         );
         let active = loaded.activeConversationId || undefined;
         if (wantNewChat) {
-          const fresh = createConversation(workspacePath, selectedAgentId);
+          const fresh = createConversation(workspacePath, PLANNER_AGENT_ID);
           forWs = [fresh, ...forWs];
           active = fresh.id;
         } else if (!forWs.some(c => c.id === active)) {
           if (!forWs.length) {
-            const fresh = createConversation(workspacePath, selectedAgentId);
+            const fresh = createConversation(workspacePath, PLANNER_AGENT_ID);
             forWs = [fresh];
             active = fresh.id;
           } else {
@@ -889,6 +955,7 @@ export const App: React.FC = () => {
           }
         }
         setActiveConversationId(active);
+        setSelectedAgentId(PLANNER_AGENT_ID);
         const conversations = replaceWorkspaceConversations(prev.conversations, workspacePath, forWs);
         const next = {
           ...prev,
@@ -910,7 +977,7 @@ export const App: React.FC = () => {
       cancelled = true;
       if (loadedWorkspaceRef.current === key) loadedWorkspaceRef.current = '';
     };
-  }, [workspacePath, workspaceEpoch, selectedAgentId]);
+  }, [workspacePath, workspaceEpoch]);
 
   // Track the desktop row so maximize / restore reclamps without saving the clamped size.
   useEffect(() => {
@@ -1135,8 +1202,9 @@ export const App: React.FC = () => {
 
   /** New Chat adds a thread. Project brain and older chats stay. */
   const handleNewChat = () => {
-    const fresh = createConversation(workspacePath, selectedAgentId);
+    const fresh = createConversation(workspacePath, PLANNER_AGENT_ID);
     setActiveConversationId(fresh.id);
+    setSelectedAgentId(PLANNER_AGENT_ID);
     setSettings(prev => {
       const existing = conversationsForWorkspace(prev.conversations, workspacePath);
       const conversations = replaceWorkspaceConversations(prev.conversations, workspacePath, [
@@ -1164,8 +1232,9 @@ export const App: React.FC = () => {
 
   /** Explicit wipe of chat threads. Project files and project.json stay. */
   const handleClearProjectChats = () => {
-    const fresh = createConversation(workspacePath, selectedAgentId);
+    const fresh = createConversation(workspacePath, PLANNER_AGENT_ID);
     setActiveConversationId(fresh.id);
+    setSelectedAgentId(PLANNER_AGENT_ID);
     setSettings(prev => {
       const conversations = replaceWorkspaceConversations(prev.conversations, workspacePath, [
         fresh
@@ -1214,9 +1283,10 @@ export const App: React.FC = () => {
         if (forWs[0]) {
           nextActive = forWs[0].id;
         } else {
-          const fresh = createConversation(workspacePath, selectedAgentId);
+          const fresh = createConversation(workspacePath, PLANNER_AGENT_ID);
           remaining.unshift(fresh);
           nextActive = fresh.id;
+          setSelectedAgentId(PLANNER_AGENT_ID);
         }
         setActiveConversationId(nextActive);
       }
@@ -1732,6 +1802,7 @@ export const App: React.FC = () => {
     nodes,
     activeTab: openTabs.find(t => t.path === activeTabPath),
     workspacePath,
+    workspaceEpoch,
     workspaceFiles: files,
     controlWidth: agentControlWidth,
     onControlWidthChange: (w: number) => {

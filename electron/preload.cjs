@@ -60,6 +60,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Agent tools (scoped to workspace root in the main process)
   execTool: (root, name, args) => ipcRenderer.invoke('tools:exec', root, name, args),
   typecheckWorkspace: (root, opts) => ipcRenderer.invoke('workspace:typecheck', root, opts),
+  renderCheckWorkspace: (root, opts) => ipcRenderer.invoke('workspace:renderCheck', root, opts),
   installWorkspaceDeps: (root, opts) => ipcRenderer.invoke('workspace:installDeps', root, opts),
   hasPackageJson: root => ipcRenderer.invoke('workspace:hasPackageJson', root),
   webSearch: (baseUrl, query) => ipcRenderer.invoke('web:search', baseUrl, query),
@@ -109,5 +110,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Live session mirror (desktop publishes; web console follows)
   getLiveSession: () => ipcRenderer.invoke('session:get'),
   publishLiveSession: snapshot => ipcRenderer.invoke('session:publish', snapshot || {}),
-  onLiveSession: subscribe('session:changed')
+  onLiveSession: subscribe('session:changed'),
+  // Authenticated web console connections; the chat mirror is only published while this is > 0.
+  onWebClientCount: subscribe('session:webClients')
 });

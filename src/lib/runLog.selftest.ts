@@ -3,7 +3,12 @@
  */
 import assert from 'node:assert/strict';
 import {
+  analyzeRunWaste,
+  computeTokPerSec,
   createRunLog,
+  formatRunWasteLines,
+  formatWasteDuration,
+  summarizeRunSteps,
   redactRunLogText,
   runLogFileName,
   runLogPath,
@@ -346,6 +351,25 @@ assert.deepEqual(
   assert.match(log.formatMarkdown(), /50 tok\/s/);
 }
 
+// Tiny samples must not produce absurd tok/s or poison the role average
+assert.equal(computeTokPerSec(1, 1_000), undefined, 'eval=1 over 1 microsecond');
+assert.equal(computeTokPerSec(15, 2_000_000_000), undefined, 'below the minimum eval count');
+assert.equal(computeTokPerSec(100, 1_000_000), undefined, 'duration under 20 ms');
+assert.equal(computeTokPerSec(100, 0), undefined);
+assert.equal(computeTokPerSec(16, 1_000_000_000), 16);
+assert.equal(computeTokPerSec(200, 2_000_000_000), 100);
+{
+  const log = createRunLog({ now: () => 5 });
+  log.add({ kind: 'turn', role: 'coder', model: 'qwen', evalCount: 1, evalDurationNs: 1_000 });
+  log.add({ kind: 'turn', role: 'coder', model: 'qwen', evalCount: 100, evalDurationNs: 2_000_000_000 });
+  const turns = log.events().filter(e => e.kind === 'turn');
+  if (turns[0]?.kind === 'turn') assert.equal(turns[0].tokPerSec, undefined);
+  if (turns[1]?.kind === 'turn') assert.equal(turns[1].tokPerSec, 50);
+  assert.doesNotMatch(log.formatMarkdown(), /1,?000,?000/);
+  const stats = log.stats();
+  assert.equal(stats.turns[0]?.avgTokPerSec, 50);
+}
+
 {
   const log = createRunLog({ now: () => 6 });
   log.add({ kind: 'tool', name: 'a', status: 'error', result: 'Exit code: 1\ntool-a-failed' });
@@ -532,5 +556,166 @@ const cutKeyBody = 'A1b2C3d4E5'.repeat(4);
 const cutKeyOutput = 'Exit code: 1\nprefix sk-' + cutKeyBody + ' ' + 'p'.repeat(759);
 const cutKeyShaped = shapeToolForRunLog({ name: 'run_command', result: cutKeyOutput });
 assert.ok(!(cutKeyShaped.result || '').includes(cutKeyBody));
+
+// Turn think / reasoning fields: optional, clean, rendered only when present
+{
+  const log = createRunLog({ now: () => 1_000 });
+  log.add({ kind: 'turn', t: 1_000, role: 'coder', model: 'm', wallMs: 1000 });
+  log.add({ kind: 'turn', t: 2_000, role: 'coder', model: 'm', think: true, reasoningTokens: 120, wallMs: 1000 });
+  log.add({ kind: 'turn', t: 3_000, role: 'coder', model: 'm', think: false, wallMs: 1000 });
+  log.add({ kind: 'turn', t: 4_000, role: 'coder', model: 'm', think: ' high ', wallMs: 1000 });
+  log.add({ kind: 'turn', t: 5_000, role: 'coder', model: 'm', think: '  ', wallMs: 1000 });
+  log.add({ kind: 'turn', t: 6_000, role: 'coder', model: 'm', think: 7 as unknown as string, wallMs: 1000 });
+  const turns = log.events().filter(event => event.kind === 'turn');
+  const thinkOf = (index: number): unknown => (turns[index] as { think?: unknown }).think;
+  assert.equal('think' in (turns[0] as object), false);
+  assert.equal(thinkOf(1), true);
+  assert.equal(thinkOf(2), false);
+  assert.equal(thinkOf(3), 'high');
+  assert.equal('think' in (turns[4] as object), false);
+  assert.equal('think' in (turns[5] as object), false);
+  const md = log.formatMarkdown();
+  const turnLines = md.split('\n').filter(line => / turn coder\/m/.test(line));
+  assert.equal(turnLines.length, 6);
+  assert.doesNotMatch(turnLines[0] ?? '', /think=|reasoning=/);
+  assert.match(turnLines[1] ?? '', /reasoning=120 think=on /);
+  assert.match(turnLines[2] ?? '', / think=off /);
+  assert.match(turnLines[3] ?? '', / think=high /);
+  assert.doesNotMatch(turnLines[4] ?? '', /think=/);
+  assert.doesNotMatch(turnLines[5] ?? '', /think=/);
+}
+
+// analyzeRunWaste: synthetic events, one per waste pattern
+{
+  assert.equal(formatWasteDuration(0), '0s');
+  assert.equal(formatWasteDuration(400), '<1s');
+  assert.equal(formatWasteDuration(4_300), '4s');
+  assert.equal(formatWasteDuration(372_000), '6m12s');
+  assert.equal(formatWasteDuration(65_000), '1m05s');
+
+  // Empty and clean logs report nothing wasted.
+  const empty = analyzeRunWaste([]);
+  assert.equal(empty.wastedMs, 0);
+  assert.deepEqual(formatRunWasteLines(empty), ['waste: none']);
+  assert.match(createRunLog({ now: () => 0 }).formatMarkdown(), /^waste: none$/m);
+
+  const log = createRunLog({ now: () => 0 });
+  let at = 0;
+  const tick = (secs: number): number => {
+    at += secs * 1000;
+    return at;
+  };
+  log.startRun({ runId: 1, conversationId: 'c' });
+  // (2) one swarm-assign naming the same file twice (leading folder, slashes, case) and one distinct file
+  log.add({
+    kind: 'swarm-assign',
+    t: tick(1),
+    assignments: [
+      { wave: 0, file: 'src/scene/constants.ts', node: 'a', model: 'm' },
+      { wave: 1, file: 'scene\\Constants.ts', node: 'a', model: 'm' },
+      { wave: 2, file: 'src/scene/Board.tsx', node: 'a', model: 'm' },
+      { wave: 3, file: 'Board.tsx', node: 'a', model: 'm', skippedReason: 'skipped' },
+      { wave: 4, file: 'src/xscene/constants.ts', node: 'a', model: 'm' }
+    ]
+  });
+  // (1) two rejected writes from one 10 s turn count twice but blame the turn once; plus one from a 5 s turn
+  log.add({ kind: 'turn', t: tick(10), role: 'coder', model: 'm', phase: 'swarm-worker', evalCount: 500, wallMs: 10_000, doneReason: 'stop' });
+  const rejected = 'Rejected scene/constants.ts: that module already exists as src/scene/constants.ts. Edit it instead of creating a second copy.';
+  log.add({ kind: 'tool', t: at, name: 'write_file', path: 'scene/constants.ts', status: 'error', stepId: '1', result: rejected });
+  log.add({ kind: 'tool', t: at, name: 'write_file', path: 'scene/constants.ts', status: 'error', stepId: '1', result: rejected });
+  log.add({ kind: 'turn', t: tick(5), role: 'coder', model: 'm', phase: 'swarm-worker', evalCount: 300, wallMs: 5_000, doneReason: 'stop' });
+  log.add({ kind: 'tool', t: at, name: 'write_file', path: 'scene/Board.tsx', status: 'error', stepId: '1', result: rejected });
+  // a successful write is not waste
+  log.add({ kind: 'tool', t: at, name: 'write_file', path: 'src/ok.ts', status: 'done', stepId: '1' });
+  // (6) the same fingerprint failing three times, plus fp=none and a different fingerprint
+  log.add({ kind: 'verify', t: tick(1), ok: false, fingerprint: 'fpA_2', stepId: '1', output: 'error TS6133' });
+  log.add({ kind: 'verify', t: tick(1), ok: false, fingerprint: 'fpA_2', stepId: '1', output: 'error TS6133' });
+  // (3a) reviewer turn spent while verify is red (4 s), nay that does not read yay->nay
+  log.add({ kind: 'turn', t: tick(4), role: 'reviewer', model: 'cloud', phase: 'verdict', evalCount: 300, wallMs: 4_000, doneReason: 'stop' });
+  log.add({ kind: 'verdict', t: tick(1), result: 'nay', stepId: '1', text: 'bugs remain' });
+  log.add({ kind: 'verify', t: tick(1), ok: false, fingerprint: 'fpA_2', stepId: '1' });
+  log.add({ kind: 'verify', t: tick(1), ok: false, fingerprint: 'fpB_1', stepId: '1' });
+  log.add({ kind: 'verify', t: tick(1), ok: true, fingerprint: 'none', stepId: '1' });
+  // (3b) verify green before review, but the post-review verify flips yay->nay (3 s turn)
+  log.add({ kind: 'turn', t: tick(3), role: 'reviewer', model: 'cloud', phase: 'verdict', evalCount: 300, wallMs: 3_000, doneReason: 'stop' });
+  log.add({ kind: 'verify', t: tick(1), ok: false, fingerprint: 'fpC_1', stepId: '1' });
+  log.add({ kind: 'verdict', t: tick(0), result: 'nay', stepId: '1', text: 'yay->nay (verify failed)' });
+  // (4) cut-off verdicts: done=length, tiny eval (2 s each; the tiny one while verify is red is also on-red)
+  log.add({ kind: 'turn', t: tick(2), role: 'reviewer', model: 'cloud', phase: 'verdict', evalCount: 800, wallMs: 2_000, doneReason: 'length' });
+  log.add({ kind: 'verdict', t: tick(0), result: 'missing', stepId: '1' });
+  log.add({ kind: 'verify', t: tick(1), ok: true, stepId: '1' });
+  log.add({ kind: 'turn', t: tick(2), role: 'reviewer', model: 'cloud', phase: 'verdict', evalCount: 9, wallMs: 2_000, doneReason: 'stop' });
+  log.add({ kind: 'verdict', t: tick(0), result: 'missing', stepId: '1' });
+  // (7) a coder turn where thinking ate the budget (6 s), and a healthy done=length turn that did not
+  log.add({ kind: 'turn', t: tick(6), role: 'coder', model: 'm', phase: 'coder', evalCount: 4, wallMs: 6_000, doneReason: 'length', think: true });
+  log.add({ kind: 'turn', t: tick(6), role: 'coder', model: 'm', phase: 'coder', evalCount: 1000, reasoningTokens: 100, wallMs: 6_000, doneReason: 'length' });
+  // (5) no-op rework, duplicated across notice+info with the same text, and a REPEATED_EDIT tool error
+  log.add({ kind: 'info', t: tick(1), stepId: '1', text: 'Rework changed nothing: the Coder wrote the same bytes again' });
+  log.add({ kind: 'info', t: at, stepId: '1', text: 'Rework changed nothing: the Coder wrote the same bytes again' });
+  log.add({ kind: 'turn', t: tick(3), role: 'coder', model: 'm', phase: 'swarm-worker', evalCount: 90, wallMs: 3_000, doneReason: 'stop' });
+  log.add({ kind: 'tool', t: at, name: 'edit_file', path: 'src/x.ts', status: 'error', stepId: '1', result: 'REPEATED_EDIT: identical hunk' });
+
+  const waste = analyzeRunWaste(log.events());
+  assert.equal(waste.rejectedWrites.count, 3);
+  assert.equal(waste.rejectedWrites.ms, 15_000);
+  assert.equal(waste.duplicateDispatch.count, 1);
+  assert.deepEqual(waste.duplicateDispatch.pairs, [{ file: 'scene\\Constants.ts', duplicateOf: 'src/scene/constants.ts' }]);
+  assert.equal(waste.repeatedFingerprint.count, 2);
+  assert.deepEqual(waste.repeatedFingerprint.fingerprints, [{ fingerprint: 'fpA_2', count: 2 }]);
+  assert.equal(waste.reviewerOnRed.count, 3);
+  assert.equal(waste.reviewerOnRed.redBeforeReview, 2);
+  assert.equal(waste.reviewerOnRed.yayToNay, 1);
+  assert.equal(waste.reviewerOnRed.ms, 4_000 + 3_000 + 2_000);
+  assert.equal(waste.cutOffVerdicts.count, 2);
+  assert.equal(waste.cutOffVerdicts.ms, 4_000);
+  assert.equal(waste.thinkingAteBudget.count, 1);
+  assert.equal(waste.thinkingAteBudget.ms, 6_000);
+  assert.equal(waste.noOpReworks.changedNothing, 1);
+  assert.equal(waste.noOpReworks.repeatedEdits, 1);
+  assert.equal(waste.noOpReworks.count, 2);
+  assert.equal(waste.noOpReworks.ms, 3_000);
+  // Nine turns, 41 s. Every turn but the healthy done=length one (6 s) is blamed once: 35 s.
+  assert.equal(waste.totalTurnMs, 41_000);
+  assert.equal(waste.wastedMs, 35_000);
+
+  const lines = formatRunWasteLines(waste);
+  assert.match(
+    lines[0] ?? '',
+    /^waste: rejected-writes 3 \(~15s\), duplicate-dispatch 1, reviewer-on-red 3 \(~9s\), cut-off-verdicts 2 \(~4s\), no-op-reworks 2 \(~3s\), repeated-fingerprint 2, thinking-ate-budget 1 \(~6s\)$/
+  );
+  assert.equal(lines[1], 'est. wasted ~35s of 41s total');
+  const md = log.formatMarkdown();
+  assert.match(md, /^waste: rejected-writes 3 /m);
+  assert.ok(md.indexOf('failures:') < md.indexOf('waste:'));
+  assert.ok(md.indexOf('waste:') < md.indexOf('repeated-errors:'));
+
+  // The report is pure: a second run over the same events agrees.
+  assert.deepEqual(analyzeRunWaste(log.events()), waste);
+
+  // Patterns zero out, and a run id change does not carry state across runs.
+  const clean = analyzeRunWaste([
+    { t: 1, runId: 1, kind: 'verify', ok: false, fingerprint: 'same' },
+    { t: 2, runId: 2, kind: 'verify', ok: false, fingerprint: 'same' }
+  ]);
+  assert.equal(clean.repeatedFingerprint.count, 0);
+  const noPriorTurn = analyzeRunWaste([
+    { t: 1, runId: 1, kind: 'turn', role: 'coder', model: 'm', wallMs: 9_000 },
+    { t: 2, runId: 2, kind: 'tool', name: 'write_file', status: 'error', result: rejected }
+  ]);
+  assert.equal(noPriorTurn.rejectedWrites.count, 1);
+  assert.equal(noPriorTurn.rejectedWrites.ms, 0);
+
+  // summarizeRunSteps: per-step time split and top turns
+  const { steps, topTurns } = summarizeRunSteps(log.events(), 3);
+  const stepOne = steps.find(row => row.stepId === '1');
+  assert.ok(stepOne);
+  assert.equal(steps[0]?.stepId, '-');
+  assert.equal(stepOne.reviewMs, 4_000 + 3_000 + 2_000 + 2_000);
+  assert.equal(stepOne.coderMs, 5_000 + 6_000 + 6_000 + 3_000);
+  assert.deepEqual(stepOne.verdicts, ['nay', 'yay->nay', 'missing', 'missing']);
+  assert.equal(topTurns.length, 3);
+  assert.equal(topTurns[0]?.wallMs, 10_000);
+  assert.equal(topTurns[0]?.stepId, '-');
+}
 
 console.log('runLog.selftest ok');

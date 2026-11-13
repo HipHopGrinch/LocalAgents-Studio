@@ -18,6 +18,7 @@ import {
 import type { NodeRole } from '../types';
 import { pickCapableReviewTarget } from './continuationReview';
 import { fileContextCapsForTier, type ModelFitTier } from './clusterInventory';
+import { moduleExportParts, scanTopLevelDeclarations, summarizeModuleExports } from './repoMap';
 
 export type SwarmComplexity = 'high' | 'medium' | 'low';
 export type SwarmPreferredRole = '@coder' | '@docs' | '@reviewer';
@@ -471,6 +472,221 @@ export function partitionSwarmTasksIntoWaves(tasks: SwarmTask[]): SwarmTask[][] 
     }
   }
   return waves;
+}
+
+const DISPATCH_SOURCE_EXTS = new Set([
+  'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'vue', 'svelte', 'py', 'rs', 'go', 'java', 'cs', 'php', 'rb'
+]);
+const DISPATCH_COMPONENT_EXTS = new Set(['tsx', 'jsx', 'vue', 'svelte']);
+const DISPATCH_FOUNDATION_TOKENS = new Set([
+  'types', 'type', 'typings', 'interfaces', 'interface', 'models', 'model', 'constants', 'constant', 'consts',
+  'const', 'config', 'configs', 'contract', 'shared', 'schema', 'schemas', 'enums', 'enum', 'common'
+]);
+const DISPATCH_UTIL_TOKENS = new Set(['utils', 'util', 'helpers', 'helper', 'lib']);
+const DISPATCH_AI_TOKENS = new Set(['ai', 'opponent', 'bot', 'minimax', 'agent', 'cpu', 'computer']);
+
+function dispatchTokens(text: string): string[] {
+  return text
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
+/**
+ * Layer of a file in a multi-file step: 0 shared types/constants, 1 utils, 2 logic,
+ * 3 AI + components, 4 entry (App/main/index), 5 tests. Null = not part of the code
+ * layering (package.json, html, css, docs, `*.config.*`).
+ */
+function dispatchRank(filePath: string): number | null {
+  // Not normPathKey: camelCase boundaries (`gameLogic`) need the original case.
+  const segs = (filePath || '').replace(/\\/g, '/').trim().split('/').filter(Boolean);
+  const base = segs[segs.length - 1] || '';
+  const dot = base.lastIndexOf('.');
+  const ext = dot > 0 ? base.slice(dot + 1).toLowerCase() : '';
+  if (!DISPATCH_SOURCE_EXTS.has(ext) || /\.config\.[a-z0-9]+$/i.test(base)) return null;
+  const isDts = /\.d\.ts$/i.test(base);
+  const stem = base.slice(0, dot).replace(/\.d$/i, '');
+  const dirs = segs.slice(0, -1).filter(s => s.toLowerCase() !== 'src');
+  const stemTokens = dispatchTokens(stem);
+  const tokens = [...stemTokens, ...dispatchTokens(dirs.join(' '))];
+  const has = (set: Set<string>) => tokens.some(t => set.has(t));
+
+  const last = stemTokens[stemTokens.length - 1];
+  if (
+    last === 'test' ||
+    last === 'spec' ||
+    dirs.some(d => ['__tests__', 'tests', 'test'].includes(d.toLowerCase()))
+  ) {
+    return 5;
+  }
+  if (isDts) return 0;
+  if (['app', 'main', 'index'].includes(stem.toLowerCase()) && dirs.length === 0) return 4;
+  if (DISPATCH_COMPONENT_EXTS.has(ext)) return 3;
+  if (has(DISPATCH_FOUNDATION_TOKENS)) return 0;
+  if (has(DISPATCH_AI_TOKENS)) return 3;
+  if (has(DISPATCH_UTIL_TOKENS)) return 1;
+  return 2;
+}
+
+// Head noun of a component file name: presentational pieces first, containers that render them last.
+const LEAF_COMPONENT_TOKENS = new Set([
+  'piece', 'cell', 'tile', 'disc', 'token', 'button', 'card', 'icon', 'light', 'camera', 'controls', 'control',
+  'hud', 'panel', 'modal', 'label', 'badge', 'marker', 'slot'
+]);
+const CONTAINER_COMPONENT_TOKENS = new Set([
+  'board', 'grid', 'scene', 'canvas', 'world', 'game', 'layout', 'page', 'screen', 'app', 'stage', 'container', 'arena'
+]);
+
+/** 0 = leaf component, 2 = container component, 1 = anything else. Meaningful only for component files. */
+function componentSubRank(filePath: string): number {
+  const base = (filePath || '').replace(/\\/g, '/').split('/').pop() || '';
+  const stem = base.includes('.') ? base.slice(0, base.lastIndexOf('.')) : base;
+  const tokens = stem
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/\d+/g, ' ')
+    .toLowerCase()
+    .split(/[^a-z]+/)
+    .filter(t => t.length >= 2);
+  let head = tokens[tokens.length - 1] || '';
+  if (head.endsWith('s') && !LEAF_COMPONENT_TOKENS.has(head) && !CONTAINER_COMPONENT_TOKENS.has(head)) {
+    head = head.slice(0, -1);
+  }
+  if (LEAF_COMPONENT_TOKENS.has(head)) return 0;
+  if (CONTAINER_COMPONENT_TOKENS.has(head)) return 2;
+  return 1;
+}
+
+/**
+ * Whether a step's tasks should be written one after another. Parallel waves only help
+ * with more than one coder node; on a single node they just queue, and workers that cannot
+ * see each other's output invent incompatible props and types.
+ */
+export function shouldSerializeStepTasks(
+  distinctCoderNodes: number,
+  taskCount: number,
+  tier?: ModelFitTier
+): boolean {
+  if (!(taskCount >= 2)) return false;
+  return !(distinctCoderNodes > 1) || tier === 'tight';
+}
+
+/**
+ * Order a multi-file step's tasks so shared/foundational files are written first and
+ * consumers wait for them (types, then utils, then logic, then AI + components, then
+ * the entry file, then tests). Within the component layer, leaf components (Piece, Cell,
+ * HUD…) come before the containers that render them (Board, Scene, Game…). Fills
+ * `dependsOn` with the lower layers, keeps any declared dependency, and never adds an
+ * edge that would close a cycle.
+ * `serial: true` returns one chain: each task depends on every earlier one, in a
+ * dependency-respecting best order (declared dependencies that point forward are dropped).
+ * Single-file steps, and parallel sets with nothing to order, are returned unchanged.
+ */
+export function orderStepDispatchTasks(tasks: SwarmTask[], opts?: { serial?: boolean }): SwarmTask[] {
+  if (!Array.isArray(tasks) || tasks.length < 2) return tasks;
+  const serial = !!opts?.serial;
+  const ranks = tasks.map(t => dispatchRank(t.filePath));
+  const subs = tasks.map((t, i) => {
+    const ext = (t.filePath || '').split('.').pop()?.toLowerCase() || '';
+    return ranks[i] === 3 && DISPATCH_COMPONENT_EXTS.has(ext) ? componentSubRank(t.filePath) : 1;
+  });
+  const distinct = new Set(ranks.filter((r): r is number => r !== null));
+  const hasLeafAndContainer =
+    ranks.some((r, i) => r === 3 && subs[i] === 0) && ranks.some((r, i) => r === 3 && subs[i] === 2);
+  if (!serial && distinct.size < 2 && !hasLeafAndContainer) return tasks;
+
+  const keys = tasks.map(t => normPathKey(t.filePath));
+  const indexByKey = new Map<string, number>();
+  keys.forEach((k, i) => {
+    if (!indexByKey.has(k)) indexByKey.set(k, i);
+  });
+  const edges: Set<number>[] = tasks.map(() => new Set<number>());
+  tasks.forEach((t, i) => {
+    for (const d of t.dependsOn || []) {
+      const j = indexByKey.get(normPathKey(d));
+      if (j !== undefined && j !== i) edges[i].add(j);
+    }
+  });
+  const reaches = (from: number, to: number): boolean => {
+    const stack = [from];
+    const seen = new Set<number>();
+    while (stack.length) {
+      const cur = stack.pop() as number;
+      if (cur === to) return true;
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      for (const next of edges[cur]) stack.push(next);
+    }
+    return false;
+  };
+
+  const order = tasks
+    .map((_, i) => i)
+    .sort((a, b) => (ranks[a] ?? -1) - (ranks[b] ?? -1) || (serial ? subs[a] - subs[b] : 0) || a - b);
+  const added = new Map<number, number[]>();
+  const addEdge = (i: number, j: number) => {
+    edges[i].add(j);
+    added.set(i, [...(added.get(i) || []), j]);
+  };
+  for (const i of order) {
+    const ri = ranks[i];
+    if (ri === null) continue;
+    for (const j of order) {
+      const rj = ranks[j];
+      if (rj === null || rj >= ri || keys[j] === keys[i] || edges[i].has(j)) continue;
+      if (reaches(j, i)) continue;
+      addEdge(i, j);
+    }
+  }
+  // Same layer: a container waits for the leaf components it renders.
+  for (const i of order) {
+    if (ranks[i] !== 3 || subs[i] !== 2) continue;
+    for (const j of order) {
+      if (ranks[j] !== 3 || subs[j] !== 0 || keys[j] === keys[i] || edges[i].has(j)) continue;
+      if (reaches(j, i)) continue;
+      addEdge(i, j);
+    }
+  }
+
+  // Emit so every task follows its dependencies; priority is the layer order above.
+  const emitted: number[] = [];
+  const placed = new Set<number>();
+  while (emitted.length < order.length) {
+    const next =
+      order.find(i => !placed.has(i) && [...edges[i]].every(d => placed.has(d))) ??
+      order.find(i => !placed.has(i));
+    if (next === undefined) break;
+    placed.add(next);
+    emitted.push(next);
+  }
+
+  if (serial) {
+    return emitted.map((i, p) => {
+      const laterKeys = new Set(emitted.slice(p + 1).map(j => keys[j]));
+      const declared = (tasks[i].dependsOn || []).filter(d => {
+        const k = normPathKey(d);
+        return k !== keys[i] && !laterKeys.has(k);
+      });
+      const have = new Set(declared.map(normPathKey));
+      const chain: string[] = [];
+      for (const j of emitted.slice(0, p)) {
+        if (keys[j] === keys[i] || have.has(keys[j])) continue;
+        have.add(keys[j]);
+        chain.push(tasks[j].filePath);
+      }
+      const unchanged =
+        !chain.length && declared.length === (tasks[i].dependsOn || []).length;
+      return unchanged ? tasks[i] : { ...tasks[i], dependsOn: [...declared, ...chain] };
+    });
+  }
+
+  return emitted.map(i => {
+    const extra = added.get(i);
+    if (!extra?.length) return tasks[i];
+    const existing = tasks[i].dependsOn || [];
+    return { ...tasks[i], dependsOn: [...existing, ...extra.map(j => tasks[j].filePath)] };
+  });
 }
 
 /** Deterministic fallback when Pass 1 JSON fails — still produces a usable contract. */
@@ -1123,6 +1339,108 @@ export function sliceErrorWindows(content: string, errors: string, radius = 40):
     .join('\n\n');
 }
 
+const TS_ERROR_STOP_WORDS = new Set([
+  'Property', 'Type', 'Argument', 'Module', 'Cannot', 'Object', 'Array', 'Promise', 'Element', 'React',
+  'IntrinsicAttributes', 'JSX', 'Did', 'String', 'Number', 'Boolean', 'Record', 'Partial', 'Omit', 'Pick'
+]);
+
+/** Identifiers a TS diagnostic names that could be declared in another file. */
+function identifiersNamedByErrors(tscErrors: string): Set<string> {
+  const names = new Set<string>();
+  for (const raw of (tscErrors || '').split(/\r?\n/)) {
+    const line = raw.replace(/^.*?error\s+TS\d+:\s*/i, '');
+    for (const m of line.matchAll(/[A-Za-z_$][\w$]*/g)) {
+      const id = m[0];
+      if (id.length >= 3 && /[A-Z0-9]/.test(id) && !TS_ERROR_STOP_WORDS.has(id) && !/^TS\d+$/.test(id)) names.add(id);
+    }
+    for (const re of [
+      /Cannot find name '([^']+)'/g,
+      /has no exported member '([^']+)'/g,
+      /declares '([^']+)' locally/g
+    ]) {
+      for (const m of line.matchAll(re)) names.add(m[1]);
+    }
+  }
+  return names;
+}
+
+function moduleSpecifiersInErrors(tscErrors: string): string[] {
+  const out: string[] = [];
+  for (const m of (tscErrors || '').matchAll(/["'`]([^"'`\s]*[\\/][^"'`\s]*)["'`]/g)) {
+    const spec = m[1]
+      .replace(/\\/g, '/')
+      .replace(/^(\.{1,2}\/)+/, '')
+      .replace(/\.(tsx?|jsx?|mjs|cjs)$/i, '')
+      .replace(/\/index$/i, '')
+      .toLowerCase();
+    if (spec && !out.includes(spec)) out.push(spec);
+  }
+  return out;
+}
+
+/**
+ * Declarations from OTHER files that a tsc failure is about: a props interface named in a
+ * TS2322, the module behind a TS2614/TS2613 import, a missing exported member. Returns the
+ * declaration bodies (interfaces/types) and the signatures + export statements of the file
+ * that holds them, so a repair worker can fix the mismatch without calling `read_file`.
+ * Pass the repair target in `excludePaths`.
+ */
+export function referencedDeclarationsForErrors(
+  tscErrors: string,
+  files: Array<{ path: string; content: string }>,
+  opts?: { maxChars?: number; excludePaths?: string[] }
+): Array<{ path: string; excerpt: string }> {
+  const maxChars = Math.max(0, Math.floor(opts?.maxChars ?? 3000));
+  if (maxChars < 60 || !tscErrors?.trim() || !files?.length) return [];
+  const exclude = new Set((opts?.excludePaths || []).map(normPathKey));
+  const idents = identifiersNamedByErrors(tscErrors);
+  const specs = moduleSpecifiersInErrors(tscErrors);
+
+  const candidates: Array<{ path: string; named: string[]; score: number; order: number; content: string }> = [];
+  files.forEach((file, order) => {
+    if (!file?.path || typeof file.content !== 'string' || exclude.has(normPathKey(file.path))) return;
+    if (!/\.(tsx?|jsx?|mjs|cjs)$/i.test(file.path)) return;
+    const named = scanTopLevelDeclarations(file.content)
+      .filter(b => idents.has(b.name))
+      .map(b => b.text);
+    let key = (file.path || '').replace(/\\/g, '/').replace(/\.(tsx?|jsx?|mjs|cjs)$/i, '').toLowerCase();
+    if (key.endsWith('/index')) key = key.slice(0, -'/index'.length);
+    const moduleHit = specs.some(s => key === s || key.endsWith(`/${s}`) || s.endsWith(`/${key}`));
+    if (!named.length && !moduleHit) return;
+    candidates.push({
+      path: file.path.replace(/\\/g, '/'),
+      named,
+      score: (named.length ? 2 : 0) + (moduleHit ? 1 : 0),
+      order,
+      content: file.content
+    });
+  });
+  candidates.sort((a, b) => b.score - a.score || a.order - b.order);
+
+  const out: Array<{ path: string; excerpt: string }> = [];
+  let remaining = maxChars;
+  for (const c of candidates) {
+    if (remaining < 60) break;
+    const parts: string[] = [];
+    for (const text of [...c.named, ...moduleExportParts(c.content)]) {
+      if (!parts.includes(text)) parts.push(text);
+    }
+    const room = Math.min(remaining - c.path.length - 8, 2400);
+    const kept: string[] = [];
+    let size = 0;
+    for (const part of parts) {
+      if (kept.length && size + part.length + 1 > room) continue;
+      kept.push(kept.length === 0 && part.length > room ? `${part.slice(0, Math.max(0, room - 1))}…` : part);
+      size += part.length + 1;
+    }
+    if (!kept.length) continue;
+    const excerpt = kept.join('\n');
+    out.push({ path: c.path, excerpt });
+    remaining -= c.path.length + excerpt.length + 8;
+  }
+  return out;
+}
+
 export function buildContractRepairPrompt(
   userTask: string,
   previous: SwarmManifest,
@@ -1206,6 +1524,22 @@ export function buildSwarmWorkerPrompt(opts: {
   stack?: DeliveryStack;
   tier?: ModelFitTier;
   siblingFiles?: SwarmSiblingFile[];
+  /**
+   * Max chars of the file this worker owns that are shown whole. Default: the tier's
+   * `maxTotalChars` (never below its per-file cap). Beyond it the middle is cut and the
+   * worker is told to patch with `edit_file` instead of rewriting the file.
+   */
+  ownedFileMaxChars?: number;
+  /**
+   * Export summaries of files from earlier steps this file must integrate (see
+   * `pickExistingProjectExports` in repoMap.ts). The caller sizes them to its spare prompt budget.
+   */
+  existingProjectExports?: Array<{ path: string; summary: string }>;
+  /**
+   * Current exported declarations of files from earlier waves of this fan-out that this file
+   * imports (see {@link alreadyWrittenDeclarations}). Read from disk when the prompt is built.
+   */
+  alreadyWritten?: Array<{ path: string; excerpt: string }>;
 }): string {
   const { task, contractFile, contractCode, siblingSummary, currentFileContent, userPrompt } = opts;
   const stack = opts.stack || 'typescript';
@@ -1238,8 +1572,20 @@ ${capFileBody(contractBody, caps.maxCharsPerFile)}
 \`\`\`
 Write real ${stack} for \`${task.filePath}\` only. No plans inside the file.`;
 
-  const fileBody = currentFileContent?.trim()
-    ? capFileBody(currentFileContent, caps.maxCharsPerFile)
+  // The file this worker rewrites is not a sibling: the per-file sibling cap must not hide its middle.
+  const ownedMax = Math.max(
+    caps.maxCharsPerFile,
+    Number.isFinite(opts.ownedFileMaxChars) ? Math.floor(opts.ownedFileMaxChars as number) : caps.maxTotalChars
+  );
+  const ownedText = (currentFileContent || '').replace(/\r\n/g, '\n');
+  const hasCurrent = !!currentFileContent?.trim();
+  const ownedCut = hasCurrent && ownedText.length > ownedMax;
+  const fileBody = hasCurrent
+    ? `${
+        ownedCut
+          ? `(Partial view: ${ownedText.length} chars, ${ownedText.split('\n').length} lines; the middle is cut at "…(truncated)…". Do NOT rewrite the whole file. Use <edit_file> SEARCH/REPLACE with lines copied from the shown regions, or <read_file path="${task.filePath}"/> first to see the rest.)\n`
+          : ''
+      }${capFileBody(currentFileContent as string, ownedMax)}`
     : '(new file — create it from scratch)';
 
   const depKeys = new Set((task.dependsOn || []).map(normPathKey));
@@ -1249,8 +1595,8 @@ Write real ${stack} for \`${task.filePath}\` only. No plans inside the file.`;
       const exp = s.exports?.length ? ` — exports: ${s.exports.join(', ')}` : '';
       return `- ${s.path}${exp}`;
     });
-    const inlineCap = Math.min(1500, Math.floor(caps.maxCharsPerFile / 2));
-    let budget = Math.min(caps.maxTotalChars, inlineCap * 2);
+    const inlineCap = Math.min(3000, caps.maxCharsPerFile);
+    let budget = Math.min(caps.maxTotalChars, inlineCap * 3);
     const inlined: string[] = [];
     for (const s of opts.siblingFiles) {
       if (!depKeys.has(normPathKey(s.path)) || !s.content || budget <= 0) continue;
@@ -1265,8 +1611,39 @@ Write real ${stack} for \`${task.filePath}\` only. No plans inside the file.`;
     siblingBlock = `### SIBLINGS\n${capFileBody(siblingSummary || '(none)', Math.min(2000, caps.maxTotalChars))}`;
   }
 
+  const writtenBlocks = (opts.alreadyWritten || [])
+    .filter(w => w?.path && w.excerpt?.trim() && normPathKey(w.path) !== normPathKey(task.filePath))
+    .map(w => `#### ${w.path}\n\`\`\`\n${capFileBody(w.excerpt, caps.maxCharsPerFile)}\n\`\`\``);
+  const writtenBlock = writtenBlocks.length
+    ? `### ALREADY WRITTEN THIS STEP (match these signatures exactly)
+Earlier files of this step, as they are on disk now. Use the exact names, props and parameter types below. When \`${task.filePath}\` disagrees with one of them, change \`${task.filePath}\` — never the other file.
+${writtenBlocks.join('\n\n')}
+
+`
+    : '';
+
   const depNote = task.dependsOn?.length
-    ? `Prerequisites already on disk: ${task.dependsOn.join(', ')}.`
+    ? `Prerequisites already on disk: ${task.dependsOn.join(', ')}. Import their exact exports; never redeclare their types or constants.`
+    : '';
+
+  const listed = new Set((opts.siblingFiles || []).map(s => normPathKey(s.path)));
+  const projectModules = (opts.existingProjectExports || []).filter(
+    e => e?.path && e.summary?.trim() && !listed.has(normPathKey(e.path)) && normPathKey(e.path) !== normPathKey(task.filePath)
+  );
+  let projectBudget = 20000;
+  const projectBlocks: string[] = [];
+  for (const e of projectModules) {
+    if (projectBudget <= 0) break;
+    const body = capFileBody(e.summary, Math.min(2400, projectBudget));
+    projectBlocks.push(`#### ${e.path}\n\`\`\`\n${body}\n\`\`\``);
+    projectBudget -= body.length;
+  }
+  const projectBlock = projectBlocks.length
+    ? `### EXISTING PROJECT MODULES (already on disk, written in earlier steps)
+Import and use these modules. Do not re-implement their logic or declare parallel copies of their types, components or game rules.
+${projectBlocks.join('\n\n')}
+
+`
     : '';
 
   return `Implement ONLY \`${task.filePath}\` (stack: ${stack}).
@@ -1278,13 +1655,17 @@ ${fileBody}
 
 ${siblingBlock}
 
-### BRIEF
+${writtenBlock}${projectBlock}### BRIEF
 ${clipText(userPrompt, 500)}
 
 ### TASK
 ${task.instructions}
 
-Emit one <edit_file path="${task.filePath}"> hunk if the current file is shown, otherwise one <write_file path="${task.filePath}">. This path only.`;
+${
+    ownedCut
+      ? `Emit <edit_file path="${task.filePath}"> hunks only (the file is partly hidden). This path only.`
+      : `Emit one <edit_file path="${task.filePath}"> hunk if the current file is shown, otherwise one <write_file path="${task.filePath}">. This path only.`
+  }`;
 }
 
 export function buildRepairWorkerPrompt(opts: {
@@ -1296,15 +1677,51 @@ export function buildRepairWorkerPrompt(opts: {
   /** Accepted for compatibility. Omitted so the repair packet stays on the error window. */
   devHostSection?: string | null;
   tier?: ModelFitTier;
+  /**
+   * Declarations from other files the errors refer to (see {@link referencedDeclarationsForErrors}).
+   * When present the worker is told not to read files and to reply with hunks.
+   */
+  relatedDeclarations?: Array<{ path: string; excerpt: string }>;
 }): string {
   const tier = opts.tier ?? 'tight';
   const errors = capDiagnosticLines(opts.tscErrors, 40);
-  const windows = sliceErrorWindows(opts.currentFileContent, opts.tscErrors, 40);
+  const caps = fileContextCapsForTier(tier);
+  const wholeFile = fitsWholeFile(opts.currentFileContent, tier);
+  const windows = wholeFile
+    ? numberedLines(opts.currentFileContent)
+    : sliceErrorWindows(opts.currentFileContent, opts.tscErrors, 40);
+  const related = (opts.relatedDeclarations || []).filter(r => r?.path && r.excerpt?.trim());
+  const hasRelated = related.length > 0;
+  let relatedBudget = Math.floor(caps.maxTotalChars / 2);
+  const relatedBlocks: string[] = [];
+  for (const r of related) {
+    if (relatedBudget <= 0) break;
+    const body = capFileBody(r.excerpt, Math.min(caps.maxCharsPerFile, relatedBudget));
+    relatedBlocks.push(`#### ${r.path}\n\`\`\`\n${body}\n\`\`\``);
+    relatedBudget -= body.length;
+  }
   const exports = extractContractExports(opts.contractCode);
-  const preferEdit = tier === 'tight';
-  const how = preferEdit
-    ? `Use <edit_file path="${opts.task.filePath}"> SEARCH/REPLACE hunks on the windows below. Do not rewrite the whole file.`
-    : `Prefer <edit_file path="${opts.task.filePath}"> hunks. Use <write_file path="${opts.task.filePath}"> only when a hunk cannot fix the window.`;
+  const fileLineCount = (opts.currentFileContent || '').replace(/\r\n/g, '\n').split('\n').length;
+  const shownLineCount = (windows.match(/^\d+\|/gm) || []).length;
+  const partialView = !wholeFile && shownLineCount < fileLineCount;
+  const preferEdit = tier === 'tight' || partialView;
+  const smallFile = fileLineCount <= SMALL_FILE_LINES && (opts.currentFileContent || '').length <= SMALL_FILE_CHARS;
+  const how = wholeFile
+    ? `The complete file is shown above. Reply now with <edit_file path="${opts.task.filePath}"> SEARCH/REPLACE hunks${
+        smallFile ? ` (or one complete <write_file path="${opts.task.filePath}"> — the file is small)` : ''
+      }. Copy SEARCH lines exactly, without the "N|" line-number prefixes.`
+    : preferEdit
+      ? `Use <edit_file path="${opts.task.filePath}"> SEARCH/REPLACE hunks on the windows below. Do not rewrite the whole file${
+          partialView
+            ? ` — only ${shownLineCount} of its ${fileLineCount} lines are shown${
+                hasRelated ? '' : `; <read_file path="${opts.task.filePath}"/> first if you need the rest`
+              }`
+            : ''
+        }.`
+      : `Prefer <edit_file path="${opts.task.filePath}"> hunks. Use <write_file path="${opts.task.filePath}"> only when a hunk cannot fix the window.`;
+  const fileSection = wholeFile
+    ? `### CURRENT FILE (complete, ${fileLineCount} lines; the "N|" prefixes are display only)`
+    : '### WINDOWS (±40 lines)';
   return `Repair ONLY \`${opts.task.filePath}\`.
 
 ### CONTRACT EXPORTS (\`${opts.contractFile}\`)
@@ -1316,10 +1733,213 @@ ${opts.task.requiredExports.map(e => `- ${e}`).join('\n') || '(see windows)'}
 ### ERRORS (≤40)
 ${errors}
 
-### WINDOWS (±40 lines)
+${
+    hasRelated
+      ? `### RELATED DECLARATIONS (other files — read-only, the types your errors refer to)
+${
+        wholeFile
+          ? 'Everything you need is on this page.'
+          : 'Do not call read_file; everything needed is below. Reply with edit_file hunks now.'
+      }
+${relatedBlocks.join('\n\n')}
+
+`
+      : ''
+  }${fileSection}
 ${windows}
 
 ${how}`;
+}
+
+/** A whole-file `write_file` is offered only for files this small. */
+const SMALL_FILE_LINES = 120;
+const SMALL_FILE_CHARS = 5000;
+/** The last-chance write turn skips files longer than this, whatever the tier allows. */
+const FORCED_WRITE_MAX_LINES = 600;
+
+/**
+ * Longest file (chars) shown whole to a repair or heal worker: the tier's total preload budget,
+ * never below its per-file cap. A `tight` window keeps the per-file cap — a whole file would
+ * crowd out the errors. Beyond it the worker sees windows around the errors instead.
+ */
+export function wholeFileCharLimit(tier: ModelFitTier): number {
+  const caps = fileContextCapsForTier(tier);
+  return tier === 'tight' ? caps.maxCharsPerFile : Math.max(caps.maxCharsPerFile, caps.maxTotalChars);
+}
+
+function fitsWholeFile(content: string, tier: ModelFitTier): boolean {
+  const text = (content || '').replace(/\r\n/g, '\n');
+  return !!text.trim() && text.length <= wholeFileCharLimit(tier);
+}
+
+/** `N|line` for every line (a trailing newline does not add a numbered empty line). */
+export function numberedLines(content: string): string {
+  const lines = (content || '').replace(/\r\n/g, '\n').split('\n');
+  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+  return lines.map((l, i) => `${i + 1}|${l}`).join('\n');
+}
+
+/** True when a last-chance write turn may inline the whole file (tier char cap and line cap). */
+export function canForceWholeFile(content: string, tier: ModelFitTier): boolean {
+  const text = (content || '').replace(/\r\n/g, '\n');
+  return fitsWholeFile(text, tier) && text.split('\n').length <= FORCED_WRITE_MAX_LINES;
+}
+
+/**
+ * Last-chance packet for a worker that only read files: the whole current file, the errors and
+ * the declarations they refer to. Asks for hunks or one complete `write_file`; read tags are
+ * ignored by the caller, so the packet does not mention them.
+ */
+export function buildForcedWritePrompt(opts: {
+  filePath: string;
+  currentFileContent: string;
+  tscErrors: string;
+  /** A Reviewer Nay to fix instead of compiler errors (logic heal); shown whole, not filtered as diagnostics. */
+  reviewerNote?: string;
+  tier?: ModelFitTier;
+  relatedDeclarations?: Array<{ path: string; excerpt: string }>;
+  contractFile?: string;
+  contractCode?: string;
+  requiredExports?: string[];
+}): string {
+  const tier = opts.tier ?? 'tight';
+  const note = (opts.reviewerNote || '').trim();
+  const caps = fileContextCapsForTier(tier);
+  const path = opts.filePath;
+  let relatedBudget = Math.floor(caps.maxTotalChars / 2);
+  const relatedBlocks: string[] = [];
+  for (const r of opts.relatedDeclarations || []) {
+    if (!r?.path || !r.excerpt?.trim()) continue;
+    if (relatedBudget <= 0) break;
+    const body = capFileBody(r.excerpt, Math.min(caps.maxCharsPerFile, relatedBudget));
+    relatedBlocks.push(`#### ${r.path}\n\`\`\`\n${body}\n\`\`\``);
+    relatedBudget -= body.length;
+  }
+  const contractExports = opts.contractCode?.trim() ? extractContractExports(opts.contractCode) : '';
+  const yourExports = (opts.requiredExports || []).map(e => `- ${e}`).join('\n');
+  const lineCount = (opts.currentFileContent || '').replace(/\r\n/g, '\n').split('\n').length;
+  return `Fix \`${path}\`. This is the final attempt: the earlier turns only read files and changed nothing, and any file-reading tag you send now is ignored.
+
+${
+    note
+      ? `### REVIEWER NOTE (the project compiles; fix exactly this)\n${capFileBody(note, 2400)}`
+      : `### ERRORS (≤40)\n${capDiagnosticLines(opts.tscErrors, 40)}`
+  }
+
+${relatedBlocks.length ? `### RELATED DECLARATIONS (other files — read-only)\n${relatedBlocks.join('\n\n')}\n\n` : ''}${
+    contractExports ? `### CONTRACT EXPORTS (\`${opts.contractFile || 'contract'}\`)\n${contractExports}\n\n` : ''
+  }${yourExports ? `### YOUR EXPORTS\n${yourExports}\n\n` : ''}### CURRENT FILE (complete, ${lineCount} lines; the "N|" prefixes are display only, never copy them)
+${numberedLines(opts.currentFileContent)}
+
+Reply with exactly one of:
+1. <edit_file path="${path}"> with SEARCH/REPLACE hunks that fix the ${note ? 'note' : 'errors'} (SEARCH lines copied exactly from the file above), or
+2. one complete <write_file path="${path}"> holding the entire corrected file.
+Change only what the ${note ? 'note' : 'errors'} require${note ? 's' : ''}. No prose.`;
+}
+
+/** Paths from `paths` that diagnostic text names, by full relative path or by file stem (≥3 chars). */
+export function pathsNamedInText(text: string, paths: string[]): string[] {
+  const haystack = (text || '').replace(/\\/g, '/');
+  const out: string[] = [];
+  for (const raw of paths || []) {
+    const rel = (raw || '').replace(/\\/g, '/').replace(/^\.\//, '');
+    if (!rel) continue;
+    const base = rel.split('/').pop() || '';
+    const stem = base.includes('.') ? base.slice(0, base.lastIndexOf('.')) : base;
+    if (
+      haystack.includes(rel) ||
+      (stem.length >= 3 && new RegExp(`(?<![\\w$/])${stem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w$])`).test(haystack))
+    ) {
+      out.push(raw);
+    }
+  }
+  return out;
+}
+
+/** Module specifiers a source file imports: `from '…'`, `import '…'`, `require('…')`, `import('…')`. */
+function importSpecifiers(code: string): string[] {
+  const out: string[] = [];
+  for (const m of (code || '').matchAll(
+    /(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)['"]([^'"\n]+)['"]/g
+  )) {
+    if (m[1] && !out.includes(m[1])) out.push(m[1]);
+  }
+  return out;
+}
+
+/**
+ * Exported declarations (interfaces, types, props types, function and component signatures) of
+ * files written earlier in the same fan-out that `task.filePath` imports. A file that is already
+ * on disk is matched by its import statements. A file that is not (or imports none of them) is
+ * matched by what its instructions, imports, exports and dependsOn name. Pass `written` freshly
+ * read from disk. Output is capped by the tier (or `maxChars`).
+ */
+export function alreadyWrittenDeclarations(opts: {
+  task: Pick<SwarmTask, 'filePath' | 'instructions' | 'requiredImports' | 'requiredExports' | 'dependsOn'>;
+  currentFileContent?: string;
+  written: Array<{ path: string; content: string }>;
+  tier?: ModelFitTier;
+  maxChars?: number;
+}): Array<{ path: string; excerpt: string }> {
+  const { task } = opts;
+  const selfKey = normPathKey(task.filePath);
+  const files = (opts.written || []).filter(
+    f => f?.path && typeof f.content === 'string' && f.content.trim() && normPathKey(f.path) !== selfKey
+  );
+  if (!files.length) return [];
+  const caps = fileContextCapsForTier(opts.tier ?? 'tight');
+  let budget = Math.max(0, Math.floor(opts.maxChars ?? caps.maxTotalChars / 4));
+  const byKey = new Map(files.map(f => [normPathKey(f.path), f.path]));
+  const picked: string[] = [];
+  const pick = (path: string | undefined) => {
+    if (path && !picked.includes(path)) picked.push(path);
+  };
+
+  const imports = importSpecifiers(opts.currentFileContent || '');
+  for (const spec of imports) {
+    let hit = lookupTaskPath(byKey, task.filePath, spec);
+    if (!hit && /^[@~]\//.test(spec)) {
+      const rest = spec.slice(2);
+      hit = lookupTaskPath(byKey, task.filePath, `src/${rest}`) || lookupTaskPath(byKey, task.filePath, rest);
+    }
+    pick(hit);
+  }
+  if (!picked.length) {
+    const mentions = [
+      task.instructions,
+      ...(task.requiredImports || []),
+      ...(task.requiredExports || []),
+      ...(task.dependsOn || [])
+    ]
+      .join('\n')
+      .replace(/\\/g, '/');
+    const mentionsLower = mentions.toLowerCase();
+    for (const f of files) {
+      const rel = f.path.replace(/\\/g, '/');
+      const stem = (rel.split('/').pop() || '').replace(/\.[A-Za-z0-9]+$/, '');
+      const named =
+        mentionsLower.includes(rel.toLowerCase()) ||
+        (stem.length >= 4 && new RegExp(`(?<![\\w$])${stem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w$])`).test(mentions));
+      if (named) pick(f.path);
+    }
+  }
+
+  const out: Array<{ path: string; excerpt: string }> = [];
+  for (const path of picked) {
+    if (budget < 60) break;
+    const file = files.find(f => f.path === path);
+    if (!file) continue;
+    const room = Math.min(2400, budget - path.length - 8);
+    if (room < 60) break;
+    const excerpt = (
+      summarizeModuleExports(path, file.content, room) ||
+      (/\.(tsx?|jsx?|mjs|cjs)$/i.test(path) ? '' : capFileBody(extractContractExports(file.content, 24), room))
+    ).trim();
+    if (!excerpt) continue;
+    out.push({ path: path.replace(/\\/g, '/'), excerpt });
+    budget -= path.length + excerpt.length + 8;
+  }
+  return out;
 }
 
 function nodeTokPerSec(n: EndpointNode, model: string): number {

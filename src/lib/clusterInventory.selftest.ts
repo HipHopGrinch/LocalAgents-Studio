@@ -7,7 +7,9 @@ import {
   fileContextCapsForTier,
   formatClusterInventory,
   modelFitTier,
-  resolveModelFit
+  resolveModelFit,
+  resolveReviewerFileCaps,
+  roomyFileCaps
 } from './clusterInventory';
 import type { EndpointNode } from '../types';
 
@@ -103,5 +105,41 @@ const section = buildModelFitSection({
   tier: 'wide'
 });
 assert.match(section, /wide context/);
+
+// Frontier window: whole files, not local-tier truncation
+const roomy = roomyFileCaps(262144);
+assert.ok(roomy);
+assert.ok(roomy.maxCharsPerFile >= 60000, `per-file ${roomy.maxCharsPerFile}`);
+const frontierBudgetChars = Math.floor((262144 - 2048 - 256) * 3.2);
+assert.ok(
+  roomy.maxTotalChars >= frontierBudgetChars * 0.45 && roomy.maxTotalChars <= frontierBudgetChars * 0.55,
+  `total ${roomy.maxTotalChars}`
+);
+assert.equal(roomyFileCaps(65536), null);
+assert.deepEqual(fileContextCapsForTier('wide'), fileContextCapsForTier('wide', 65536));
+assert.deepEqual(fileContextCapsForTier('tight', 16384), fileContextCapsForTier('tight'));
+assert.ok(fileContextCapsForTier('wide', 262144).maxCharsPerFile >= 60000);
+const reviewerLocal = { maxFiles: 16, maxCharsPerFile: 16000, maxTotalChars: 48000 };
+assert.deepEqual(resolveReviewerFileCaps(16384, reviewerLocal), reviewerLocal);
+assert.deepEqual(resolveReviewerFileCaps(65536, reviewerLocal), reviewerLocal);
+const frontierCaps = resolveReviewerFileCaps(262144, reviewerLocal);
+assert.ok(frontierCaps.maxCharsPerFile >= 60000 && frontierCaps.maxTotalChars > 48000 && frontierCaps.maxFiles >= 16);
+const geminiNode = {
+  id: 'cloud',
+  name: 'Gemini',
+  url: 'https://generativelanguage.googleapis.com',
+  type: 'openai',
+  apiKey: 'k',
+  online: true,
+  latency: 1,
+  models: [{ name: 'gemini-3.5-flash-lite', size: 1 }]
+} as unknown as EndpointNode;
+const geminiFit = resolveModelFit(geminiNode, 'gemini-3.5-flash-lite', 'reviewer', 16384);
+assert.equal(geminiFit.maxCtx, 262144);
+assert.ok(geminiFit.caps.maxCharsPerFile >= 60000);
+// A local 27B at 16K stays tight
+const localFit = resolveModelFit(node, 'gemma4:e4b', 'coder', 16384);
+assert.equal(localFit.tier, 'tight');
+assert.deepEqual(localFit.caps, fileContextCapsForTier('tight'));
 
 console.log('clusterInventory.selftest: ok');

@@ -23,8 +23,9 @@ export function promptFillsContext(tokens: number, maxCtx: number, ratio = CONTE
 }
 
 /**
- * The request already ran and the window was full: the model stopped for length,
- * or prompt_eval + eval consumed the num_ctx that was actually sent.
+ * The request already ran and the window was full: prompt_eval + eval consumed
+ * (or nearly consumed) the num_ctx that was actually sent. A bare done=length with
+ * plenty of room left is an output-cap stop, see {@link outputCapWasHit}.
  * `maxCtx` is the configured ceiling. Pass `sentNumCtx` (the options.num_ctx on
  * that request) so a smaller pinned window still trips the retry.
  */
@@ -38,15 +39,44 @@ export function contextWasExhausted(
       ? sentNumCtx
       : maxCtx;
   if (!stats || !window || window < 512) return false;
-  if (/length|context/i.test(stats.doneReason || '')) return true;
   const prompt = stats.promptEvalCount || 0;
   const generated = stats.evalCount || 0;
   const used = prompt + generated;
+  if (/context/i.test(stats.doneReason || '')) return true;
+  if (/length/i.test(stats.doneReason || '')) {
+    // done=length is also what hitting num_predict looks like. Without counts we can't
+    // tell, so assume the window; with counts, only a nearly full window counts.
+    if (!prompt) return true;
+    return used >= Math.floor(window * 0.9) || prompt > Math.floor(window * 0.85);
+  }
   if (used >= window) return true;
   // Prompt left almost no room to answer inside the window that was sent.
   if (prompt > Math.floor(window * 0.9) && generated < 64) return true;
   // prompt_eval + eval filled the sent num_ctx, and the reply itself was short.
   return used >= Math.floor(window * 0.9) && generated < Math.floor(window * 0.25);
+}
+
+/**
+ * The reply stopped for length (done=length) while the sent window still had room:
+ * the output cap (`num_predict`) was hit, not the context. Resending the same packet
+ * cannot help; raise the output budget or ask for a smaller/continued write instead.
+ * When `numPredict` is passed, the reply must also have reached that cap (±2%).
+ * Returns false when prompt counts are missing, since the window can't be judged.
+ */
+export function outputCapWasHit(
+  stats: { promptEvalCount?: number; evalCount?: number; doneReason?: string } | undefined,
+  sentNumCtx: number,
+  numPredict?: number
+): boolean {
+  if (!stats || !/length/i.test(stats.doneReason || '')) return false;
+  if (!Number.isFinite(sentNumCtx) || sentNumCtx < 512) return false;
+  const prompt = stats.promptEvalCount || 0;
+  if (!prompt) return false;
+  if (contextWasExhausted(stats, sentNumCtx, sentNumCtx)) return false;
+  if (typeof numPredict === 'number' && numPredict > 0) {
+    return (stats.evalCount || 0) >= Math.floor(numPredict * 0.98);
+  }
+  return true;
 }
 
 type SectionKind = 'repo-map' | 'already-written' | 'sibling' | 'protected' | 'other';
@@ -164,7 +194,11 @@ function windowLines(lines: string[]): string[] {
   const tail = FENCE_KEEP_TAIL_LINES;
   if (lines.length <= head + tail) return lines;
   const omitted = lines.length - head - tail;
-  return [...lines.slice(0, head), `…(${omitted} lines omitted for context)…`, ...lines.slice(-tail)];
+  return [
+    ...lines.slice(0, head),
+    `…(${omitted} lines omitted for context — do not rewrite the whole file: use edit_file on the shown lines or read_file the rest)…`,
+    ...lines.slice(-tail)
+  ];
 }
 
 function trimBlockFences(block: SectionBlock): SectionBlock {

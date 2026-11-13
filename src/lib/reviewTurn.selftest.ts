@@ -7,6 +7,7 @@ import { fitBudgetForPinnedCtx } from './contextSize';
 import {
   MISSING_REVIEW_VERDICT_NOTICE,
   MISSING_REVIEW_VERDICT_WAIT_NOTICE,
+  REVIEW_FOLLOWUP_MAX_TOOL_CHARS,
   REVIEW_PRELOAD_CHARS_PER_TOKEN,
   REVIEW_PRELOAD_FILE_SHARE,
   REVIEW_PRELOAD_MAX_CHARS_PER_FILE,
@@ -14,11 +15,15 @@ import {
   REVIEW_VERDICT_NOW_INSTRUCTION,
   boundReviewContinuation,
   hasStructuredReviewResult,
+  isStaleCompilerNay,
+  nayCitesCompilerErrors,
   needsReviewVerdictTurn,
   nonPlanReviewLacksMarkup,
   reviewFollowUpBudget,
   reviewPreloadCaps,
-  reviewVerdictNowInstruction
+  reviewVerdictNowInstruction,
+  staleNayReaskPrompt,
+  verifyPassedStatement
 } from './reviewTurn';
 
 const readTool = {
@@ -196,6 +201,12 @@ const tightFiles = reviewPreloadCaps(16384, 4);
 assert.equal(tightFiles.maxFiles, 4);
 assert.equal(tightFiles.maxCharsPerFile, local.maxCharsPerFile);
 
+// A frontier window pastes whole step files, but one follow-up stays under 400K characters.
+assert.equal(reviewFollowUpBudget(262144, 'reviewer').toolChars, REVIEW_FOLLOWUP_MAX_TOOL_CHARS);
+assert.equal(reviewFollowUpBudget(1048576, 'reviewer').toolChars, REVIEW_FOLLOWUP_MAX_TOOL_CHARS);
+assert.ok(reviewFollowUpBudget(131072, 'reviewer').toolChars > 60000 * 3);
+assert.ok(reviewFollowUpBudget(16384, 'reviewer').toolChars < 30000);
+
 const eightBudget = reviewFollowUpBudget(8192, 'reviewer');
 assert.equal(eightBudget.toolChars, fileShareChars(8192));
 const fat = `${'x'.repeat(20000)}\n\nReply now with your <review_plan>.`;
@@ -203,5 +214,41 @@ const bounded = boundReviewContinuation(fat, eightBudget.toolChars);
 assert.ok(bounded.length <= eightBudget.toolChars);
 assert.match(bounded, /review_plan/);
 assert.match(bounded, /tool results truncated/);
+
+// Stale compiler Nay: the quoted errors came from an earlier failed verify, tsc has passed since.
+const staleNotes =
+  'Type mismatch between App.tsx and Board3D.tsx causing compilation errors: src/App.tsx(56,30): error TS2322: Type X is not assignable. src/components/Board3D.tsx(207,22): error TS2345: Argument of type Y.';
+assert.equal(isStaleCompilerNay(staleNotes, { ok: true, output: 'Exit code: 0' }), true);
+assert.equal(isStaleCompilerNay(staleNotes, { ok: true, output: '' }), true);
+// Red verify, or no verify result: never stale.
+assert.equal(
+  isStaleCompilerNay(staleNotes, { ok: false, output: 'src/App.tsx(56,30): error TS2322: Type X.' }),
+  false
+);
+assert.equal(isStaleCompilerNay(staleNotes, null), false);
+// A Nay with no compiler errors is a real review finding.
+assert.equal(
+  isStaleCompilerNay('Board3D is a stub: the click handler does nothing.', { ok: true, output: '' }),
+  false
+);
+// One cited pair still reported (same file and code, other line) means the Nay is not stale.
+assert.equal(
+  isStaleCompilerNay(staleNotes, {
+    ok: true,
+    output: 'D:/proj/src/components/Board3D.tsx(210,3): error TS2345: Argument of type Y.'
+  }),
+  false
+);
+// A different code in the same file does not match.
+assert.equal(
+  isStaleCompilerNay(staleNotes, { ok: true, output: 'src/App.tsx(56,30): error TS9999: other.' }),
+  true
+);
+assert.equal(nayCitesCompilerErrors(staleNotes), true);
+assert.equal(nayCitesCompilerErrors('The click handler does nothing.'), false);
+assert.match(verifyPassedStatement('tsc exit 0'), /PASSED just now \(tsc exit 0\)/);
+assert.match(verifyPassedStatement(), /do not Nay for them/);
+assert.match(staleNayReaskPrompt(verifyPassedStatement()), /<step_verdict>/);
+assert.match(staleNayReaskPrompt(verifyPassedStatement()), /Project verify: PASSED/);
 
 console.log('reviewTurn.selftest ok');

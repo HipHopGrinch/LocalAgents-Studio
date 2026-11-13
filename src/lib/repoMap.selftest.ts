@@ -8,8 +8,12 @@ import {
   invalidateRepoMap,
   isSkippedRepoDir,
   pathHasSkippedRepoDir,
+  pickExistingProjectExports,
+  rankExistingProjectFiles,
   relevantFilesForTask,
   repoMapNeedsRebuild,
+  scanTopLevelDeclarations,
+  summarizeModuleExports,
   symbolHitsForQuery,
   type RepoMap
 } from './repoMap';
@@ -82,5 +86,113 @@ assert.equal(repoMapNeedsRebuild(stale), true);
 assert.equal(repoMapNeedsRebuild(null), true);
 assert.equal(repoMapNeedsRebuild(named), false);
 assert.equal(invalidateRepoMap(null), null);
+
+// Module export summaries: props interfaces + signatures, never bodies
+const board3d = `import { Piece3D } from './Piece3D';
+import type { Board } from '../game/gameLogic';
+
+interface Board3DProps {
+  board: Board;
+  onColumnClick: (col: number) => void;
+}
+
+const SECRET_LOCAL = 42;
+
+export function Board3D({ board, onColumnClick }: Board3DProps) {
+  const BODY_MARKER = SECRET_LOCAL;
+  return <group>{BODY_MARKER}</group>;
+}
+
+export const COLUMNS = 7;
+export const makeBoard = (rows: number, cols: number): Board => {
+  return BODY_ONLY;
+};
+export type Player = 'red' | 'yellow';
+export default Board3D;
+`;
+const board3dSummary = summarizeModuleExports('src/components/Board3D.tsx', board3d, 2000);
+assert.match(board3dSummary, /interface Board3DProps \{/);
+assert.match(board3dSummary, /onColumnClick: \(col: number\) => void;/);
+assert.match(board3dSummary, /export function Board3D\(\{ board, onColumnClick \}: Board3DProps\) \{ … \}/);
+assert.match(board3dSummary, /export const COLUMNS = 7/);
+assert.match(board3dSummary, /export const makeBoard = \(rows: number, cols: number\): Board => …/);
+assert.match(board3dSummary, /export type Player = 'red' \| 'yellow';/);
+assert.match(board3dSummary, /export default Board3D;/);
+assert.doesNotMatch(board3dSummary, /BODY_MARKER|BODY_ONLY|SECRET_LOCAL/);
+assert.equal(summarizeModuleExports('src/main.tsx', 'import x from "x";\nrender(x);\n'), '');
+assert.equal(summarizeModuleExports('src/styles.css', 'export {}'), '');
+assert.ok(summarizeModuleExports('src/components/Board3D.tsx', board3d, 120).length <= 125);
+const multiLine = scanTopLevelDeclarations(
+  'export function Piece3D({\n  position,\n  player\n}: Piece3DProps) {\n  return null;\n}\n'
+);
+assert.equal(multiLine[0].name, 'Piece3D');
+assert.match(multiLine[0].text, /player\n\}: Piece3DProps\) \{ … \}$/);
+
+// Which earlier-step files a task should integrate
+const projectFiles = [
+  { path: 'src/game/gameLogic.ts', content: 'export type Cell = 0 | 1 | 2;\nexport function dropPiece(board: Cell[][], col: number): Cell[][] {\n  return board;\n}\n' },
+  { path: 'src/game/aiWorker.ts', content: 'export function bestMove(board: number[][]): number {\n  return 3;\n}\n' },
+  {
+    path: 'src/components/Board3D.tsx',
+    content: 'interface Board3DProps { board: number[][]; onColumnClick: (c: number) => void }\nexport function Board3D(props: Board3DProps) {\n  return null;\n}\n'
+  },
+  { path: 'src/components/HUD.tsx', content: 'export function HUD(props: { turn: number }) {\n  return null;\n}\n' },
+  { path: 'src/utils/format.ts', content: 'export const fmt = (n: number) => String(n);\n' },
+  { path: 'src/main.tsx', content: 'import "./App";\n' },
+  { path: 'src/App.test.tsx', content: 'export const t = 1;\n' },
+  { path: 'package.json', content: '{}' }
+];
+const appPick = pickExistingProjectExports({
+  taskPath: 'src/App.tsx',
+  brief: 'Create src/App.tsx that renders the 3D Connect 4 game with an AI opponent.',
+  files: projectFiles,
+  excludePaths: ['src/components/HUD.tsx'],
+  maxChars: 4000
+});
+const appPaths = appPick.map(p => p.path);
+assert.deepEqual([...appPaths].sort(), [
+  'src/components/Board3D.tsx',
+  'src/game/aiWorker.ts',
+  'src/game/gameLogic.ts',
+  'src/utils/format.ts'
+]);
+assert.ok(appPick.every(p => p.summary.length > 0));
+assert.match(appPick.find(p => p.path === 'src/game/gameLogic.ts')?.summary ?? '', /export function dropPiece\(board: Cell\[\]\[\], col: number\): Cell\[\]\[\] \{ … \}/);
+assert.match(appPick.find(p => p.path === 'src/components/Board3D.tsx')?.summary ?? '', /interface Board3DProps/);
+assert.ok(!appPaths.includes('src/main.tsx') && !appPaths.includes('src/App.test.tsx'));
+
+// A non-entry file only gets what its imports would hit; named files rank first
+const hudPick = pickExistingProjectExports({
+  taskPath: 'src/components/HUD.tsx',
+  brief: 'Show whose turn it is using the types from src/game/gameLogic.ts',
+  files: projectFiles,
+  maxChars: 4000
+});
+assert.equal(hudPick[0].path, 'src/game/gameLogic.ts');
+assert.ok(hudPick.some(p => p.path === 'src/components/Board3D.tsx'), 'same folder');
+assert.ok(!hudPick.some(p => p.path === 'src/components/HUD.tsx'), 'never its own file');
+assert.ok(!hudPick.some(p => p.path === 'src/main.tsx' || p.path === 'package.json'));
+assert.ok(
+  hudPick.findIndex(p => p.path === 'src/components/Board3D.tsx') <
+    hudPick.findIndex(p => p.path === 'src/game/aiWorker.ts'),
+  'same-folder file outranks a generic game/ file'
+);
+assert.deepEqual(
+  rankExistingProjectFiles({ taskPath: 'src/x.ts', brief: 'unrelated', paths: ['docs/readme.md', 'other/y.ts'] }),
+  []
+);
+
+// Total budget is honoured
+const tinyBudget = pickExistingProjectExports({
+  taskPath: 'src/App.tsx',
+  brief: 'wire it up',
+  files: projectFiles,
+  maxChars: 200
+});
+assert.ok(tinyBudget.reduce((n, p) => n + p.path.length + p.summary.length, 0) <= 200);
+assert.deepEqual(
+  pickExistingProjectExports({ taskPath: 'src/App.tsx', brief: 'x', files: projectFiles, maxChars: 40 }),
+  []
+);
 
 console.log('repoMap.selftest ok');

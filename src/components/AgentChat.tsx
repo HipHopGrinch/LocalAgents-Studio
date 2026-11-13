@@ -63,10 +63,12 @@ import {
   pickBestModelForComplexity,
   pickFailoverTarget,
   rankModelsForWeight,
+  nodeAllowsRole,
   selectBestEndpointForTask,
   isFrontierNode,
   stripThinking,
   looksLikeCreateIntent,
+  continuationAddsContent,
   continuationClosedWrite,
   hasUnclosedWrite,
   truncatedWriteToolCall,
@@ -75,10 +77,14 @@ import {
   annotateAppliedWrites
 } from '../lib/tools';
 import {
+  alreadyWrittenDeclarations,
   assignSwarmTasksToCluster,
   buildContractRepairPrompt,
+  buildForcedWritePrompt,
   buildLeadArchitectPrompt,
   buildRepairWorkerPrompt,
+  canForceWholeFile,
+  wholeFileCharLimit,
   buildSwarmWorkerPrompt,
   buildSwarmWorkerSystemStub,
   fallbackSwarmManifest,
@@ -86,8 +92,12 @@ import {
   groupTscErrorsByFile,
   isTypeScriptContractPath,
   endpointQueueKey,
+  orderStepDispatchTasks,
+  referencedDeclarationsForErrors,
+  shouldSerializeStepTasks,
   parseSwarmManifest,
   partitionSwarmTasksIntoWaves,
+  pathsNamedInText,
   queueAssignmentsByGpu,
   shouldRejectPlannerWrite,
   looksLikePlaceholderCode,
@@ -113,6 +123,9 @@ import {
 } from '../lib/projectScaffold';
 import { verifyCommandForStack, type DeliveryStack } from '../lib/deliveryIntent';
 import {
+  brainIsStaleForFolder,
+  brainWorkspaceKey,
+  brainWriteDecision,
   emptyProjectBrain,
   extractAtMentions,
   formatProjectBrainForPrompt,
@@ -130,9 +143,13 @@ import {
   formatRepoMap,
   invalidateRepoMap,
   listSourceFolderFiles,
+  listWorkspaceFiles,
+  pickExistingProjectExports,
+  rankExistingProjectFiles,
   relevantFilesForTask,
   type RepoMap
 } from '../lib/repoMap';
+import { canonicalizePaths } from '../lib/workspacePaths';
 import {
   annotateMissingDependencies,
   beginVerify,
@@ -147,6 +164,7 @@ import {
   typescriptVerifyUsesCompiler,
   verifyOutputFailed
 } from '../lib/verifyGate';
+import { fixUnusedImports, isHygieneError } from '../lib/hygieneFix';
 import {
   ELECTRON_DIST_TIMEOUT_SEC,
   decideElectronDist,
@@ -169,6 +187,8 @@ import {
   historyForModel,
   isEmptyTerminalResult,
   isReadOnlyToolBatch,
+  isRepeatedEditStop,
+  isUnchangedWrite,
   latestTerminalResult,
   runCommandTools,
   runAuxTools,
@@ -181,14 +201,19 @@ import {
   MISSING_REVIEW_VERDICT_NOTICE,
   MISSING_REVIEW_VERDICT_WAIT_NOTICE,
   boundReviewContinuation,
+  isStaleCompilerNay,
+  nayCitesCompilerErrors,
   needsReviewVerdictTurn,
   nonPlanReviewLacksMarkup,
   reviewFollowUpBudget,
   reviewPreloadCaps,
-  reviewVerdictNowInstruction
+  reviewVerdictNowInstruction,
+  staleNayReaskPrompt,
+  verifyPassedStatement
 } from '../lib/reviewTurn';
 import { streamChat } from '../lib/ollamaClient';
 import {
+  computeTokPerSec,
   createRunLog,
   runLogPath,
   shapeToolForRunLog,
@@ -211,11 +236,11 @@ import { snapshotNodeConfigs } from './agent/snapshotNodes';
 import { scrubStructuredMarkup } from './agent/messageText';
 import {
   modelSupportsThinking,
-  resolveThinkOption,
   thinkFalseForSidePaths,
   thinkingToggleLabel,
   type ThinkPersona
 } from '../lib/thinking';
+import { resolveNodeThink, turnThinkFields } from '../lib/modelProfile';
 import {
   capActiveFileForTier,
   clampNumCtx,
@@ -239,18 +264,30 @@ import {
   notePromptSample,
   ollamaOptions,
   pinnedChatOptions,
+  planCutOffRetry,
   prependVolatileContext,
+  raisedOutputBudget,
   siblingFile,
-  warmModels
+  warmModels,
+  withRaisedOutputBudget
 } from './agent/modelRequest';
 import {
   contextWasExhausted,
   estimatePromptTokens,
+  outputCapWasHit,
   fitPromptToContext,
   shrinkUserPacket
 } from '../lib/contextMonitor';
-import { webEntryVerifyErrors } from '../lib/webEntryGate';
-import { resolveModelFit, type ModelFitTier } from '../lib/clusterInventory';
+import { webEntryGateDeferred, webEntryVerifyErrors, webRunHint } from '../lib/webEntryGate';
+import {
+  evaluateRenderCheck,
+  hasRenderCheckErrors,
+  isRenderRelevantFile,
+  RENDER_HEAL_HINT,
+  type RenderCheckRaw
+} from '../lib/renderGate';
+import { resolveContextMeter } from '../lib/contextMeterSource';
+import { resolveModelFit, resolveReviewerFileCaps, type ModelFitTier } from '../lib/clusterInventory';
 import {
   ASSIST_MAX_PREDICT,
   FREE_TIER_ASSIST_SYSTEM,
@@ -320,17 +357,23 @@ import {
 import {
   chooseFullAutoPlanOption,
   fullAutoPickNotice,
+  hasProseFindings,
   messagesFromOrigin,
+  missingDeltaAsFail,
   nayNotesFromReviewerProse,
   nayNotesFromToolErrors,
   newestReviewerMessage,
+  noVerdictAdvanceNote,
   canReaskMissingVerdict,
   pendingPlanChoice,
   pickExplicitStepVerdict,
+  pickProseStepVerdict,
+  plainNote,
   releaseCoderRedispatch,
   rememberVerdictReask,
+  reviewDeltaReaskPromptWithContext,
   takeCoderRedispatch,
-  VERDICT_REASK_PROMPT,
+  verdictReaskPromptWithContext,
   type FullAutoStepGate
 } from '../lib/fullAuto';
 import {
@@ -340,6 +383,7 @@ import {
   formatQueueForReviewer,
   getActiveTask,
   hasOpenTasks,
+  markFailed,
   markInProgress,
   markStopped,
   pickNextPending,
@@ -350,8 +394,12 @@ import {
   appendPlannerPlan,
   applyStepVerdict,
   canHealAdvanceOnGreenVerify,
+  collectStepContextPaths,
   collectStepFilePaths,
   createPlanFromParsed,
+  filePathsInText,
+  reworkTargetFiles,
+  resolveContextPaths,
   editStepTask,
   formatPlanForPanel,
   formatStepForCoders,
@@ -370,14 +418,27 @@ import {
   notesLookLikeVerifyFailure,
   parsePlannerPlanJson,
   planReadyForRelease,
+  planEndMessage,
+  planHasDebt,
   plannerPlanFromReviewQueue,
   plannerPlanPath,
+  resolveBareTaskFiles,
   retryFailedStep,
   skipStep,
   stepLooksLikeFixStep,
   writePlannerPlan
 } from '../lib/plannerPlan';
-import { transition, type RunToken } from '../lib/conductor';
+import {
+  leftFailedNotice,
+  MAX_LOGIC_HEAL_ROUNDS,
+  MAX_REVIEW_FIX_ROUNDS,
+  reopenActiveStepForRework,
+  reviewFixKey,
+  reviewFixesOwnTheTurn,
+  takeReviewFixRound,
+  transition,
+  type RunToken
+} from '../lib/conductor';
 import {
   failUnfinishedNodeWork,
   findNodeWorkIndex,
@@ -414,6 +475,9 @@ import {
   type ClusterAutoConfigPlan
 } from '../lib/clusterAdvisor';
 import { normalizeClusterNodes } from '../lib/tools';
+
+/** Quiet time before edited chat messages are handed to App for saving. */
+const MESSAGE_SAVE_DEBOUNCE_MS = 750;
 
 interface AgentChatProps {
   agents: AgentPersona[];
@@ -509,6 +573,8 @@ interface AgentChatProps {
   }) => void;
   /** Desktop palette calls this to copy the in-memory run log. */
   onRunLogApi?: (api: { copy: () => void } | null) => void;
+  /** Bumps each time a folder is opened, even when the path string is unchanged. */
+  workspaceEpoch?: number;
 }
 
 function runLogFailureCount(stats: RunLogStats): number {
@@ -529,7 +595,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   nodeWorkWidth = 280,
   onNodeWorkWidthChange,
   onChromeWidthsChange,
-  onApplyFileWrite,
+  onApplyFileWrite: onApplyFileWriteProp,
   onExecuteToolCommand,
   onOpenFileInEditor,
   onRecordTokens,
@@ -561,7 +627,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   peerConductor = null,
   peerChatMirror = null,
   onLiveConductorPublish,
-  onRunLogApi
+  onRunLogApi,
+  workspaceEpoch = 0
 }) => {
   const toolStepLimit = toolContinuationLimit(maxAgentSteps);
   const currentAgent = agents.find(a => a.id === selectedAgentId) || agents[0];
@@ -617,6 +684,52 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const lastNoticeRef = useRef<string | null>(null);
   /** End-of-run tsc heals. Reset when a new owned Conductor run starts. */
   const finalVerifyHealsRef = useRef(0);
+  /** Newest verify result from the run log. A pass clears the failure text. */
+  const lastVerifyEvidenceRef = useRef<{ ok: boolean; output: string }>({ ok: true, output: '' });
+  /** A green verify with no write, command or new run since. Null means nothing is known. */
+  const greenVerifyRef = useRef<{ output: string; detail: string } | null>(null);
+  /**
+   * Bumped by every applied file write / edit and every agent command that can change the workspace
+   * (see `onApplyFileWrite`, `executeTrackedCommand` and the tool events in the run log). A verify
+   * result computed at generation N is still valid while the counter reads N.
+   */
+  const workspaceWriteGenRef = useRef(0);
+  /** > 0 while the project verify command itself runs: a verify never invalidates its own result. */
+  const verifyCommandRunningRef = useRef(0);
+  /** The newest unified verify result and the write generation it was computed at. */
+  const verifyCacheRef = useRef<{
+    gen: number;
+    at: number;
+    workspace: string;
+    /** Active plan step the result was judged for (the web entry gate defers per step). */
+    step: string;
+    result: { ok: boolean; output: string; fingerprint: string };
+    green: { output: string; detail: string } | null;
+  } | null>(null);
+  /**
+   * Render smoke check outcome for one write generation: at most one real check per generation, whatever
+   * verify re-runs. `errors` is compiler-shaped TS91xx text ('' = pass or skipped); `notes` are warnings
+   * for the Reviewer prompt.
+   */
+  const renderCheckRef = useRef<{
+    gen: number;
+    workspace: string;
+    errors: string;
+    notes: string;
+    summary: string;
+    skipped: boolean;
+    screenshotRel: string;
+  } | null>(null);
+  /** Stale-error Nay re-asks spent, keyed `planId:stepId:round` (round = verdict count for the step). */
+  const staleNayReasksRef = useRef<Record<string, number>>({});
+  /** Failed steps that already got their one end-of-plan Reviewer pass, keyed `planId:stepId`. */
+  const debtReviewedRef = useRef<Record<string, number>>({});
+  /** `planId:stepId:nayCount` keys of a post-heal Reviewer re-check, so each Nay gets at most one. */
+  const healFreshReviewRef = useRef<Record<string, number>>({});
+  /** Logic-heal rounds spent per `planId:stepId`. */
+  const logicHealRoundsRef = useRef<Record<string, number>>({});
+  /** Files a rework dispatch narrowed to, so a failed-write retry keeps the same scope. */
+  const reworkScopeRef = useRef<{ stepId: string; files: string[] } | null>(null);
   const appVersionRef = useRef('');
   /** Folder that is open right now. */
   const workspacePathRef = useRef(workspacePath);
@@ -663,6 +776,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
    * Planner keeps durable state via plan/work log; workers do not inherit the full chat.
    */
   const ephemeralWorkerRef = useRef(false);
+  /** The Conductor, not the user, moved the agent tab to a worker; the run's end puts Planner back. */
+  const conductorWorkerTabRef = useRef(false);
 
   const [input, setInput] = useState('');
   const [pendingImages, setPendingImages] = useState<string[]>([]);
@@ -740,11 +855,19 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const rulesCapFor = (tier: 'tight' | 'standard' | 'wide') =>
     tier === 'wide' ? 16000 : tier === 'tight' ? 4000 : 6000;
   const [pinnedFiles, setPinnedFiles] = useState<string[]>([]);
+  /** Folder identity (path + open epoch) the in-memory brain was loaded or initialised for. */
+  const brainLoadedKeyRef = useRef('');
+  const openWorkspaceKeyRef = useRef('');
+  const workspaceKey = brainWorkspaceKey(workspacePath, workspaceEpoch);
+  openWorkspaceKeyRef.current = workspaceKey;
   const commitProjectBrain = (next: ProjectBrain) => {
+    const where = brainWriteDecision(workspaceKey, openWorkspaceKeyRef.current, brainLoadedKeyRef.current);
+    // A closure from a folder that is no longer open must not touch the new folder's brain.
+    if (where === 'drop') return;
     const stamped = { ...next, updatedAt: Date.now() };
     projectBrainRef.current = stamped;
     setProjectBrain(stamped);
-    if (!workspacePath || !window.electronAPI?.writeFile) return;
+    if (where !== 'write' || !workspacePath || !window.electronAPI?.writeFile) return;
     void window.electronAPI.writeFile(projectBrainPath(workspacePath), JSON.stringify(stamped, null, 2));
   };
   const projectContextForPrompt = (maxRules = 6000) =>
@@ -795,6 +918,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   );
   /** Auto-review Nay reworks per step id — caps infinite Coder↔Reviewer loops. */
   const stepReworkCountRef = useRef<Record<string, number>>({});
+  /** Coder rounds per review-fix task, and the tasks Full auto already escalated once. */
+  const reviewFixRoundsRef = useRef<Record<string, number>>({});
+  const reviewFixEscalatedRef = useRef<Set<string>>(new Set());
   /** Pre-coder file bytes keyed by step id. Capped at 2 MB across the map. */
   const stepSnapshotsRef = useRef<Map<string, { path: string; content: string }[]>>(new Map());
   const STEP_SNAPSHOT_CAP = 2 * 1024 * 1024;
@@ -906,6 +1032,20 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     else scheduleRunLog();
   };
   logRunImplRef.current = (event: RunLogInput) => {
+    if (event.kind === 'verify') {
+      lastVerifyEvidenceRef.current = { ok: event.ok, output: event.ok ? '' : event.output || '' };
+      greenVerifyRef.current = event.ok
+        ? {
+            output: event.output || '',
+            detail: /workspace tsc/i.test(event.output || '')
+              ? 'workspace tsc, exit 0'
+              : `${projectBrainRef.current.verifyCommand || 'project verify'}, exit 0`
+          }
+        : null;
+    } else if (event.kind === 'tool' && /write|edit|delete|move|rename|patch|run_command/i.test(event.name)) {
+      greenVerifyRef.current = null;
+      workspaceWriteGenRef.current += 1;
+    }
     runLogRef.current.add(event);
     publishRunLog(false);
   };
@@ -939,6 +1079,11 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     const step = getActiveStep(plannerPlanRef.current);
     return step ? String(step.id) : undefined;
   };
+  /** The step a verdict turn judges: the named one (end-of-plan pass on a failed step), else the active one. */
+  const verdictStepFor = (stepId?: string) => {
+    const plan = plannerPlanRef.current;
+    return (stepId ? plan?.steps.find(s => String(s.id) === String(stepId)) : undefined) || getActiveStep(plan);
+  };
   const estimateTurnTokens = (parts: Array<string | undefined>, model?: string) => {
     const kept = parts.filter((part): part is string => typeof part === 'string' && part.length > 0);
     if (!kept.length) return undefined;
@@ -954,7 +1099,11 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     logRun({
       kind: 'tool',
       name: tool.name,
-      path: tool.args?.path,
+      // A run_command tag can carry the worker's expected file as `path`. Log the command instead.
+      path:
+        tool.name === 'run_command'
+          ? (tool.args?.command || tool.body || '').replace(/\s+/g, ' ').trim().slice(0, 160) || undefined
+          : tool.args?.path,
       status: tool.status,
       ...(shaped.exitCode != null ? { exitCode: shaped.exitCode } : {}),
       ...(shaped.result ? { result: shaped.result } : {}),
@@ -1060,7 +1209,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       if (taken.aborted) {
         logTurn({ kind: 'turn', ...meta, wallMs, aborted: true });
       } else {
-        logTurn({ kind: 'turn', ...meta, wallMs, ...summarizeStats(taken.result.stats) });
+        logTurn({ kind: 'turn', ...meta, wallMs, ...summarizeStats(taken.result.stats), ...turnThinkFields(taken.result) });
       }
       return taken;
     } catch (err) {
@@ -1120,8 +1269,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       );
     };
   }, []);
-  useEffect(() => {
-    if (workspacePath === logWorkspaceRef.current) return;
+  /** A different folder, or the same path reopened empty, starts with an empty log. */
+  const resetRunLogForFolder = (root: string) => {
     if (runLogTimerRef.current != null) {
       window.clearTimeout(runLogTimerRef.current);
       runLogTimerRef.current = null;
@@ -1132,13 +1281,17 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     runLogRef.current = fresh;
     const id = conversationIdRef.current;
     if (id) runLogsRef.current.set(id, fresh);
-    logWorkspaceRef.current = workspacePath;
+    logWorkspaceRef.current = root;
     activeRunLogIdRef.current = null;
     lastNoticeRef.current = null;
     runLogFailRef.current = 0;
     setRunLogFailures(0);
     runLogSaveErrorRef.current = null;
     setRunLogSaveError(null);
+  };
+  useEffect(() => {
+    if (workspacePath === logWorkspaceRef.current) return;
+    resetRunLogForFolder(workspacePath);
   }, [workspacePath]);
   useEffect(() => {
     const text = executingPlanNotice;
@@ -1250,6 +1403,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     const releasing = owned && runIsCurrent(token);
     leaveConductorSession(owned, token);
     if (releasing && !heldRef.current) failUnfinishedWork('Stopped before finishing');
+    if (releasing && !heldRef.current && conductorWorkerTabRef.current) restorePlannerControl();
     if (releasing) endLoggedRun(token, 'finished');
   };
 
@@ -1277,6 +1431,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     if (!entered) return null;
     if (entered.owned) {
       finalVerifyHealsRef.current = 0;
+      greenVerifyRef.current = null;
       toolDepsRef.current = {
         ...toolDepsRef.current,
         editProgress: editProgressRef.current
@@ -1459,8 +1614,28 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   };
 
   const skipPersistRef = useRef(false);
-  /** Last message array handed to the persist effect. Local messages that differ from it are not saved yet. */
+  /** Last message array handed to App. Local messages that differ from it are not saved yet. */
   const persistedMessagesRef = useRef<ChatMessage[] | null>(null);
+  const pendingSaveRef = useRef<{ messages: ChatMessage[]; send: (messages: ChatMessage[]) => void } | null>(null);
+  const saveTimerRef = useRef<number | null>(null);
+  const dropPendingSave = () => {
+    if (saveTimerRef.current != null) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    pendingSaveRef.current = null;
+  };
+  const flushPendingSave = () => {
+    if (saveTimerRef.current != null) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    const pending = pendingSaveRef.current;
+    if (!pending) return;
+    pendingSaveRef.current = null;
+    persistedMessagesRef.current = pending.messages;
+    pending.send(pending.messages);
+  };
   /** The switch commit's React state is still the previous chat. Skip one ref copy. */
   const skipMessagesSyncRef = useRef(false);
 
@@ -1494,6 +1669,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   useEffect(() => {
     const nextId = conversation?.id ?? null;
     if (nextId !== conversationIdRef.current) {
+      // The previous chat's last edits go to App before the buffer is replaced.
+      flushPendingSave();
       stopConductor();
       adoptRunLog(nextId);
       releaseStashedPlanChoice();
@@ -1790,12 +1967,84 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     };
   }, [conversation?.id, workspacePath]);
 
-  // Project brain + rules survive New Chat and compaction.
+  /**
+   * The folder was deleted, emptied, or swapped under the same path. Memory from the old folder
+   * (brain, repo map, finished plan, run log) must not seed a new project.
+   */
+  const dropStaleFolderMemory = async (
+    root: string,
+    isCurrent: () => boolean,
+    opts: { resetBrain: boolean; resetLog: boolean; ownsHold?: boolean }
+  ) => {
+    if (opts.resetBrain) {
+      const blank = emptyProjectBrain();
+      projectBrainRef.current = blank;
+      setProjectBrain(blank);
+    }
+    const idle = () => !heldRef.current || !!opts.ownsHold;
+    const cid = conversationIdRef.current;
+    if (cid && idle() && plannerPlanRef.current && window.electronAPI?.readFile) {
+      let planOnDisk = true;
+      try {
+        const res = await window.electronAPI.readFile(plannerPlanPath(root, cid));
+        planOnDisk = !!res?.content;
+      } catch {
+        planOnDisk = false;
+      }
+      if (!isCurrent()) return;
+      if (!planOnDisk && idle() && conversationIdRef.current === cid) {
+        plannerPlanRef.current = null;
+        setPlannerPlanView(null);
+        stepReworkCountRef.current = {};
+        fullAutoGateRef.current = null;
+        onConversationPatch?.({ plannerPlan: null });
+      }
+    }
+    if (opts.resetLog && !heldRef.current) resetRunLogForFolder(root);
+    if (opts.resetBrain) rebuildRepoMap();
+  };
+
+  /** Start of a user task: a brain file that vanished from disk means memory is from a deleted folder. */
+  const ensureFreshProjectState = async (run: ConductorRun) => {
+    const root = workspacePath;
+    const key = workspaceKey;
+    if (!root || !window.electronAPI?.readFile) return;
+    let onDisk = true;
+    try {
+      const res = await window.electronAPI.readFile(projectBrainPath(root));
+      onDisk = !!res?.content;
+    } catch {
+      onDisk = false;
+    }
+    if (!runLive(run) || openWorkspaceKeyRef.current !== key) return;
+    if (!brainIsStaleForFolder(onDisk, projectBrainRef.current)) return;
+    logRun({ kind: 'info', text: 'Project brain missing on disk — reset stale project memory for this folder.' });
+    await dropStaleFolderMemory(root, () => runLive(run) && openWorkspaceKeyRef.current === key, {
+      resetBrain: true,
+      resetLog: false,
+      ownsHold: true
+    });
+    brainLoadedKeyRef.current = key;
+  };
+
+  // Project brain + rules reload whenever a folder is opened, even when the path string is unchanged.
   useEffect(() => {
-    if (!workspacePath || !window.electronAPI?.readFile) return;
+    const key = workspaceKey;
+    // Nothing in memory is trusted for a newly opened folder until it has been read from disk.
+    const blank = emptyProjectBrain();
+    projectBrainRef.current = blank;
+    setProjectBrain(blank);
+    repoMapGenRef.current += 1;
+    repoMapRef.current = null;
+    projectRulesRef.current = '';
+    if (!workspacePath || !window.electronAPI?.readFile) {
+      brainLoadedKeyRef.current = key;
+      return;
+    }
     let cancel = false;
     (async () => {
       const brainRes = await window.electronAPI.readFile(projectBrainPath(workspacePath));
+      const brainOnDisk = !!brainRes.content;
       const brain = brainRes.content
         ? parseProjectBrain(brainRes.content) || emptyProjectBrain()
         : emptyProjectBrain();
@@ -1825,38 +2074,74 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       if (cancel) return;
       projectRulesRef.current = ruleChunks.join('\n\n').slice(0, 24000);
       projectBrainRef.current = brain;
+      brainLoadedKeyRef.current = key;
+      const gen = ++repoMapGenRef.current;
       void buildRepoMap(workspacePath).then(map => {
-        if (!cancel) repoMapRef.current = map;
+        if (!cancel && gen === repoMapGenRef.current) repoMapRef.current = map;
       });
       setProjectBrain(brain);
+      // No brain file: the folder is new or was wiped. Old plan/log memory does not belong to it.
+      if (!brainOnDisk) {
+        await dropStaleFolderMemory(workspacePath, () => !cancel, {
+          resetBrain: false,
+          resetLog: true
+        });
+      }
     })();
     return () => {
       cancel = true;
     };
-  }, [workspacePath]);
+  }, [workspacePath, workspaceEpoch]);
 
   // Persist message edits up to App (skip one tick after conversation switch)
+  // App serializes and saves the whole chat on every call, so saves are debounced. A pending
+  // save keeps the callback of the render that scheduled it: it is bound to that chat and folder.
   useEffect(() => {
     if (skipPersistRef.current) {
       skipPersistRef.current = false;
+      // Adopted messages replace anything local that was still waiting to be saved.
+      dropPendingSave();
       persistedMessagesRef.current = messages;
       return;
     }
     if (!conversation?.id || conversationIdRef.current !== conversation.id) return;
-    persistedMessagesRef.current = messages;
-    onMessagesChange(messages);
+    pendingSaveRef.current = { messages, send: onMessagesChange };
+    if (saveTimerRef.current != null) window.clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = window.setTimeout(flushPendingSave, MESSAGE_SAVE_DEBOUNCE_MS);
   }, [messages]);
+
+  // A run that ended (or was stopped) saves right away.
+  useEffect(() => {
+    if (!isStreaming) flushPendingSave();
+  }, [isStreaming]);
+
+  // Folder switch and unmount save what is waiting.
+  useEffect(() => {
+    flushPendingSave();
+  }, [workspacePath]);
+  useEffect(() => flushPendingSave, []);
 
   // Workspace file tree summary for prompt injection
   const workspaceOverview = (workspaceFiles && workspaceFiles.length > 0)
     ? workspaceFiles.slice(0, 80).map(f => (f.isDirectory ? `📁 ${f.name}/` : `📄 ${f.name}`)).join('\n')
     : '(empty workspace or loading)';
 
+  /** Every applied workspace write bumps the write generation, so a cached verify result goes stale. */
+  const onApplyFileWrite = async (filePath: string, content: string): Promise<boolean> => {
+    workspaceWriteGenRef.current += 1;
+    try {
+      return await onApplyFileWriteProp(filePath, content);
+    } finally {
+      workspaceWriteGenRef.current += 1;
+    }
+  };
+
   const executeTrackedCommand = async (command: string, opts?: { timeoutSec?: number }) => {
     const startedRun = runRef.current;
     const startedWorkspace = workspacePathRef.current;
     const frame = beginActivity('tool', 'Terminal', command.slice(0, 90));
     try {
+      if (!verifyCommandRunningRef.current) workspaceWriteGenRef.current += 1;
       const out = await onExecuteToolCommand(command, opts);
       if (workspacePathRef.current === startedWorkspace && (!startedRun || runLive(startedRun))) {
         commitProjectBrain({
@@ -1870,10 +2155,13 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       }
       return out;
     } finally {
+      if (!verifyCommandRunningRef.current) workspaceWriteGenRef.current += 1;
       endActivity(frame);
     }
   };
 
+  /** Files the active plan step assigned to its Coders: a write to a suffix/case twin is redirected here. */
+  const assignedFilesRef = useRef<string[]>([]);
   const toolDeps = {
     workspacePath,
     onApplyFileWrite,
@@ -1881,6 +2169,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     nodes,
     searxngUrl,
     getOwnedFiles: () => projectBrainRef.current.ownedFiles,
+    getAssignedFiles: () => assignedFilesRef.current,
     getRepoMap: () => repoMapRef.current,
     mcpServersJson,
     editProgress: editProgressRef.current,
@@ -2246,12 +2535,8 @@ ${instruction}`,
     model: string,
     persona?: ThinkPersona
   ) => {
-    const live = node?.models?.find(m => m.name === model);
-    const meta = node?.modelMeta?.[model];
-    const modelInfo = live || (meta
-      ? { name: model, capabilities: meta.capabilities, thinking: meta.thinking }
-      : undefined);
-    const think = resolveThinkOption(modelInfo, node?.modelPrefs?.[model]?.think, { persona });
+    // Same resolution the budget math uses (modelProfile), so num_predict and `think` agree.
+    const think = resolveNodeThink(node, model, persona);
     if (think === undefined) return body;
     return { ...body, think };
   };
@@ -2473,8 +2758,21 @@ ${instruction}`,
   };
 
   /** Hand control back to Planner after an ephemeral Coder/Reviewer worker finishes. */
+  const selectWorkerTab = (agentId: string) => {
+    ephemeralWorkerRef.current = true;
+    conductorWorkerTabRef.current = true;
+    onSelectAgent(agentId);
+    onConversationPatch?.({ agentId });
+  };
+
+  const pickAgentTab = (agentId: string) => {
+    conductorWorkerTabRef.current = false;
+    onSelectAgent(agentId);
+  };
+
   const restorePlannerControl = (notice?: string) => {
     ephemeralWorkerRef.current = false;
+    conductorWorkerTabRef.current = false;
     onSelectAgent(plannerAgent.id);
     onConversationPatch?.({ agentId: plannerAgent.id });
     if (!notice) return;
@@ -2584,11 +2882,346 @@ ${instruction}`,
       if (taken.aborted || !runIsCurrent(token)) return content;
       const extra = (taken.result.content || '').trim();
       if (!extra) return content;
+      // After a length stop, a lone close tag or a few characters would turn a partial file into
+      // a complete-looking one. Leave the write open so the caller fails it instead of saving it.
+      if (!cleanStop && !continuationAddsContent(extra)) {
+        hostLog(
+          'warn',
+          `finish truncated write: continuation for ${writePath} added only ${
+            taken.result.stats?.evalCount ?? 0
+          } tokens; not saving a partial file.`
+        );
+        return content;
+      }
       return content + (content.endsWith('\n') ? '' : '\n') + extra;
     } catch (err: any) {
       hostLog('error', `finish truncated write: ${err?.message || err}`);
       return content;
     }
+  };
+
+  /**
+   * Same packet, bigger num_predict, after a reply stopped at its output cap with window to spare.
+   * The caller checks `aborted` / run liveness, like for any other takeChat.
+   */
+  const resendWithRaisedCap = (args: {
+    node: EndpointNode;
+    model: string;
+    body: Record<string, unknown>;
+    raised: number;
+    sent: { num_ctx: number; num_predict: number };
+    stats?: { evalCount?: number };
+    label: string;
+    phase: string;
+    role: string;
+    promptBudget?: number;
+    estPromptTokens?: number;
+    /** Replaces the default "Output cap hit" note. */
+    note?: string;
+    run: ConductorRun;
+  }) => {
+    const { node, model, body, raised, sent, run } = args;
+    const note =
+      args.note ??
+      `Output cap hit at ${args.stats?.evalCount ?? sent.num_predict} tokens${
+        args.label ? ` for ${args.label}` : ''
+      }; retrying with ${raised}.`;
+    logContext('resubmit', note, {
+      numCtx: sent.num_ctx,
+      ...(args.promptBudget != null ? { promptBudget: args.promptBudget } : {}),
+      ...(args.estPromptTokens != null ? { estPromptTokens: args.estPromptTokens } : {})
+    });
+    setExecutingPlanNotice(note);
+    const raisedBody = {
+      ...body,
+      options: { ...(body.options as Record<string, unknown>), num_predict: raised }
+    };
+    return takeChat(
+      {
+        phase: args.phase,
+        role: args.role,
+        nodeId: node.id,
+        nodeName: node.name,
+        model,
+        numCtx: sent.num_ctx,
+        ...(args.promptBudget != null ? { promptBudget: args.promptBudget } : {}),
+        ...(args.estPromptTokens != null ? { estPromptTokens: args.estPromptTokens } : {})
+      },
+      () => streamChat(node.url, raisedBody, () => {}, node.type, node.apiKey),
+      () => runLive(run)
+    );
+  };
+
+  /**
+   * One retry of a reply that stopped for length because thinking used the output budget, for
+   * every role (see `planCutOffRetry`). Frontier: resend with a larger budget. Local with
+   * thinking on and a near-empty visible reply: resend the same packet with `think: false`.
+   * Null when no retry applies. Logs the retry.
+   */
+  const resendFrontierCutOff = (args: {
+    node: EndpointNode;
+    model: string;
+    body: Record<string, unknown>;
+    sent: { num_ctx: number; num_predict: number };
+    stats?: { promptEvalCount?: number; evalCount?: number; doneReason?: string };
+    /** The cut-off reply, so a local thinking-only reply can be told from a long one. */
+    reply?: { content?: string; thinking?: string };
+    role: string;
+    promptBudget?: number;
+    estPromptTokens?: number;
+    run: ConductorRun;
+  }) => {
+    const { node, sent, stats } = args;
+    const plan = planCutOffRetry({
+      frontier: isFrontierNode(node),
+      stats,
+      content: args.reply?.content,
+      thinking: args.reply?.thinking,
+      thinkSent: args.body.think as boolean | string | undefined,
+      numCtx: sent.num_ctx,
+      numPredict: sent.num_predict,
+      estPromptTokens: args.estPromptTokens
+    });
+    if (!plan) return null;
+    const spent = (stats?.evalCount || 0) + (stats?.promptEvalCount || 0);
+    if (plan.kind === 'no-think') {
+      if (spent) onRecordTokens(spent, 0);
+      const noThinkNote = 'thinking used the whole output budget; retried without thinking';
+      const noThinkStep = activeStepId();
+      scopeRunLog().logRun({ kind: 'info', text: noThinkNote, ...(noThinkStep ? { stepId: noThinkStep } : {}) });
+      setExecutingPlanNotice(`${args.model}: ${noThinkNote}.`);
+      const plainBody = { ...args.body, think: false };
+      return takeChat(
+        {
+          phase: 'no-think-resubmit',
+          role: args.role,
+          nodeId: node.id,
+          nodeName: node.name,
+          model: args.model,
+          numCtx: sent.num_ctx,
+          ...(args.promptBudget != null ? { promptBudget: args.promptBudget } : {}),
+          ...(args.estPromptTokens != null ? { estPromptTokens: args.estPromptTokens } : {})
+        },
+        () => streamChat(node.url, plainBody, () => {}, node.type, node.apiKey),
+        () => runLive(args.run)
+      );
+    }
+    const raised = plan.numPredict;
+    if (spent) onRecordTokens(0, spent);
+    const who = args.role ? `${args.role.charAt(0).toUpperCase()}${args.role.slice(1)}` : 'Model';
+    const note = `${who} reply was cut off after ${
+      stats?.evalCount ?? sent.num_predict
+    } tokens (the model's thinking used the output budget); retrying with a larger budget (${raised}).`;
+    const stepId = activeStepId();
+    scopeRunLog().logRun({ kind: 'info', text: note, ...(stepId ? { stepId } : {}) });
+    return resendWithRaisedCap({
+      node,
+      model: args.model,
+      body: args.body,
+      raised,
+      sent,
+      stats,
+      label: '',
+      note,
+      phase: 'cutoff-resubmit',
+      role: args.role,
+      promptBudget: args.promptBudget,
+      estPromptTokens: args.estPromptTokens,
+      run: args.run
+    });
+  };
+
+  /**
+   * One worker reply as write tools for `expectedFilePath`: closed or truncated writes, with
+   * planner-prose and parallel-module rejections. Shared by Swarm worker turns and the forced
+   * write turn so both judge a write the same way.
+   */
+  const parseWorkerWrites = (args: {
+    raw: string;
+    finished: string;
+    stats?: { evalCount?: number; doneReason?: string };
+    id: string;
+    expectedFilePath: string;
+  }): { tools: ToolCall[]; writeTruncated: boolean } => {
+    const { raw, finished, stats, id, expectedFilePath } = args;
+    const { logToolEvent } = scopeRunLog();
+    let tools = parseResponse(finished, id, false, {
+      expectedFilePath,
+      createIntent: true,
+      allowUnclosedSalvage: false
+    }).toolCalls.map(t => anchorWritePath(t, expectedFilePath));
+    let writeTruncated = false;
+    if (!continuationClosedWrite(raw, finished) && hasUnclosedWrite(finished)) {
+      const truncated = truncatedWriteToolCall(finished, id, expectedFilePath);
+      if (truncated) {
+        const anchored = {
+          ...anchorWritePath(truncated, expectedFilePath),
+          result: `output truncated; file not written (reply stopped after ${
+            stats?.evalCount ?? '?'
+          } tokens at ${stats?.doneReason || 'the output cap'} and could not be completed)`
+        };
+        tools = [...tools, anchored];
+        logToolEvent(anchored);
+        writeTruncated = true;
+      }
+    }
+    tools = tools.map(t => {
+      if (
+        (t.name === 'write_file' || t.name === 'edit_file') &&
+        shouldRejectPlannerWrite(t.args?.path || expectedFilePath || '', t.body || '')
+      ) {
+        return {
+          ...t,
+          status: 'error' as const,
+          result:
+            'Rejected: body looks like planner/option prose, not source for this path. Rewrite with real file contents only.'
+        };
+      }
+      if (t.name === 'write_file') {
+        const candidate = t.args?.path || expectedFilePath || '';
+        const existing = preferredExistingPath(projectBrainRef.current.ownedFiles, candidate);
+        if (existing) {
+          return {
+            ...t,
+            status: 'error' as const,
+            result: `Rejected parallel module \`${candidate}\`. Edit the owned file \`${existing}\` instead of creating a second copy.`
+          };
+        }
+      }
+      if (t.status !== 'error') noteOwnedPath(t.args?.path || expectedFilePath);
+      return t;
+    });
+    return { tools, writeTruncated };
+  };
+
+  /**
+   * Last-chance write for a worker that only read files. Fresh context: the short worker stub plus
+   * one packet that already holds the whole file. Read, list and search tags in the reply are
+   * dropped, never run. Logs the attempt and its outcome.
+   */
+  const runForcedWriteTurn = async (args: {
+    node: EndpointNode;
+    model: string;
+    filePath: string;
+    prompt: string;
+    run: ConductorRun;
+    label: string;
+    phase: string;
+    stack?: string;
+  }): Promise<{ tools: ToolCall[]; wrote: boolean }> => {
+    const { node, model, filePath, run } = args;
+    const none = { tools: [] as ToolCall[], wrote: false };
+    if (!runLive(run)) return none;
+    const { logRun } = scopeRunLog();
+    logRun({
+      kind: 'info',
+      text: `${args.label}: no edit after the "edit now" turn. One last turn on ${node.name} · ${model} with the whole file inlined; reads are ignored`
+    });
+    const fit = resolveModelFit(node, model, 'coder', coderAgent.numCtx);
+    applyToolTier(fit.tier);
+    const system = buildSwarmWorkerSystemStub(filePath, args.stack || projectBrainRef.current.stack);
+    const req = pinnedChatOptions({
+      node,
+      model,
+      role: 'coder',
+      createIntent: true,
+      tier: fit.tier,
+      temperature: coderAgent.temperature,
+      fallbackNumCtx: coderAgent.numCtx
+    });
+    const fitted = fitPromptToContext({
+      system,
+      userContent: args.prompt,
+      history: [],
+      maxCtx: req.pinnedCtx,
+      frontier: isFrontierNode(node),
+      modelKey: model,
+      promptBudget: req.promptBudget
+    });
+    const messages = [
+      { role: 'system', content: system },
+      { role: 'user', content: fitted.userContent }
+    ];
+    const options = ollamaOptions(req);
+    const body = withThink({ model, messages, options }, node, model, 'coder');
+    const taken = await takeChat(
+      {
+        phase: args.phase,
+        role: 'coder',
+        nodeId: node.id,
+        nodeName: node.name,
+        model,
+        numCtx: options.num_ctx,
+        promptBudget: req.promptBudget,
+        estPromptTokens: estimateTurnTokens(messages.map(message => message.content), model)
+      },
+      () => streamChat(node.url, body, () => {}, node.type, node.apiKey),
+      () => runLive(run)
+    );
+    if (taken.aborted || !runLive(run)) return none;
+    let res = taken.result;
+    const cutOffForced = await resendFrontierCutOff({
+      node,
+      model,
+      body,
+      sent: options,
+      stats: res.stats,
+      reply: res,
+      role: 'coder',
+      promptBudget: req.promptBudget,
+      estPromptTokens: estimateTurnTokens(messages.map(message => message.content), model),
+      run
+    });
+    if (cutOffForced) {
+      if (cutOffForced.aborted || !runLive(run)) return none;
+      res = cutOffForced.result;
+    }
+    notePromptSample(model, messages, res.stats);
+    if (res.stats?.evalCount) {
+      const spent = res.stats.evalCount + (res.stats.promptEvalCount || 0);
+      if (isFrontierNode(node)) onRecordTokens(0, spent);
+      else onRecordTokens(spent, 0);
+    }
+    const finished = await finishTruncatedWrites(
+      node,
+      model,
+      res.content,
+      res.stats?.doneReason,
+      filePath,
+      run.token
+    );
+    if (!runLive(run)) return none;
+    const parsed = parseWorkerWrites({
+      raw: res.content,
+      finished,
+      stats: res.stats,
+      id: `forced-write-${Date.now()}`,
+      expectedFilePath: filePath
+    });
+    let tools = parsed.tools.filter(t => t.name === 'write_file' || t.name === 'edit_file');
+    tools = await autoApplyWritableTools(tools, toolDepsRef.current);
+    if (!runLive(run)) return none;
+    updateProgress(log => noteSavedFiles(log, tools, savedFileFingerprints()));
+    noteAppliedWrites(tools);
+    const root = (workspacePathRef.current || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+    const rel = (p: string) => {
+      let r = p.replace(/\\/g, '/').toLowerCase();
+      if (root && r.startsWith(`${root}/`)) r = r.slice(root.length + 1);
+      return r.replace(/^(?:\.\/|\/)+/, '');
+    };
+    const wrote = tools.some(
+      t => t.status === 'done' && rel(t.args?.path || filePath) === rel(filePath)
+    );
+    const failure = tools.find(t => t.status === 'error')?.result;
+    logRun({
+      kind: 'info',
+      text: wrote
+        ? `${args.label}: the last turn wrote ${filePath}`
+        : `${args.label}: the last turn wrote nothing for ${filePath}${
+            failure ? ` (${String(failure).replace(/\s+/g, ' ').slice(0, 160)})` : tools.length ? '' : ' (no edit_file or write_file in the reply)'
+          }`
+    });
+    return { tools, wrote };
   };
 
   // ==========================================
@@ -2653,10 +3286,18 @@ ${instruction}`,
       finalSourceReview?: boolean;
       /** One last answer turn after the read cap. Tool tags in that reply are not run. */
       verdictNow?: boolean;
+      /** Path the worker must now edit. Read tools in the reply are dropped, not run. */
+      forceEdit?: string;
+      /** Step a verdict turn judges when it is not the active one. */
+      verdictStepId?: string;
       run?: ConductorRun;
     }
   ): Promise<ChatMessage | undefined> => {
     const { logToolEvent, hostLog } = scopeRunLog();
+    const dropForcedReads = (list: ToolCall[]): ToolCall[] =>
+      opts?.forceEdit
+        ? list.filter(t => !['read_file', 'list_dir', 'search', 'read_terminal'].includes(t.name))
+        : list;
     const budget = opts?.budget;
     const depth = budget ? budget.depth : continuationDepthRef.current;
 
@@ -2687,7 +3328,7 @@ ${instruction}`,
     });
     const prevTerminalFp = continueOpts.terminalFingerprint;
     const activeReviewStepId = () => {
-      const id = getActiveStep(plannerPlanRef.current)?.id;
+      const id = verdictStepFor(opts?.verdictStepId)?.id;
       return id != null && String(id) !== '' ? String(id) : undefined;
     };
     const reviewVerdictTurnNeeded = (batch: ToolCall[], raw: string, used: number, max?: number) =>
@@ -2847,7 +3488,9 @@ ${instruction}`,
       let continuationPrompt = buildContinuationUserPrompt(feedbackTools, {
         // True only on a 2nd+ command-fix continue (when MAX_COMMAND_FIX_ATTEMPTS > 1)
         finalCommandAttempt: priorFixAttempts > 0,
-        tier: continueTier
+        tier: continueTier,
+        // Frontier windows show a read whole; local windows keep the tier caps.
+        ...(isFrontierNode(routeNode) ? { maxCtx: modelMaxCtx(routeNode, routeModel) } : {})
       });
       const emptyTerminalNoFail =
         feedbackTools.some(
@@ -2878,6 +3521,9 @@ ${instruction}`,
         inferenceModel: routeModel
       });
       const followBudget = reviewFollowUpBudget(modelMaxCtx(routeNode, routeModel), continueRole);
+      if (opts?.forceEdit) {
+        continuationPrompt += `\n\nNow reply with edit_file hunks for ${opts.forceEdit} — no more reads. The file contents you asked for are above. Do not call read_file, list_dir or search again.`;
+      }
       if (verdictNow) {
         continuationPrompt += `\n\n${reviewVerdictNowInstruction({
           stepVerdictMode: stepVerdictContinue && !opts?.finalSourceReview,
@@ -2994,7 +3640,7 @@ ${instruction}`,
                     ? parsed.toolCalls.filter(t =>
                         ['read_file', 'list_dir', 'search', 'read_terminal'].includes(t.name)
                       )
-                    : parsed.toolCalls
+                    : dropForcedReads(parsed.toolCalls)
                 ),
             ...(liveOptions.length >= 2
               ? {
@@ -3006,8 +3652,8 @@ ${instruction}`,
             ...(liveVerdict
               ? {
                   stepVerdict: {
-                    stepId: liveVerdict.stepId || getActiveStep(plannerPlanRef.current)?.id || '',
-                    stepTitle: getActiveStep(plannerPlanRef.current)?.title || 'Step',
+                    stepId: liveVerdict.stepId || verdictStepFor(opts?.verdictStepId)?.id || '',
+                    stepTitle: verdictStepFor(opts?.verdictStepId)?.title || 'Step',
                     result: liveVerdict.result,
                     notes: liveVerdict.notes
                   }
@@ -3035,7 +3681,64 @@ ${instruction}`,
         () => runLive(run)
       );
       if (taken.aborted || !runLive(run)) return;
-      const result = taken.result;
+      let result = taken.result;
+      // A whole-file write cut by the output cap (window to spare): resend once with more room.
+      const raisedFollowCap =
+        !readOnlyContinue &&
+        hasUnclosedWrite(result.content) &&
+        outputCapWasHit(result.stats, continueOptions.num_ctx, continueOptions.num_predict)
+          ? raisedOutputBudget({
+              numCtx: continueOptions.num_ctx,
+              estPromptTokens: result.stats?.promptEvalCount ?? 0,
+              currentBudget: continueOptions.num_predict
+            })
+          : null;
+      if (raisedFollowCap != null) {
+        if (result.stats?.evalCount) {
+          const spent = result.stats.evalCount + (result.stats.promptEvalCount || 0);
+          if (isFrontierNode(routeNode)) onRecordTokens(0, spent);
+          else onRecordTokens(spent, 0);
+        }
+        const raisedFollow = await resendWithRaisedCap({
+          node: routeNode,
+          model: routeModel,
+          body,
+          raised: raisedFollowCap,
+          sent: continueOptions,
+          stats: result.stats,
+          label: opts?.expectedFilePath ? `\`${opts.expectedFilePath}\`` : '',
+          phase: 'output-cap-resubmit',
+          role: continueAgent.handle || originRole,
+          estPromptTokens: estimateTurnTokens(
+            conversationPayload.map(message => message.content),
+            routeModel
+          ),
+          run
+        });
+        if (raisedFollow.aborted || !runLive(run)) return;
+        result = raisedFollow.result;
+      }
+      const cutOffFollow =
+        raisedFollowCap != null
+          ? null
+          : await resendFrontierCutOff({
+              node: routeNode,
+              model: routeModel,
+              body,
+              sent: continueOptions,
+              stats: result.stats,
+              reply: result,
+              role: continueAgent.handle || originRole,
+              estPromptTokens: estimateTurnTokens(
+                conversationPayload.map(message => message.content),
+                routeModel
+              ),
+              run
+            });
+      if (cutOffFollow) {
+        if (cutOffFollow.aborted || !runLive(run)) return;
+        result = cutOffFollow.result;
+      }
       notePromptSample(routeModel, conversationPayload, result.stats);
       const finished = readOnlyContinue
         ? result.content
@@ -3054,7 +3757,7 @@ ${instruction}`,
         allowUnclosedSalvage: false
       });
 
-      let tools = collapseDuplicateReadTools(finalParsed.toolCalls);
+      let tools = dropForcedReads(collapseDuplicateReadTools(finalParsed.toolCalls));
       if (
         !readOnlyContinue &&
         !continuationClosedWrite(result.content, finished) &&
@@ -3128,8 +3831,8 @@ ${instruction}`,
         ...(contVerdict
           ? {
               stepVerdict: {
-                stepId: contVerdict.stepId || getActiveStep(plannerPlanRef.current)?.id || '',
-                stepTitle: getActiveStep(plannerPlanRef.current)?.title || 'Step',
+                stepId: contVerdict.stepId || verdictStepFor(opts?.verdictStepId)?.id || '',
+                stepTitle: verdictStepFor(opts?.verdictStepId)?.title || 'Step',
                 result: contVerdict.result,
                 notes: contVerdict.notes
               }
@@ -3195,7 +3898,7 @@ ${instruction}`,
       skipUserAppend?: boolean;
       run?: ConductorRun;
       /** Active plan step: skip Pass-1 and fan one worker per file. */
-      stepDispatch?: { files: string[]; brief: string };
+      stepDispatch?: { files: string[]; brief: string; keptFiles?: string[] };
     }
   ) => {
     const entered = bindRun(opts?.run ?? null, false, 'swarm');
@@ -3300,6 +4003,19 @@ ${instruction}`,
       retargeted?: boolean;
       /** Same-node retry already used. The next failure failsover. */
       retriedSame?: boolean;
+      /** tsc repair of an existing file: a reads-only reply gets one explicit edit turn, not more reads. */
+      repair?: boolean;
+      /**
+       * Material for the last-chance write turn of a repair that still wrote nothing after the
+       * "edit now" turn (see runForcedWriteTurn).
+       */
+      repairFallback?: {
+        errors: string;
+        related: Array<{ path: string; excerpt: string }>;
+        contractFile: string;
+        contractCode: string;
+        requiredExports: string[];
+      };
     }): Promise<boolean> => {
       if (!runLive(run)) return false;
       const { idx, assignment, userPrompt, expectedFilePath } = opts;
@@ -3585,6 +4301,69 @@ ${instruction}`,
           );
         }
         if (!runLive(run)) return false;
+        // done=length with window to spare is the output cap, not the context: resend the same
+        // packet once with more room instead of stitching a partial file.
+        const raisedWorkerReq = outputCapWasHit(res.stats, workerOptions.num_ctx, workerOptions.num_predict)
+          ? withRaisedOutputBudget(
+              workerReq,
+              res.stats?.promptEvalCount ??
+                estimateTurnTokens(sentWorkerMsgs.map(message => message.content), model) ??
+                0
+            )
+          : null;
+        if (raisedWorkerReq) {
+          recordTok(node, res.stats);
+          const raisedTaken = await resendWithRaisedCap({
+            node,
+            model,
+            body: withThink(
+              { model, messages: sentWorkerMsgs, options: ollamaOptions(raisedWorkerReq) },
+              node,
+              model,
+              'coder'
+            ),
+            raised: raisedWorkerReq.num_predict,
+            sent: workerOptions,
+            stats: res.stats,
+            label: `\`${expectedFilePath}\``,
+            phase: 'swarm-worker-raised',
+            role: 'coder',
+            promptBudget: workerReq.promptBudget,
+            estPromptTokens: estimateTurnTokens(
+              sentWorkerMsgs.map(message => message.content),
+              model
+            ),
+            run
+          });
+          if (raisedTaken.aborted && runLive(run)) return failRepeatedOutput();
+          if (raisedTaken.aborted || !runLive(run)) return false;
+          res = raisedTaken.result;
+        }
+        // Thinking ate the output budget (cloud: bigger budget, local: retry without thinking).
+        const cutOffWorker = raisedWorkerReq
+          ? null
+          : await resendFrontierCutOff({
+              node,
+              model,
+              body: withThink(
+                { model, messages: sentWorkerMsgs, options: workerOptions },
+                node,
+                model,
+                'coder'
+              ),
+              sent: workerOptions,
+              stats: res.stats,
+              reply: res,
+              role: 'coder',
+              promptBudget: workerReq.promptBudget,
+              estPromptTokens: estimateTurnTokens(sentWorkerMsgs.map(message => message.content), model),
+              run
+            });
+        if (cutOffWorker) {
+          if (cutOffWorker.aborted && runLive(run)) return failRepeatedOutput();
+          if (cutOffWorker.aborted || !runLive(run)) return false;
+          res = cutOffWorker.result;
+        }
         recordTok(node, res.stats, { model, messages: sentWorkerMsgs });
         const finished = await finishTruncatedWrites(
           node,
@@ -3596,46 +4375,15 @@ ${instruction}`,
         );
         if (!runLive(run)) return false;
 
-        let tools = parseResponse(finished, `${agentMsgId}-${idx}`, false, {
-          expectedFilePath,
-          createIntent: true,
-          allowUnclosedSalvage: false
-        }).toolCalls.map(t => anchorWritePath(t, expectedFilePath));
-        if (!continuationClosedWrite(res.content, finished) && hasUnclosedWrite(finished)) {
-          const truncated = truncatedWriteToolCall(finished, `${agentMsgId}-${idx}`, expectedFilePath);
-          if (truncated) {
-            const anchored = anchorWritePath(truncated, expectedFilePath);
-            tools = [...tools, anchored];
-            logToolEvent(anchored);
-          }
-        }
-
-        tools = tools.map(t => {
-          if (
-            (t.name === 'write_file' || t.name === 'edit_file') &&
-            shouldRejectPlannerWrite(t.args?.path || expectedFilePath || '', t.body || '')
-          ) {
-            return {
-              ...t,
-              status: 'error' as const,
-              result:
-                'Rejected: body looks like planner/option prose, not source for this path. Rewrite with real file contents only.'
-            };
-          }
-          if (t.name === 'write_file') {
-            const candidate = t.args?.path || expectedFilePath || '';
-            const existing = preferredExistingPath(projectBrainRef.current.ownedFiles, candidate);
-            if (existing) {
-              return {
-                ...t,
-                status: 'error' as const,
-                result: `Rejected parallel module \`${candidate}\`. Edit the owned file \`${existing}\` instead of creating a second copy.`
-              };
-            }
-          }
-          noteOwnedPath(t.args?.path || expectedFilePath);
-          return t;
+        const parsedWrites = parseWorkerWrites({
+          raw: res.content,
+          finished,
+          stats: res.stats,
+          id: `${agentMsgId}-${idx}`,
+          expectedFilePath
         });
+        let tools = parsedWrites.tools;
+        const writeTruncated = parsedWrites.writeTruncated;
 
         if (!runLive(run)) return false;
         const readPass = await runReadOnlyTools(tools, toolDepsRef.current);
@@ -3663,7 +4411,16 @@ ${instruction}`,
           terminalFingerprint: undefined
         };
         let continuedWork: ChatMessage | undefined;
-        if (shouldContinueFromTools(tools, continueDecisionOpts(workerBudget))) {
+        // A repair that only read files gets its read results inlined once and one explicit
+        // "edit now" turn. Reads in that turn are dropped, so the worker cannot ping-pong on reads.
+        const repairReadsOnly =
+          !!opts.repair &&
+          !writeTruncated &&
+          tools.length > 0 &&
+          tools.every(t => t.name === 'read_file' || t.name === 'list_dir' || t.name === 'search');
+        // A truncated write is not healed in place: a fresh-context heal turn can save a partial
+        // file next to the error card. Fail the worker so the step is reworked.
+        if (!writeTruncated && shouldContinueFromTools(tools, continueDecisionOpts(workerBudget))) {
           const origin: ChatMessage = {
             id: `${agentMsgId}-worker-${idx}`,
             role: 'assistant',
@@ -3680,54 +4437,114 @@ ${instruction}`,
             model,
             budget: workerBudget,
             role: 'coder',
-            run
+            run,
+            ...(repairReadsOnly ? { forceEdit: expectedFilePath } : {})
           });
         }
 
         const isWriteTool = (tool: ToolCall) =>
           tool.name === 'write_file' || tool.name === 'edit_file';
-        const followWrites = (continuedWork?.toolCalls || []).filter(isWriteTool);
-        let cardTools = tools;
-        let writeErrors = tools.filter(tool => isWriteTool(tool) && tool.status === 'error');
-        if (followWrites.length) {
-          const latest = new Map<string, ToolCall>();
-          for (const tool of [...tools.filter(isWriteTool), ...followWrites]) {
-            const key = (tool.args?.path || expectedFilePath || tool.id).replace(/\\/g, '/').toLowerCase();
-            latest.set(key, tool);
-          }
-          const judged = [...latest.values()];
-          writeErrors = judged.filter(tool => tool.status !== 'done');
-          cardTools = [...tools.filter(tool => !isWriteTool(tool)), ...judged];
-        }
         const workspaceRoot = (workspacePathRef.current || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
         const normWritePath = (p: string) => {
           let rel = p.replace(/\\/g, '/').toLowerCase();
           if (workspaceRoot && rel.startsWith(workspaceRoot + '/')) rel = rel.slice(workspaceRoot.length + 1);
           return rel.replace(/^(?:\.\/|\/)+/, '');
         };
-        const wroteExpected = cardTools.some(
-          tool =>
-            isWriteTool(tool) &&
-            tool.status === 'done' &&
-            normWritePath(tool.args?.path || expectedFilePath || '') === normWritePath(expectedFilePath || '')
-        );
-        const noWrite = !writeErrors.length && !wroteExpected;
+        const judgeWrites = (lastResortWrites: ToolCall[]) => {
+          const followWrites = [
+            ...(continuedWork?.toolCalls || []).filter(isWriteTool),
+            ...lastResortWrites
+          ];
+          let cards = tools;
+          let errors = tools.filter(tool => isWriteTool(tool) && tool.status === 'error');
+          if (followWrites.length) {
+            const latest = new Map<string, ToolCall>();
+            for (const tool of [...tools.filter(isWriteTool), ...followWrites]) {
+              const key = (tool.args?.path || expectedFilePath || tool.id).replace(/\\/g, '/').toLowerCase();
+              latest.set(key, tool);
+            }
+            const judged = [...latest.values()];
+            errors = judged.filter(tool => tool.status !== 'done');
+            cards = [...tools.filter(tool => !isWriteTool(tool)), ...judged];
+          }
+          const wrote = cards.some(
+            tool =>
+              isWriteTool(tool) &&
+              tool.status === 'done' &&
+              normWritePath(tool.args?.path || expectedFilePath || '') === normWritePath(expectedFilePath || '')
+          );
+          return { cardTools: cards, writeErrors: errors, noWrite: !errors.length && !wrote };
+        };
+        let judgedWrites = judgeWrites([]);
+        // The "edit now" turn still wrote nothing: one last fresh-context turn with the whole file
+        // (re-read from disk), the errors and the declarations they refer to. Reads in it are ignored.
+        if (opts.repair && opts.repairFallback && judgedWrites.noWrite && !writeTruncated && runLive(run)) {
+          const fallback = opts.repairFallback;
+          const bodyNow = await readWorkspaceRel(expectedFilePath);
+          if (!runLive(run)) return false;
+          if (typeof bodyNow === 'string' && canForceWholeFile(bodyNow, workerFit.tier)) {
+            const lastTurn = await runForcedWriteTurn({
+              node,
+              model,
+              filePath: expectedFilePath,
+              run,
+              label: `Repair of ${expectedFilePath}`,
+              phase: 'repair-forced-write',
+              stack: opts.stack,
+              prompt: buildForcedWritePrompt({
+                filePath: expectedFilePath,
+                currentFileContent: bodyNow,
+                tscErrors: fallback.errors,
+                tier: workerFit.tier,
+                relatedDeclarations: fallback.related,
+                contractFile: fallback.contractFile,
+                contractCode: fallback.contractCode,
+                requiredExports: fallback.requiredExports
+              })
+            });
+            if (!runLive(run)) return false;
+            judgedWrites = judgeWrites(lastTurn.tools);
+          } else {
+            logRun({
+              kind: 'info',
+              text: `Repair of ${expectedFilePath}: no last-chance write turn — the file is ${
+                typeof bodyNow === 'string'
+                  ? `too large to inline whole (${bodyNow.length} chars; the ${workerFit.tier} tier shows at most ${wholeFileCharLimit(workerFit.tier)})`
+                  : 'not readable'
+              }`
+            });
+          }
+        }
+        const { cardTools, writeErrors, noWrite } = judgedWrites;
         const workerFailed = writeErrors.length > 0 || noWrite;
 
-        const doneStats =
-          res.stats?.evalCount && res.stats?.evalDuration
-            ? {
-                evalCount: res.stats.evalCount,
-                tokensPerSec: Math.round(res.stats.evalCount / (res.stats.evalDuration / 1e9))
-              }
-            : undefined;
+        const workerTps = computeTokPerSec(res.stats?.evalCount, res.stats?.evalDuration);
+        const doneStats = res.stats?.evalCount
+          ? {
+              evalCount: res.stats.evalCount,
+              ...(workerTps != null ? { tokensPerSec: Math.round(workerTps) } : {})
+            }
+          : undefined;
+        const repairGaveUp = noWrite && repairReadsOnly;
+        if (repairGaveUp) {
+          logRun({
+            kind: 'info',
+            text: `Repair of ${expectedFilePath} failed: the model only read files and gave no edit_file hunks after an explicit "edit now" turn${
+              opts.repairFallback ? ' and a last turn with the whole file' : ''
+            }`
+          });
+        }
         const doneContent = writeErrors.length
           ? writeErrors
               .map(t => t.result || `Failed to write ${t.args?.path || expectedFilePath}`)
               .join('\n')
-          : noWrite
-            ? `No write for ${expectedFilePath}`
-            : `Completed ${expectedFilePath}`;
+          : repairGaveUp
+            ? `Repair of ${expectedFilePath} failed: the model only read files and gave no edit after being told to edit now`
+            : noWrite
+              ? `No write for ${expectedFilePath}`
+              : cardTools.some(tool => isWriteTool(tool) && tool.status === 'done' && !isUnchangedWrite(tool.result))
+                ? `Completed ${expectedFilePath}`
+                : `Unchanged ${expectedFilePath} (the worker wrote the same bytes as before)`;
         patchPipelineMsg(m => {
           if (!m.pipelineSteps) return m;
           const updatedSteps = [...m.pipelineSteps];
@@ -3885,9 +4702,25 @@ ${instruction}`,
     setIsStreaming(true);
 
     try {
-      const stepFiles = (opts?.stepDispatch?.files || [])
-        .map(file => file.replace(/\\/g, '/').trim())
-        .filter(file => !!file && !file.includes('..'));
+      // One path identity per file: case/slash/folder-suffix spellings of a file never get two workers.
+      let dispatchWorkspaceFiles: string[] = [];
+      if (opts?.stepDispatch?.files?.length && workspacePath) {
+        try {
+          dispatchWorkspaceFiles = await listWorkspaceFiles(workspacePath);
+        } catch {
+          /* no listing: names are only normalised and deduped */
+        }
+      }
+      const dispatchPathCtx = {
+        workspaceFiles: dispatchWorkspaceFiles,
+        knownFiles: [...(opts?.stepDispatch?.files || []), ...(opts?.stepDispatch?.keptFiles || [])]
+      };
+      const stepFiles = canonicalizePaths(opts?.stepDispatch?.files || [], dispatchPathCtx);
+      const stepFileKeys = new Set(stepFiles.map(file => file.toLowerCase()));
+      const keptStepFiles = canonicalizePaths(opts?.stepDispatch?.keptFiles || [], dispatchPathCtx).filter(
+        file => !stepFileKeys.has(file.toLowerCase())
+      );
+      if (stepFiles.length) assignedFilesRef.current = stepFiles;
       const skipPass1 = stepFiles.length > 0;
       const anyOnline = nodesRef.current.some(
         n => n.online && getEnabledModelsForNode(n).length > 0
@@ -3930,6 +4763,7 @@ ${instruction}`,
           }
           if (!shouldWrite) continue;
           if (!runLive(run)) break;
+          workspaceWriteGenRef.current += 1;
           const saved = await window.electronAPI.writeFile(abs, f.content);
           if (saved?.error || saved?.success === false) continue;
           written.push(f.path);
@@ -3975,8 +4809,29 @@ ${instruction}`,
         ? `${userText}\n\n${formatApprovedPlanForSwarm(lockedPlan)}`
         : userText;
       let manifest: SwarmManifest = fallbackSwarmManifest(swarmTaskText);
+      // A pinned Coder pick owns every file of a step: one node, and its model.
+      let stepCoderPin: { node: EndpointNode; model: string } | undefined;
+      let serializeStep = false;
       if (skipPass1) {
         const contractRel = projectBrainRef.current.contractFile || 'SWARM.md';
+        const coderPick = explicitPickStatus(nodesRef.current, roleRoutesRef.current, 'coder');
+        if (coderPick?.ok) stepCoderPin = { node: coderPick.node, model: coderPick.model };
+        const usableNodes = nodesRef.current.filter(n => n.online && getEnabledModelsForNode(n).length > 0);
+        const localUsable = usableNodes.filter(n => !isFrontierNode(n));
+        const coderPool = (localUsable.length ? localUsable : usableNodes).filter(n =>
+          nodeAllowsRole(n, 'coder')
+        );
+        const coderProbes = stepCoderPin
+          ? [stepCoderPin]
+          : coderPool.map(n => {
+              const enabled = getEnabledModelsForNode(n);
+              return { node: n, model: n.activeModel && enabled.includes(n.activeModel) ? n.activeModel : enabled[0] };
+            });
+        const coderTiers = coderProbes.map(
+          p => resolveModelFit(p.node, p.model, 'coder', coderAgent.numCtx).tier
+        );
+        const coderTier: ModelFitTier | undefined = coderTiers.includes('tight') ? 'tight' : coderTiers[0];
+        serializeStep = shouldSerializeStepTasks(stepCoderPin ? 1 : coderPool.length, stepFiles.length, coderTier);
         const existingContract = await readWorkspaceRel(contractRel);
         const stack =
           projectBrainRef.current.stack ||
@@ -3988,15 +4843,22 @@ ${instruction}`,
           stack,
           verifyCommand:
             projectBrainRef.current.verifyCommand || verifyCommandForStack(stack) || null,
-          tasks: stepFiles.map(filePath => ({
-            filePath,
-            complexity: 'medium' as const,
-            preferredRole: '@coder' as const,
-            requiredExports: [],
-            requiredImports: [],
-            instructions: (opts?.stepDispatch?.brief || swarmTaskText).slice(0, 4000),
-            role: 'Coder'
-          }))
+          tasks: orderStepDispatchTasks(
+            stepFiles.map(filePath => ({
+              filePath,
+              complexity: 'medium' as const,
+              preferredRole: '@coder' as const,
+              requiredExports: [],
+              requiredImports: [],
+              instructions: `${(opts?.stepDispatch?.brief || swarmTaskText).slice(0, 4000)}${
+                stepFiles.length > 1
+                  ? `\n\nYou own only \`${filePath}\`. Other files in this step belong to other workers: import shared types, constants and helpers from their files instead of redeclaring them.`
+                  : ''
+              }`,
+              role: 'Coder'
+            })),
+            { serial: serializeStep }
+          )
         };
         patchPipelineMsg({
           display: `Swarm step — ${manifest.tasks.length} file${
@@ -4126,7 +4988,23 @@ ${instruction}`,
           return;
         }
         if (decompTaken.aborted || !runLive(run)) return;
-        const decompRes = decompTaken.result;
+        let decompRes = decompTaken.result;
+        const cutOffPass1 = await resendFrontierCutOff({
+          node: lead.node,
+          model: lead.model,
+          body: withThink(architectBody, lead.node, lead.model, 'planner'),
+          sent: passOptions,
+          stats: decompRes.stats,
+          reply: decompRes,
+          role: 'planner',
+          promptBudget: passOpts.promptBudget,
+          estPromptTokens: estimateTurnTokens(architectMsgs.map(message => message.content), lead.model),
+          run
+        });
+        if (cutOffPass1) {
+          if (cutOffPass1.aborted || !runLive(run)) return;
+          decompRes = cutOffPass1.result;
+        }
         recordTok(architect.node, decompRes.stats, { model: architect.model, messages: architectMsgs });
         const parsed = parseSwarmManifest(decompRes.content, swarmTaskText);
         if (parsed) manifest = parsed;
@@ -4343,12 +5221,14 @@ ${instruction}`,
             });
           } else {
             contractVerified = true;
+            logRun({ kind: 'verify', ok: true, output: `contract ${manifest.contractFile} typechecks after repair` });
             patchPipelineMsg({
               display: `✅ Contract \`${manifest.contractFile}\` typechecks. Fan-out Pass 2…`
             });
           }
         } else {
           contractVerified = true;
+          logRun({ kind: 'verify', ok: true, output: `contract ${manifest.contractFile} typechecks` });
           patchPipelineMsg({
             display: `✅ Contract \`${manifest.contractFile}\` locked & typechecked. Fan-out Pass 2…`
           });
@@ -4417,7 +5297,10 @@ ${instruction}`,
       const assignments: SwarmAssignment[] = [];
       const assignmentWaveIndex: number[] = [];
       taskWaves.forEach((wave, wi) => {
-        const waveAssign = assignSwarmTasksToCluster(wave, nodesRef.current);
+        const waveAssign = assignSwarmTasksToCluster(
+          wave,
+          stepCoderPin ? [stepCoderPin.node] : nodesRef.current
+        ).map(a => (stepCoderPin ? { ...a, model: stepCoderPin.model } : a));
         for (const a of waveAssign) {
           assignments.push(a);
           assignmentWaveIndex.push(wi);
@@ -4504,6 +5387,113 @@ ${instruction}`,
       syncNodeWork(initialSteps);
 
       const completedPaths: string[] = [];
+      const pathKey = (p: string) => p.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+      const failedPaths = new Set<string>();
+
+      // Source files already on disk, listed once per dispatch.
+      let projectFilesCache: Promise<string[]> | undefined;
+      const projectSourceFiles = () => {
+        if (!projectFilesCache) {
+          projectFilesCache = workspacePath ? listSourceFolderFiles(workspacePath) : Promise.resolve([]);
+        }
+        return projectFilesCache;
+      };
+      const manifestTaskPaths = () => manifest.tasks.map(t => t.filePath);
+
+      /**
+       * Add export summaries of earlier-step modules to a worker packet, sized to the prompt
+       * budget the packet leaves unused. Falls back to the plain packet when nothing fits.
+       */
+      const buildWorkerPromptWithProject = async (
+        assignment: SwarmAssignment,
+        base: Parameters<typeof buildSwarmWorkerPrompt>[0]
+      ): Promise<string> => {
+        const plain = buildSwarmWorkerPrompt(base);
+        try {
+          const { node, model, task } = assignment;
+          const fit = resolveModelFit(node, model, 'coder', coderAgent.numCtx);
+          const req = pinnedChatOptions({
+            node,
+            model,
+            role: 'coder',
+            createIntent: true,
+            tier: fit.tier,
+            temperature: coderAgent.temperature,
+            fallbackNumCtx: coderAgent.numCtx
+          });
+          const system = buildSwarmWorkerSystemStub(task.filePath, base.stack || projectBrainRef.current.stack);
+          const used = estimateTurnTokens([system, plain], model) ?? 0;
+          const budgetChars = Math.floor((req.promptBudget - used) * 3.2 * 0.8) - 400;
+          let maxChars = Math.min(6000, budgetChars);
+          if (maxChars < 200) return plain;
+          const exclude = manifestTaskPaths();
+          const brief = `${base.userPrompt}\n${task.instructions}`;
+          const all = await projectSourceFiles();
+          if (!runLive(run) || !all.length) return plain;
+          const ranked = rankExistingProjectFiles({
+            taskPath: task.filePath,
+            brief,
+            paths: all,
+            excludePaths: exclude
+          }).slice(0, 10);
+          const files: Array<{ path: string; content: string }> = [];
+          for (const rel of ranked) {
+            const content = await readWorkspaceRel(rel);
+            if (!runLive(run)) return plain;
+            if (typeof content === 'string') files.push({ path: rel, content });
+          }
+          for (let attempt = 0; attempt < 3 && maxChars >= 200; attempt++) {
+            const existingProjectExports = pickExistingProjectExports({
+              taskPath: task.filePath,
+              brief,
+              files,
+              excludePaths: exclude,
+              maxChars
+            });
+            if (!existingProjectExports.length) return plain;
+            const withProject = buildSwarmWorkerPrompt({ ...base, existingProjectExports });
+            if ((estimateTurnTokens([system, withProject], model) ?? 0) <= req.promptBudget) return withProject;
+            maxChars = Math.floor(maxChars / 2);
+          }
+          return plain;
+        } catch {
+          return plain;
+        }
+      };
+
+      /** Declarations of other files that a repair worker's tsc errors point at. */
+      const relatedDeclarationsFor = async (
+        assignment: SwarmAssignment,
+        errors: string
+      ): Promise<Array<{ path: string; excerpt: string }>> => {
+        try {
+          const norm = (p: string) => p.replace(/\\/g, '/').replace(/^\.\//, '');
+          const wanted = new Map<string, string>();
+          const want = (p: string) => {
+            const rel = norm(p);
+            if (rel && !wanted.has(rel.toLowerCase())) wanted.set(rel.toLowerCase(), rel);
+          };
+          manifestTaskPaths().forEach(want);
+          completedPaths.forEach(want);
+          stepFiles.forEach(want);
+          const onDisk = (await projectSourceFiles()).filter(rel => !wanted.has(norm(rel).toLowerCase()));
+          pathsNamedInText(errors, onDisk).forEach(want);
+          const files: Array<{ path: string; content: string }> = [];
+          for (const rel of [...wanted.values()].slice(0, 16)) {
+            if (norm(rel).toLowerCase() === norm(assignment.task.filePath).toLowerCase()) continue;
+            const content = await readWorkspaceRel(rel);
+            if (!runLive(run)) return [];
+            if (typeof content === 'string') files.push({ path: rel, content });
+          }
+          return referencedDeclarationsForErrors(errors, files, {
+            excludePaths: [assignment.task.filePath],
+            maxChars: 3000
+          });
+        } catch {
+          return [];
+        }
+      };
+
       let flatOffset = 0;
       for (let wi = 0; wi < taskWaves.length; wi++) {
         if (!runLive(run)) return;
@@ -4599,9 +5589,54 @@ ${instruction}`,
                   })
                 );
               }
+              // Step files a rework left alone are on disk: show them whole as prerequisites.
+              const keptOnDisk: string[] = [];
+              for (const kept of keptStepFiles) {
+                if (norm(kept) === norm(assignment.task.filePath)) continue;
+                if (siblings.some(s => norm(s.path) === norm(kept))) continue;
+                const body = await readWorkspaceRel(kept);
+                if (typeof body !== 'string' || !body.trim()) continue;
+                siblings.push(siblingFile(kept, { content: body, inline: true }));
+                keptOnDisk.push(kept);
+              }
+              const ownTask = keptOnDisk.length
+                ? {
+                    ...assignment.task,
+                    dependsOn: [...new Set([...(assignment.task.dependsOn || []), ...keptOnDisk])]
+                  }
+                : assignment.task;
               const workerOverall = lockedPlan ? formatApprovedPlanBrief(lockedPlan) : userText;
-              const workerPrompt = buildSwarmWorkerPrompt({
-                task: assignment.task,
+              // A dependency that failed to write cannot be imported. Say so, so the worker does
+              // not invent an incompatible copy of its types.
+              const missingDeps = (assignment.task.dependsOn || []).filter(d => failedPaths.has(norm(d)));
+              const workerTask = missingDeps.length
+                ? {
+                    ...ownTask,
+                    instructions: `${assignment.task.instructions}\n\nWARNING: ${missingDeps
+                      .map(d => `\`${d}\``)
+                      .join(', ')} failed to write and is NOT on disk. Still import from ${
+                      missingDeps.length === 1 ? 'it' : 'them'
+                    } by that path using only names the contract or the brief defines. Do NOT redeclare its types, constants or functions locally.`
+                  }
+                : ownTask;
+              // Earlier waves of this fan-out are on disk now. Show this file the exact signatures
+              // of the ones it imports, so it matches them instead of a stale or guessed shape.
+              const writtenNow: Array<{ path: string; content: string }> = [];
+              for (const p of completedPaths) {
+                if (norm(p) === norm(assignment.task.filePath)) continue;
+                const body = await readWorkspaceRel(p);
+                if (typeof body === 'string' && body.trim()) writtenNow.push({ path: p, content: body });
+              }
+              if (!runLive(run)) return;
+              const alreadyWritten = alreadyWrittenDeclarations({
+                task: workerTask,
+                currentFileContent: current,
+                written: writtenNow,
+                tier: workerTier
+              });
+              const workerPrompt = await buildWorkerPromptWithProject(assignment, {
+                alreadyWritten,
+                task: workerTask,
                 contractFile: manifest.contractFile,
                 contractCode: manifest.contractCode,
                 siblingSummary: '',
@@ -4611,6 +5646,7 @@ ${instruction}`,
                 stack: manifest.stack,
                 tier: workerTier
               });
+              if (!runLive(run)) return;
               const wrote = await runWorkerTurn({
                 idx: stepIdx,
                 assignment,
@@ -4624,6 +5660,9 @@ ${instruction}`,
         );
 
         completedPaths.push(...waveDone);
+        for (const task of taskWaves[wi]) {
+          if (!waveDone.includes(task.filePath)) failedPaths.add(pathKey(task.filePath));
+        }
       }
 
       let packageMerged = false;
@@ -4665,13 +5704,31 @@ ${instruction}`,
       if (!runLive(run)) return;
 
       // ── Stage 4: Verify (tsc only for TypeScript stacks) ──
-      if (manifest.stack !== 'typescript' && manifest.verifyCommand) {
+      if (opts?.stepDispatch) {
+        // A plan-step dispatch leaves the verdict on verify to the pre-review gate (reviewStepVerifyFirst),
+        // so the Swarm, the gate and the Yay check all judge the same project verify + web entry gate.
+        logRun({
+          kind: 'info',
+          text: `Swarm step dispatch wrote ${assignments.length} file(s); verify runs once at the pre-review gate`
+        });
+        patchPipelineMsg(m => ({
+          ...m,
+          display: `Conductor Swarm finished ${assignments.length} file(s). Verify runs at the step gate.`
+        }));
+      } else if (manifest.stack !== 'typescript' && manifest.verifyCommand) {
         patchPipelineMsg(m => ({
           ...m,
           display: `${m.display || ''}\n\n🔍 Verifying ${manifest.stack}: \`${manifest.verifyCommand}\``
         }));
         const output = await executeTrackedCommand(manifest.verifyCommand);
         const failed = commandOutputFailed(output);
+        logRun({
+          kind: 'verify',
+          ok: !failed,
+          ...(failed
+            ? { output, fingerprint: errorFingerprint(parseCompilerErrors(output)) }
+            : {})
+        });
         patchPipelineMsg(m => ({
           ...m,
           display: failed
@@ -4705,6 +5762,7 @@ ${instruction}`,
             error: skippedOutput.slice(0, 500)
           }));
         } else if (wsCheck.ok) {
+          logRun({ kind: 'verify', ok: true, output: 'workspace tsc passed' });
           patchPipelineMsg(m => ({
             ...m,
             display: `✅ Conductor Swarm finished ${assignments.length} worker file(s). Workspace typecheck passed.`
@@ -4732,6 +5790,12 @@ ${instruction}`,
           }));
         } else {
           const fpBefore = errorFingerprint(parseCompilerErrors(wsCheck.output || ''));
+          logRun({
+            kind: 'verify',
+            ok: false,
+            output: wsCheck.output || wsCheck.error || 'workspace tsc failed',
+            fingerprint: fpBefore
+          });
           const jobsForOutput = async (output: string) => {
             const byFile = groupTscErrorsByFile(output, workspacePath);
             const bodies = new Map<string, string>();
@@ -4784,13 +5848,16 @@ ${instruction}`,
                     'coder',
                     coderAgent.numCtx
                   ).tier;
+                  const relatedDeclarations = await relatedDeclarationsFor(assignment, errors);
+                  if (!runLive(run)) return;
                   const repairPrompt = buildRepairWorkerPrompt({
                     task: assignment.task,
                     contractFile: manifest.contractFile,
                     contractCode: manifest.contractCode,
                     currentFileContent: current,
                     tscErrors: errors,
-                    tier: repairTier
+                    tier: repairTier,
+                    relatedDeclarations
                   });
                   await warmModels(
                     [{ node: assignment.node, model: assignment.model }],
@@ -4802,7 +5869,15 @@ ${instruction}`,
                     userPrompt: repairPrompt,
                     expectedFilePath: assignment.task.filePath,
                     stepLabel: `Repaired ${assignment.task.filePath}`,
-                    stack: manifest.stack
+                    stack: manifest.stack,
+                    repair: true,
+                    repairFallback: {
+                      errors,
+                      related: relatedDeclarations,
+                      contractFile: manifest.contractFile,
+                      contractCode: manifest.contractCode,
+                      requiredExports: assignment.task.requiredExports
+                    }
                   });
                 }
               })
@@ -4829,6 +5904,20 @@ ${instruction}`,
               mode: 'workspace',
               timeoutMs: 90000
             });
+            const recheckRaw = `${recheck.output || ''}\n${recheck.error || ''}`;
+            // Timeouts, a missing compiler, and unresolved modules are logged in their own branch below.
+            if (runLive(run) && !recheck.timedOut && !recheck.missingTsc && !typesCannotResolve(recheckRaw)) {
+              logRun({
+                kind: 'verify',
+                ok: recheck.ok === true,
+                ...(recheck.ok
+                  ? { output: 'workspace tsc passed after repair' }
+                  : {
+                      output: recheck.output || recheck.error || 'workspace tsc failed',
+                      fingerprint: errorFingerprint(parseCompilerErrors(recheck.output || ''))
+                    })
+              });
+            }
             if (recheck.ok) {
               patchPipelineMsg(m => ({
                 ...m,
@@ -4870,6 +5959,16 @@ ${instruction}`,
                   const recheck2 = await window.electronAPI.typecheckWorkspace(workspacePath, {
                     mode: 'workspace',
                     timeoutMs: 90000
+                  });
+                  logRun({
+                    kind: 'verify',
+                    ok: recheck2.ok === true,
+                    ...(recheck2.ok
+                      ? { output: 'workspace tsc passed after second repair' }
+                      : {
+                          output: recheck2.output || recheck2.error || 'workspace tsc failed',
+                          fingerprint: errorFingerprint(parseCompilerErrors(recheck2.output || ''))
+                        })
                   });
                   patchPipelineMsg(m => ({
                     ...m,
@@ -4991,6 +6090,8 @@ ${instruction}`,
     failedOver?: boolean;
     /** Run-log phase when this turn is a Full auto re-ask or similar. */
     logPhase?: string;
+    /** Step a verdict turn judges when it is not the active one (end-of-plan pass on a failed step). */
+    verdictStepId?: string;
     run?: ConductorRun;
   }): Promise<ChatMessage | undefined> => {
     const {
@@ -5407,8 +6508,8 @@ ${instruction}`,
                 ...(liveVerdict
                   ? {
                       stepVerdict: {
-                        stepId: liveVerdict.stepId || getActiveStep(plannerPlanRef.current)?.id || '',
-                        stepTitle: getActiveStep(plannerPlanRef.current)?.title || 'Step',
+                        stepId: liveVerdict.stepId || verdictStepFor(opts.verdictStepId)?.id || '',
+                        stepTitle: verdictStepFor(opts.verdictStepId)?.title || 'Step',
                         result: liveVerdict.result,
                         notes: liveVerdict.notes
                       }
@@ -5512,6 +6613,73 @@ ${instruction}`,
         result = retried.result;
       }
       if (!runLive(run)) return;
+      // A whole-file write cut by the output cap (window to spare): resend once with more room.
+      const raisedTurnReq =
+        !readOnlyMode &&
+        hasUnclosedWrite(result.content) &&
+        outputCapWasHit(result.stats, turnOptions.num_ctx, turnOptions.num_predict)
+          ? withRaisedOutputBudget(turnReq, result.stats?.promptEvalCount ?? 0)
+          : null;
+      if (raisedTurnReq) {
+        if (result.stats?.evalCount) {
+          const spent = result.stats.evalCount + (result.stats.promptEvalCount || 0);
+          if (routedIsFrontier) onRecordTokens(0, spent);
+          else onRecordTokens(spent, 0);
+        }
+        const raisedTurn = await resendWithRaisedCap({
+          node: routedNode,
+          model: routedModel,
+          body,
+          raised: raisedTurnReq.num_predict,
+          sent: turnOptions,
+          stats: result.stats,
+          label: '',
+          phase: 'output-cap-resubmit',
+          role: turnRole,
+          promptBudget: turnReq.promptBudget,
+          estPromptTokens: estimateTurnTokens(
+            conversationPayload.map(message => message.content),
+            routedModel
+          ),
+          run
+        });
+        if (raisedTurn.aborted || !runLive(run)) {
+          if (runLive(run)) {
+            turnError = 'Model output repeated itself; aborted';
+            repeatAborted = true;
+          }
+          return;
+        }
+        result = raisedTurn.result;
+      }
+      // Frontier reasoning models: hidden thinking can eat the whole output cap. Retry once, bigger.
+      const cutOffTurn = raisedTurnReq
+        ? null
+        : await resendFrontierCutOff({
+            node: routedNode,
+            model: routedModel,
+            body: { ...body, messages: conversationPayload },
+            sent: turnOptions,
+            stats: result.stats,
+            reply: result,
+            role: turnRole,
+            promptBudget: turnReq.promptBudget,
+            estPromptTokens: estimateTurnTokens(
+              conversationPayload.map(message => message.content),
+              routedModel
+            ),
+            run
+          });
+      if (cutOffTurn) {
+        if (cutOffTurn.aborted || !runLive(run)) {
+          if (runLive(run)) {
+            turnError = 'Model output repeated itself; aborted';
+            repeatAborted = true;
+          }
+          return;
+        }
+        result = cutOffTurn.result;
+      }
       notePromptSample(routedModel, conversationPayload, result.stats);
       const finished = readOnlyMode
         ? result.content
@@ -5561,10 +6729,10 @@ ${instruction}`,
 
       let stats = undefined;
       if (result.stats?.evalCount && result.stats?.evalDuration) {
-        const tps = Math.round(result.stats.evalCount / (result.stats.evalDuration / 1e9));
+        const tps = computeTokPerSec(result.stats.evalCount, result.stats.evalDuration);
         stats = {
           evalCount: result.stats.evalCount,
-          tokensPerSec: tps,
+          ...(tps != null ? { tokensPerSec: Math.round(tps) } : {}),
           promptTokens: result.stats.promptEvalCount,
           loadMs: result.stats.loadDuration ? Math.round(result.stats.loadDuration / 1e6) : undefined
         };
@@ -5625,8 +6793,8 @@ ${instruction}`,
         ...(parsedVerdict
           ? {
               stepVerdict: {
-                stepId: parsedVerdict.stepId || getActiveStep(plannerPlanRef.current)?.id || '',
-                stepTitle: getActiveStep(plannerPlanRef.current)?.title || 'Step',
+                stepId: parsedVerdict.stepId || verdictStepFor(opts.verdictStepId)?.id || '',
+                stepTitle: verdictStepFor(opts.verdictStepId)?.title || 'Step',
                 result: parsedVerdict.result,
                 notes: parsedVerdict.notes
               }
@@ -5727,7 +6895,7 @@ ${instruction}`,
           : reviewMode || stepVerdictMode
             ? 'reviewer'
             : 'coder');
-      const activeReviewStepId = getActiveStep(plannerPlanRef.current)?.id;
+      const activeReviewStepId = verdictStepFor(opts.verdictStepId)?.id;
       const reviewNeedsVerdictNow =
         (!!reviewMode || !!stepVerdictMode) &&
         needsReviewVerdictTurn({
@@ -5770,6 +6938,7 @@ ${instruction}`,
           finalSourceReview: !!finalSourceReview,
           freshContext: useFreshContext,
           verdictNow: reviewNeedsVerdictNow && !shouldContinueFromTools(tools, turnContinueOpts),
+          ...(opts.verdictStepId ? { verdictStepId: opts.verdictStepId } : {}),
           run
         });
         if (continued) originOut = continued;
@@ -5806,7 +6975,7 @@ ${instruction}`,
                 : continued
                   ? [continued]
                   : [];
-          const active = getActiveStep(plannerPlanRef.current);
+          const active = verdictStepFor(opts.verdictStepId);
           const picked = pickExplicitStepVerdict(pool, active?.id);
           if (picked) {
             const packedVerdict = {
@@ -5959,6 +7128,63 @@ ${instruction}`,
   };
 
   /**
+   * A review-fix task used up its Coder rounds. Never mark it done: Full auto asks a frontier
+   * model for one brief and allows one more round; otherwise the loop pauses for a person.
+   */
+  const stopReviewFixLoop = async (
+    task: NonNullable<ReturnType<typeof getActiveTask>>,
+    depth: number,
+    reviewNotes: string | undefined,
+    run: ConductorRun
+  ): Promise<void> => {
+    const { logRun, hostLog } = scopeRunLog();
+    const key = reviewFixKey(task.id, task.title);
+    const note = plainNote(reviewNotes || task.failureNote || '', 600);
+    const queue = executionQueueRef.current;
+    if (queue) commitExecutionQueue(markFailed(queue, task.id, note || 'Review fix rounds used up'));
+    logRun({
+      kind: 'escalate',
+      text: `Review-fix task #${task.id} still failing after ${MAX_REVIEW_FIX_ROUNDS} Coder rounds — fix loop stopped`
+    });
+    if (fullAutoRef.current && !reviewFixEscalatedRef.current.has(key) && runLive(run)) {
+      reviewFixEscalatedRef.current.add(key);
+      setExecutingPlanNotice(
+        `Task #${task.id} failed review ${MAX_REVIEW_FIX_ROUNDS} times — asking a frontier model for one fix brief…`
+      );
+      let brief: string | null = null;
+      try {
+        brief = await requestFreeTierBrief(
+          'The Reviewer keeps failing this fix task after repeated Coder rounds. Give one short concrete fix plan naming files and edits. Do not rewrite whole files.',
+          `Task #${task.id}: ${task.title}\n${task.description}\nReviewer notes:\n${note}`,
+          run
+        );
+      } catch (err: any) {
+        hostLog('warn', `review-fix escalation: ${err?.message || err}`);
+      }
+      if (!runLive(run)) return;
+      if (brief?.trim()) {
+        // One more round, carrying the brief. A second failure lands back here and pauses.
+        reviewFixRoundsRef.current = {
+          ...reviewFixRoundsRef.current,
+          [key]: MAX_REVIEW_FIX_ROUNDS - 1
+        };
+        logRun({ kind: 'escalate', text: `Review-fix task #${task.id}: one more round with a frontier brief` });
+        await sendReviewPlanToPlanner(
+          null,
+          depth,
+          `${note}\n\nFrontier brief (apply this; earlier approaches failed):\n${brief.trim()}`,
+          run
+        );
+        return;
+      }
+    }
+    pendingReviewResumeRef.current = { depth, previousTask: '' };
+    const notice = `Task #${task.id} failed review ${MAX_REVIEW_FIX_ROUNDS} times — fix loop stopped and left failed. Review it, then Send to Planner to try again.`;
+    logRun({ kind: 'pause', text: notice });
+    restorePlannerControl(notice);
+  };
+
+  /**
    * Planner orchestrates ONE active queue task → fix contract → Coder, then Reviewer verifies that task.
    * Seeds the durable queue from planMsg when needed; never drops the list.
    */
@@ -6001,6 +7227,16 @@ ${instruction}`,
       commitExecutionQueue(queue);
       task = getActiveTask(queue)!;
     }
+
+    // A person clicking Send to Planner starts a fresh count; automatic re-entry keeps it.
+    if (!parent) reviewFixRoundsRef.current = {};
+    const fixKey = reviewFixKey(task.id, task.title);
+    const fixTurn = takeReviewFixRound(reviewFixRoundsRef.current, fixKey);
+    if (fixTurn.capped) {
+      await stopReviewFixLoop(task, depth, reviewNotes, run);
+      return;
+    }
+    reviewFixRoundsRef.current = fixTurn.rounds;
 
     if (planMsg) {
       setMessages(prev => {
@@ -6092,9 +7328,7 @@ ${instruction}`,
       plannerMsg?.display || ''
     );
 
-    ephemeralWorkerRef.current = true;
-    onSelectAgent(coderAgent.id);
-    onConversationPatch?.({ agentId: coderAgent.id });
+    selectWorkerTab(coderAgent.id);
 
     const coderPrompt = formatReviewPlanForCoder(
       singlePlan,
@@ -6320,8 +7554,14 @@ ${instruction}`,
     try {
     if (!runLive(run)) return;
 
+    // Open review-fix tasks outrank their own mirrored plan, which is not a real plan step.
+    const fixesFirst = reviewFixesOwnTheTurn({
+      openTasks: hasOpenTasks(executionQueueRef.current),
+      activeStepId: plannerPlanRef.current?.activeStepId,
+      planId: plannerPlanRef.current?.id
+    });
     // Planner-owned plan is the sole controller — never invent next steps while active.
-    if (isPlanActive(plannerPlanRef.current)) {
+    if (isPlanActive(plannerPlanRef.current) && !fixesFirst) {
       const step = getActiveStep(plannerPlanRef.current);
       if (step && (step.status === 'in_progress' || step.status === 'pending')) {
         await dispatchActiveStep(run);
@@ -6483,6 +7723,24 @@ ${instruction}`,
         );
         if (taken.aborted) {
           return { content: '', thinking: '', aborted: true, stats: {} };
+        }
+        const cutOffAsk = await resendFrontierCutOff({
+          node,
+          model,
+          body,
+          sent: askOptions,
+          stats: taken.result.stats,
+          reply: taken.result,
+          role: 'reviewer',
+          estPromptTokens: estimateTurnTokens(
+            askMsgs.map(message => message.content),
+            model
+          ),
+          run
+        });
+        if (cutOffAsk) {
+          if (cutOffAsk.aborted) return { content: '', thinking: '', aborted: true, stats: {} };
+          return cutOffAsk.result;
         }
         return taken.result;
       };
@@ -6889,7 +8147,7 @@ ${instruction}`,
       !!executionQueueRef.current?.tasks.length &&
       (livePlan?.activeStepId === 'review-fixes' || !!livePlan?.id?.startsWith('plan-review-'));
     if (isPlanActive(livePlan) && !reviewQueueMirror) {
-      await reviewActiveStep(run);
+      await reviewStepVerifyFirst(run);
       return;
     }
 
@@ -6934,12 +8192,11 @@ ${instruction}`,
       ? `Files just written/edited:\n${touchedPaths.slice(0, 12).join('\n')}`
       : 'No write/edit paths recorded — review the latest coding step from chat context.';
     setIsStreaming(true);
+    const reviewPlanFit = resolveModelFit(target.node, target.model, 'reviewer', reviewerAgent.numCtx);
     const filesBody = await buildTouchedFilesContext(
       workspacePath,
       touchedPaths,
-      reviewPreloadCaps(
-        resolveModelFit(target.node, target.model, 'reviewer', reviewerAgent.numCtx).maxCtx
-      )
+      resolveReviewerFileCaps(reviewPlanFit.maxCtx, reviewPreloadCaps(reviewPlanFit.maxCtx))
     );
     if (!runLive(run)) {
       if (runOwnsUi(run)) setIsStreaming(false);
@@ -7035,29 +8292,82 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
     if (deltaMode && existingQueue && activeTask) {
       let delta = parseReviewDelta(latestReview?.raw || '');
       if (!delta) {
-        const parsedPlan = latestReview ? parseReviewPlan(latestReview.raw || '') : null;
-        const coerced = coerceDirtyReviewPlan(parsedPlan, rawBlob);
-        const missingClean =
-          nonPlanReviewLacksMarkup(latestReview?.raw || '') && coerced.tasks.length === 0;
-        if (missingClean) noteMissingReviewVerdict(!autoReviewOn());
-        if (coerced.tasks.length === 0) {
-          delta = {
-            taskId: activeTask.id,
-            verdict: 'completed',
-            notes: missingClean ? 'Reviewer gave no verdict.' : coerced.summary || 'Looks good.'
-          };
-        } else {
-          delta = {
-            taskId: activeTask.id,
-            verdict: 'failed',
-            notes:
-              coerced.tasks.map(t => t.description).join(' ') ||
-              coerced.summary ||
-              'Active task not completed correctly.'
-          };
+        const classify = (msg: ChatMessage | undefined) => {
+          const parsedPlan = msg ? parseReviewPlan(msg.raw || '') : null;
+          const blob = msg === latestReview ? rawBlob : `${msg?.display || ''}\n${msg?.raw || ''}`;
+          const coerced = coerceDirtyReviewPlan(parsedPlan, blob);
+          const missingClean = nonPlanReviewLacksMarkup(msg?.raw || '') && coerced.tasks.length === 0;
+          return { coerced, missingClean };
+        };
+        let seen = classify(latestReview);
+        if (seen.missingClean) {
+          // No pass by silence: ask once more, then count it as a Fail.
+          missingReviewNoted = true;
+          logRun({
+            kind: 'verdict',
+            result: 'missing',
+            text: 'Reviewer gave no verdict on the fix task',
+            stepId: `fix-${activeTask.id}`
+          });
+          setExecutingPlanNotice(`Reviewer gave no verdict on task #${activeTask.id} — asking once more…`);
+          logRun({
+            kind: 'user',
+            action: 'auto',
+            stepId: `fix-${activeTask.id}`,
+            text: `Re-ask review verdict for task #${activeTask.id}`
+          });
+          const deltaReask = reviewDeltaReaskPromptWithContext(activeTask.id, {
+            header: formatQueueForReviewer(existingQueue, activeTask),
+            filesHint,
+            filesBody
+          });
+          const askedAgain = await runSingleNodeTurn({
+            userText: deltaReask,
+            fullPrompt: deltaReask,
+            agent: reviewerAgent,
+            reviewMode: true,
+            skipUserAppend: true,
+            notice: `Reviewer re-ask — task #${activeTask.id}`,
+            logPhase: 'verdict-reask',
+            pinRoute: target,
+            freshContext: true,
+            run
+          });
+          if (!runLive(run)) {
+            restorePlannerControl('Stopped — talk to Planner about what to do next.');
+            return;
+          }
+          delta = parseReviewDelta(askedAgain?.raw || '');
+          if (!delta && askedAgain) seen = classify(askedAgain);
+        }
+        if (!delta) {
+          if (seen.missingClean) {
+            delta = missingDeltaAsFail(activeTask.id);
+          } else if (seen.coerced.tasks.length === 0) {
+            delta = {
+              taskId: activeTask.id,
+              verdict: 'completed',
+              notes: seen.coerced.summary || 'Looks good.'
+            };
+          } else {
+            delta = {
+              taskId: activeTask.id,
+              verdict: 'failed',
+              notes:
+                seen.coerced.tasks.map(t => t.description).join(' ') ||
+                seen.coerced.summary ||
+                'Active task not completed correctly.'
+            };
+          }
         }
       }
 
+      logRun({
+        kind: 'verdict',
+        result: delta.verdict === 'completed' ? 'yay' : 'nay',
+        text: delta.notes,
+        stepId: `fix-${activeTask.id}`
+      });
       const updated = applyReviewDelta(existingQueue, {
         ...delta,
         taskId: delta.taskId || activeTask.id
@@ -7269,6 +8579,21 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
     return tools;
   };
 
+  /** Workspace-relative paths from `rels` that exist on disk (at most 8 probes). */
+  const existingWorkspaceFiles = async (rels: string[]): Promise<string[]> => {
+    if (!workspacePath || !window.electronAPI?.execTool) return [];
+    const out: string[] = [];
+    for (const rel of rels.slice(0, 8)) {
+      try {
+        const probe = await window.electronAPI.execTool(workspacePath, 'exists', { path: rel });
+        if (probe?.exists) out.push(rel);
+      } catch {
+        /* missing or out of the workspace */
+      }
+    }
+    return out;
+  };
+
   const snapshotStepFiles = async (stepId: string, rels: string[]) => {
     if (!workspacePath || !window.electronAPI?.readFile) return;
     const sep = workspacePath.includes('\\') ? '\\' : '/';
@@ -7298,6 +8623,60 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
     stepSnapshotsRef.current.set(String(stepId), next);
   };
 
+  /**
+   * Plan task files written as bare names (`types.ts`) become the existing workspace file they mean
+   * (`src/game/types.ts`), so a worker edits it instead of creating a root copy. Reads the workspace
+   * fresh, commits the plan only when a name changed. `stepId` limits the rewrite to that step.
+   */
+  const resolvePlanBareFiles = async (run: ConductorRun, stepId?: string): Promise<void> => {
+    const plan = plannerPlanRef.current;
+    if (!plan || !workspacePath || !runLive(run)) return;
+    let files: string[];
+    try {
+      files = await listWorkspaceFiles(workspacePath);
+    } catch {
+      return;
+    }
+    if (!runLive(run)) return;
+    const latest = plannerPlanRef.current;
+    if (!latest || latest.id !== plan.id) return;
+    const { logRun } = scopeRunLog();
+    const resolved = resolveBareTaskFiles(latest, files, stepId !== undefined ? { stepId } : undefined);
+    if (resolved.renames.length) {
+      logRun({
+        kind: 'info',
+        ...(stepId !== undefined ? { stepId } : {}),
+        text: `Resolved plan file names to existing files: ${resolved.renames.map(r => `${r.from} → ${r.to}`).join(', ')}`
+      });
+    }
+    if (resolved.mentions.length) {
+      logRun({
+        kind: 'info',
+        ...(stepId !== undefined ? { stepId } : {}),
+        text: `Rewrote file names in plan text to full paths: ${resolved.mentions.map(r => `${r.from} → ${r.to}`).join(', ')}`
+      });
+    }
+    if (resolved.merged.length) {
+      logRun({
+        kind: 'info',
+        ...(stepId !== undefined ? { stepId } : {}),
+        text: `Merged tasks that name the same file (one worker per file): ${resolved.merged.map(m => `${m.file} (${m.tasks})`).join(', ')}`
+      });
+    }
+    if (resolved.plan !== latest) await commitPlannerPlan(resolved.plan, run.token);
+    // The step's files are what its Coders may write: twin spellings of them are redirected, not rejected.
+    const assignedStep =
+      stepId !== undefined ? resolved.plan.steps.find(s => String(s.id) === String(stepId)) : undefined;
+    assignedFilesRef.current = assignedStep ? collectStepFilePaths(assignedStep) : [];
+    if (resolved.ambiguous.length) {
+      logRun({
+        kind: 'info',
+        ...(stepId !== undefined ? { stepId } : {}),
+        text: `Plan file names match several workspace files and were left as written: ${resolved.ambiguous.join(', ')}`
+      });
+    }
+  };
+
   /** Dispatch the active Planner step to Coders (sequential single-node or Swarm for the step). */
   const dispatchActiveStep = async (
     parent?: ConductorRun | null,
@@ -7317,7 +8696,26 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
     }
     let plan = plannerPlanRef.current;
     if (!plan || plan.status !== 'active') return;
+    // The review-fixes mirror is a view of the fix queue, never a step for the step Coders.
+    if (
+      reviewFixesOwnTheTurn({
+        openTasks: hasOpenTasks(executionQueueRef.current),
+        activeStepId: plan.activeStepId,
+        planId: plan.id
+      })
+    ) {
+      await sendReviewPlanToPlanner(null, 0, undefined, run);
+      return;
+    }
 
+    // A Nay leaves the active step failed: rework re-runs that step before anything advances.
+    const reopened = reopenActiveStepForRework(plan);
+    const isRework = reopened !== plan;
+    if (isRework) {
+      plan = reopened;
+      await commitPlannerPlan(plan, run.token);
+      if (!runLive(run)) return;
+    }
     let step = getActiveStep(plan);
     if (!step || step.status === 'completed' || step.status === 'failed' || step.status === 'abandoned') {
       plan = activateNextStep(plan);
@@ -7336,19 +8734,76 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
     if (!runLive(run)) return;
     step = getActiveStep(plannerPlanRef.current)!;
     if (!step) return;
+    // Earlier steps may have created the folders a bare file name belongs in.
+    await resolvePlanBareFiles(run, String(step.id));
+    if (!runLive(run)) return;
+    step = getActiveStep(plannerPlanRef.current)!;
+    if (!step) return;
 
-    ephemeralWorkerRef.current = true;
-    onSelectAgent(coderAgent.id);
-    onConversationPatch?.({ agentId: coderAgent.id });
+    selectWorkerTab(coderAgent.id);
 
     resetAgentLoopBudget();
 
     // Cleared-context Coders need the named file bodies (e.g. app.js) in the packet —
     // titles alone caused incomplete edits → Reviewer Nay → infinite rework loops.
-    const stepFiles = collectStepFilePaths(step);
-    await snapshotStepFiles(String(step.id), stepFiles);
+    const allStepFiles = collectStepFilePaths(step);
+    // Files the step text only mentions (`game/types.ts`) are dependencies: shown, never written.
+    let dependencyFiles: string[] = [];
+    const contextMentions = collectStepContextPaths(step);
+    if (contextMentions.length && workspacePath) {
+      try {
+        dependencyFiles = resolveContextPaths(contextMentions, await listWorkspaceFiles(workspacePath))
+          .filter(file => !allStepFiles.some(own => own.toLowerCase() === file.toLowerCase()))
+          .slice(0, 8);
+      } catch {
+        /* no workspace listing: the Coder reads its dependencies itself */
+      }
+      if (!runLive(run)) return;
+    }
+    // A rework regenerates only the files the Nay or the failed verify points at.
+    // The other step files stay on disk and are shown to the Coder as context.
+    let stepFiles = allStepFiles;
+    const keptScope = reworkScopeRef.current;
+    if (!isRework && opts?.coderRetry && keptScope?.stepId === String(step.id)) {
+      // Retry of a rework dispatch whose writes failed: same narrowed file set.
+      stepFiles = keptScope.files.length ? keptScope.files : allStepFiles;
+    } else if (!isRework) {
+      reworkScopeRef.current = null;
+    }
+    if (isRework) {
+      const evidence = lastVerifyEvidenceRef.current;
+      const tscErrors = evidence.ok ? undefined : evidence.output;
+      // Errors in files outside the step (a gate on index.html, a type error in a module an
+      // earlier worker wrote) are fixed there: re-running only the step files repeats their bytes.
+      const named = [
+        ...filesFromErrors(parseCompilerErrors(`${tscErrors || ''}\n${step.reviewNote || ''}`)),
+        ...(await existingWorkspaceFiles(filePathsInText(step.reviewNote || '')))
+      ];
+      if (!runLive(run)) return;
+      stepFiles = reworkTargetFiles(allStepFiles, { nayNote: step.reviewNote, tscErrors }, named);
+      const sameSet =
+        stepFiles.length === allStepFiles.length && stepFiles.every(file => allStepFiles.includes(file));
+      reworkScopeRef.current = sameSet ? null : { stepId: String(step.id), files: stepFiles };
+      if (!sameSet) {
+        const outside = stepFiles.filter(file => !allStepFiles.includes(file));
+        const kept = allStepFiles.filter(file => !stepFiles.includes(file));
+        logRun({
+          kind: 'info',
+          stepId: String(step.id),
+          text: `Rework of step #${step.id}: re-dispatching ${stepFiles.join(', ')}${
+            outside.length ? ` (outside the step, named by the failure: ${outside.join(', ')})` : ''
+          }${kept.length ? `; kept as is: ${kept.join(', ')}` : ''}`
+        });
+      }
+    }
+    await snapshotStepFiles(String(step.id), [...new Set([...allStepFiles, ...stepFiles])]);
     if (!runLive(run)) return;
-    const recentWrites = collectWrittenPaths(messagesRef.current);
+    const recentWrites = [
+      ...new Set([
+        ...collectWrittenPaths(messagesRef.current),
+        ...allStepFiles.filter(file => !stepFiles.includes(file))
+      ])
+    ];
     const coderRoute = resolveRoute(`Implement plan step #${step.id}: ${step.title}`, coderAgent);
     const coderFit = coderRoute
       ? resolveModelFit(
@@ -7360,7 +8815,7 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
       : null;
     const filesBody = await buildTouchedFilesContext(
       workspacePath,
-      [...stepFiles, ...recentWrites],
+      [...stepFiles, ...recentWrites, ...dependencyFiles],
       coderFit?.caps || {
         maxFiles: 10,
         maxCharsPerFile: 12000,
@@ -7393,7 +8848,8 @@ ${progressForPrompt() || '(empty)'}`;
           run,
           stepDispatch: {
             files: stepFiles,
-            brief: formatStepForCoders(plan, step)
+            brief: formatStepForCoders(plan, step),
+            keptFiles: [...allStepFiles.filter(file => !stepFiles.includes(file)), ...dependencyFiles]
           }
         });
         const pipelineMsg = pipelineId
@@ -7426,6 +8882,13 @@ ${progressForPrompt() || '(empty)'}`;
             ];
       }
       coderTurnWritesRef.current = { stepId: String(step.id), tools: turnWrites };
+      if (isRework && turnWrites.length && turnWrites.every(tool => isUnchangedWrite(tool.result))) {
+        logRun({
+          kind: 'info',
+          stepId: String(step.id),
+          text: `Rework of step #${step.id} changed nothing: the Coder wrote the same bytes again (${stepFiles.join(', ')})`
+        });
+      }
 
       if (!runLive(run)) {
         if (runOwnsUi(run)) {
@@ -7495,7 +8958,7 @@ ${progressForPrompt() || '(empty)'}`;
         setPlanResumePhase('review', run.token);
       }
       if (!runLive(run)) return;
-      await reviewActiveStep(run);
+      await reviewStepVerifyFirst(run);
     } catch (err: any) {
       if (runOwnsUi(run)) {
         setPlanPaused(true);
@@ -7510,19 +8973,25 @@ ${progressForPrompt() || '(empty)'}`;
   };
 
   /** Reviewer Yay/Nay on the active Planner step. `parent` is the conductor run that owns this review. */
-  const reviewActiveStep = async (parent?: ConductorRun | null): Promise<void> => {
+  const reviewActiveStep = async (
+    parent?: ConductorRun | null,
+    /** End-of-plan pass on a failed step: Yay completes it, Nay leaves it failed with no rework. */
+    opts?: { debtStepId?: string }
+  ): Promise<void> => {
     const { logRun } = scopeRunLog();
     if (parent && !runLive(parent)) return;
     if (!parent && stopRequestedRef.current) return;
     const plan = plannerPlanRef.current;
-    const step = getActiveStep(plan);
+    const step = opts?.debtStepId
+      ? plan?.steps.find(s => String(s.id) === String(opts.debtStepId))
+      : getActiveStep(plan);
     if (!plan || !step) {
       if (plan?.status === 'completed') {
         setExecutingPlanNotice('Planner plan complete.');
       }
       return;
     }
-    setPlanResumePhase('review');
+    if (!opts?.debtStepId) setPlanResumePhase('review');
 
     const target = roleTarget('reviewer', () => pickCapableReviewTarget(nodesRef.current));
     if (!target) {
@@ -7532,7 +9001,8 @@ ${progressForPrompt() || '(empty)'}`;
 
     const stepFiles = collectStepFilePaths(step);
     const touchedPaths = collectWrittenPaths(messagesRef.current);
-    const reviewPaths = [...touchedPaths, ...stepFiles];
+    // This step's own files first, so a file cap never drops them for another step's files.
+    const reviewPaths = [...new Set([...stepFiles, ...touchedPaths])];
     const filesHint = reviewPaths.length
       ? `Files to verify:\n${reviewPaths.slice(0, 24).join('\n')}`
       : 'Review from chat context and the step task list.';
@@ -7542,9 +9012,9 @@ ${progressForPrompt() || '(empty)'}`;
     const filesBody = await buildTouchedFilesContext(
       workspacePath,
       reviewPaths,
-      reviewPreloadCaps(
+      resolveReviewerFileCaps(
         reviewFit.maxCtx,
-        reviewFit.tier === 'tight' ? reviewFit.caps.maxFiles : 16
+        reviewPreloadCaps(reviewFit.maxCtx, reviewFit.tier === 'tight' ? reviewFit.caps.maxFiles : 16)
       )
     );
     if ((parent && !runLive(parent)) || (!parent && stopRequestedRef.current)) {
@@ -7564,6 +9034,7 @@ ${progressForPrompt() || '(empty)'}`;
       }
     }
 
+    const greenVerify = greenVerifyRef.current;
     const reviewPrompt = `${formatStepForReviewer(plan, step)}
 
 ${filesHint}
@@ -7572,7 +9043,7 @@ ${filesBody || '(No file bodies loaded — use at most two read_file calls, then
 
 Work log:
 ${progressForPrompt() || '(empty)'}
-
+${greenVerify ? `\n${verifyPassedStatement(greenVerify.detail)}\n` : ''}${renderNotesForReviewer()}
 Compatibility rules for this step:
 - Nay if files contain planner/reviewer prose, Intent Analysis, or obvious stubs (Placeholder for actual, empty TODOs).
 - Nay if imports/types disagree across the files above (duplicate parallel modules for the same concern).
@@ -7580,9 +9051,7 @@ Compatibility rules for this step:
 ${placeholderHits.length ? `\nStudio pre-scan found likely stubs/prose in: ${placeholderHits.slice(0, 8).join(', ')}. Prefer Nay unless those are false positives.\n` : ''}
 After reviewing the files above, emit <step_verdict> immediately. Do not re-read the same paths.`;
 
-    ephemeralWorkerRef.current = true;
-    onSelectAgent(reviewerAgent.id);
-    onConversationPatch?.({ agentId: reviewerAgent.id });
+    selectWorkerTab(reviewerAgent.id);
     setExecutingPlanNotice(
       autoReviewOn()
         ? `Reviewer Yay/Nay on step #${step.id}…`
@@ -7599,6 +9068,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       notice: `Reviewer on ${target.node.name} — step #${step.id}`,
       pinRoute: target,
       freshContext: true,
+      verdictStepId: String(step.id),
       ...(parent ? { run: parent } : {})
     });
 
@@ -7631,15 +9101,26 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       !!loose &&
       (loose.result === 'yay' || loose.result === 'nay') &&
       (!loose.stepId || String(loose.stepId) === String(step.id));
+    // No tag, but the reply itself says "yay ..." / "Verdict: nay": that is a verdict, not a missing one.
+    const proseVerdict = explicit || looseFits ? null : pickProseStepVerdict(pool, step.id);
+    if (proseVerdict) {
+      logRun({
+        kind: 'info',
+        stepId: String(step.id),
+        text: `Reviewer gave no <step_verdict> tag; read ${proseVerdict.parsed.result} from its reply text`
+      });
+    }
     const parsedVerdict = explicit
       ? explicit.parsed
       : looseFits && loose
         ? { stepId: String(step.id), result: loose.result, notes: loose.notes }
-        : {
-            stepId: String(step.id),
-            result: 'missing' as const,
-            notes: loose?.notes || 'Missing <step_verdict> markup. Ask for an explicit yay or nay.'
-          };
+        : proseVerdict
+          ? { stepId: String(step.id), result: proseVerdict.parsed.result, notes: proseVerdict.parsed.notes }
+          : {
+              stepId: String(step.id),
+              result: 'missing' as const,
+              notes: loose?.notes || 'Missing <step_verdict> markup. Ask for an explicit yay or nay.'
+            };
 
     const acceptVerdict = async (
       message: ChatMessage | undefined,
@@ -7651,6 +9132,41 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
         result: verdict.result,
         notes: verdict.notes
       };
+      if (opts?.debtStepId) {
+        logRun({ kind: 'verdict', result: packed.result, text: packed.notes, stepId: packed.stepId });
+        const current = plannerPlanRef.current;
+        if (!current || (parent && !runLive(parent))) return;
+        if (packed.result === 'yay') {
+          await commitPlannerPlan(
+            applyStepVerdict(current, { stepId: packed.stepId, result: 'yay', notes: packed.notes }),
+            parent?.token
+          );
+          commitProjectBrain({
+            ...projectBrainRef.current,
+            todo: projectBrainRef.current.todo.filter(t => t.id !== `debt-${packed.stepId}`),
+            updatedAt: Date.now()
+          });
+        } else {
+          logRun({
+            kind: 'info',
+            stepId: packed.stepId,
+            text: `Step #${packed.stepId} stays FAILED after its end-of-plan Reviewer pass`
+          });
+          await commitPlannerPlan(
+            {
+              ...current,
+              steps: current.steps.map(s =>
+                String(s.id) === packed.stepId
+                  ? { ...s, reviewNote: (packed.notes || s.reviewNote || '').slice(0, 1200) }
+                  : s
+              ),
+              updatedAt: Date.now()
+            },
+            parent?.token
+          );
+        }
+        return;
+      }
       const withVerdict = message
         ? {
             ...message,
@@ -7702,6 +9218,41 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       });
     };
 
+    /**
+     * Full auto, still no verdict after the re-ask. Prose that lists real problems stays a Nay.
+     * Otherwise there is no feedback to rework from, so project verify decides: green advances the
+     * step with a caveat, red turns into a Nay carrying the verify errors (see
+     * applyStepVerdictAndContinue). The end-of-plan pass on a failed step just leaves it failed.
+     */
+    const resolveWithoutVerdict = async (message: ChatMessage | undefined) => {
+      const sid = String(step.id);
+      if (hasProseFindings(`${message?.display || ''}\n${message?.raw || ''}`)) {
+        await nayFromReviewer(message);
+        return;
+      }
+      if (opts?.debtStepId) {
+        logRun({
+          kind: 'info',
+          stepId: sid,
+          text: `Reviewer gave no verdict on failed step #${sid}; it stays failed`
+        });
+        await acceptVerdict(message, {
+          stepId: sid,
+          result: 'nay',
+          notes: 'The end-of-plan Reviewer pass gave no verdict, so the step stays failed.'
+        });
+        return;
+      }
+      logRun({
+        kind: 'info',
+        stepId: sid,
+        text: greenVerifyRef.current
+          ? `Reviewer gave no verdict; verify passed, so step #${sid} advanced without a Reviewer verdict`
+          : `Reviewer gave no verdict; project verify decides step #${sid} (it advances only if verify passes)`
+      });
+      await acceptVerdict(message, { stepId: sid, result: 'yay', notes: noVerdictAdvanceNote(sid) });
+    };
+
     if (!parsedVerdict || parsedVerdict.result === 'missing') {
       if (fullAutoRef.current && parent && runLive(parent)) {
         if (verdictReaskAllowed(String(step.id))) {
@@ -7709,9 +9260,18 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
           setExecutingPlanNotice(
             `Full auto: asking the reviewer again for a Pass or Fail on step #${step.id}…`
           );
+          // Fresh context: carry the step, its files and their bodies so it judges this step.
+          const reaskPrompt = verdictReaskPromptWithContext({
+            stepId: String(step.id),
+            header: formatStepForReviewer(plan, step),
+            filesHint,
+            filesBody,
+            verifyStatement: greenVerify ? verifyPassedStatement(greenVerify.detail) : undefined,
+            debt: !!opts?.debtStepId
+          });
           const again = await runSingleNodeTurn({
-            userText: VERDICT_REASK_PROMPT,
-            fullPrompt: VERDICT_REASK_PROMPT,
+            userText: reaskPrompt,
+            fullPrompt: reaskPrompt,
             agent: reviewerAgent,
             reviewMode: true,
             stepVerdictMode: true,
@@ -7720,6 +9280,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
             logPhase: 'verdict-reask',
             pinRoute: target,
             freshContext: true,
+            verdictStepId: String(step.id),
             run: parent
           });
           if (!runLive(parent)) {
@@ -7747,10 +9308,20 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
             await acceptVerdict(againExplicit.message, againExplicit.parsed);
             return;
           }
-          await nayFromReviewer(newestReviewerMessage(againPool) || again || host);
+          const againProse = pickProseStepVerdict(againPool, step.id);
+          if (againProse) {
+            logRun({
+              kind: 'info',
+              stepId: String(step.id),
+              text: `Reviewer gave no <step_verdict> tag; read ${againProse.parsed.result} from its reply text`
+            });
+            await acceptVerdict(againProse.message, againProse.parsed);
+            return;
+          }
+          await resolveWithoutVerdict(newestReviewerMessage(againPool) || again || host);
           return;
         }
-        await nayFromReviewer(host);
+        await resolveWithoutVerdict(host);
         return;
       }
 
@@ -7797,11 +9368,91 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     if (parsedVerdict.result !== 'yay' && parsedVerdict.result !== 'nay') {
       return;
     }
-    await acceptVerdict(explicit?.message || host, {
+    let finalMessage = explicit?.message || proseVerdict?.message || host;
+    let finalVerdict: { stepId: string; result: 'yay' | 'nay'; notes: string } = {
       stepId: String(step.id),
       result: parsedVerdict.result,
       notes: parsedVerdict.notes
-    });
+    };
+
+    // A Nay that repeats compiler errors a fresh verify no longer reports gets one more ask.
+    const staleKey = `${plan.id}:${step.id}:${effectiveStepReworkCount(String(step.id), step.reworkCount)}`;
+    if (
+      finalVerdict.result === 'nay' &&
+      nayCitesCompilerErrors(finalVerdict.notes) &&
+      !staleNayReasksRef.current[staleKey] &&
+      (parent ? runLive(parent) : !stopRequestedRef.current)
+    ) {
+      let fresh = greenVerifyRef.current;
+      if (!fresh) {
+        const gate = await verifyBeforeYay(parent);
+        if (parent ? !runLive(parent) : stopRequestedRef.current) {
+          if (!parent || runOwnsUi(parent)) {
+            setPlanPaused(true);
+            setPlanResumePhase('review');
+            restorePlannerControl(`Paused during Review on step #${step.id} — press Play to resume.`);
+          }
+          return;
+        }
+        if (gate.ok) fresh = { output: gate.output, detail: 'project verify, exit 0' };
+      }
+      if (fresh && isStaleCompilerNay(finalVerdict.notes, { ok: true, output: fresh.output })) {
+        staleNayReasksRef.current = { ...staleNayReasksRef.current, [staleKey]: 1 };
+        logRun({
+          kind: 'info',
+          stepId: String(step.id),
+          text: 'Reviewer Nay cited compiler errors that verify no longer reports; asking once more with the fresh verify result'
+        });
+        const askPrompt = `${staleNayReaskPrompt(verifyPassedStatement(fresh.detail))}
+
+${formatStepForReviewer(plan, step)}
+
+${filesHint}
+
+${filesBody || '(No file bodies loaded — use at most two read_file calls, then verdict.)'}`;
+        const again = await runSingleNodeTurn({
+          userText: `Re-check plan step #${step.id}: ${step.title}`,
+          fullPrompt: askPrompt,
+          agent: reviewerAgent,
+          reviewMode: true,
+          stepVerdictMode: true,
+          skipUserAppend: true,
+          notice: `Reviewer re-check (verify passed) — step #${step.id}`,
+          logPhase: 'verdict-reask',
+          pinRoute: target,
+          freshContext: true,
+          verdictStepId: String(step.id),
+          ...(parent ? { run: parent } : {})
+        });
+        if (parent ? !runLive(parent) : stopRequestedRef.current) {
+          if (!parent || runOwnsUi(parent)) {
+            setPlanPaused(true);
+            setPlanResumePhase('review');
+            restorePlannerControl(`Paused during Review on step #${step.id} — press Play to resume.`);
+          }
+          return;
+        }
+        const againLocated = again ? messagesFromOrigin(messagesRef.current, again.id) : [];
+        const againPool =
+          again && !againLocated.some(message => message.id === again.id)
+            ? [...againLocated, again]
+            : againLocated.length
+              ? againLocated
+              : again
+                ? [again]
+                : [];
+        const againExplicit = pickExplicitStepVerdict(againPool, step.id);
+        if (againExplicit) {
+          finalMessage = againExplicit.message;
+          finalVerdict = {
+            stepId: String(step.id),
+            result: againExplicit.parsed.result,
+            notes: againExplicit.parsed.notes
+          };
+        }
+      }
+    }
+    await acceptVerdict(finalMessage, finalVerdict);
   };
 
   /** Collect distinct Reviewer Nay notes for a step from chat history. */
@@ -7872,12 +9523,23 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     const reworkCount = effectiveStepReworkCount(String(stuck.id), stuck.reworkCount);
     const escalations = plan.escalationCount || 0;
     // Cap, or step is already a Fix pass → compiler heal (no redundant Fix: steps).
+    // Logic Nay: neither Planner fix steps nor a compiler heal can fix it. Try a targeted Coder fix.
+    if (stuck.blockerKind === 'review' && fullAutoRef.current && parent && runLive(parent)) {
+      if (await healLogicNay(String(stuck.id), parent)) return;
+      if (!runLive(parent)) {
+        if (runOwnsUi(parent)) setPlanPaused(true);
+        return;
+      }
+      // The logic heal re-verifies first; a red build now routes to the compiler heal below.
+      plan = plannerPlanRef.current || plan;
+    }
     if (stuck.blockerKind === 'review' && plan.lastVerifyOk) {
       if (fullAutoRef.current && parent && runLive(parent)) {
         await deferFailedStepAndContinue(
           String(stuck.id),
-          `Step #${stuck.id} failed review. Verify is green, so the step stays failed and is kept as debt.`,
-          parent
+          `Step #${stuck.id} failed review (a logic issue remains). Verify is green, so the step stays failed and is kept as debt.`,
+          parent,
+          { logicIssue: true }
         );
         return;
       }
@@ -8047,6 +9709,16 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     const delivery = projectBrainRef.current.delivery || plannerPlanRef.current?.delivery;
     if (delivery && delivery !== 'web') return '';
     if (!workspacePath || !window.electronAPI?.readFile) return '';
+    const plan = plannerPlanRef.current;
+    const active = plan ? getActiveStep(plan) : undefined;
+    if (plan && active) {
+      const at = plan.steps.findIndex(s => String(s.id) === String(active.id));
+      const later = plan.steps
+        .slice(at + 1)
+        .filter(s => s.status === 'pending' || s.status === 'in_progress')
+        .flatMap(s => collectStepFilePaths(s));
+      if (webEntryGateDeferred(collectStepFilePaths(active), later)) return '';
+    }
     const root = workspacePath.replace(/[\\/]+$/, '');
     const sep = root.includes('\\') ? '\\' : '/';
     const read = async (rel: string) => {
@@ -8057,6 +9729,13 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
         return '';
       }
     };
+    const firstOf = async (names: string[]) => {
+      for (const name of names) {
+        const content = await read(name);
+        if (content) return { path: name, content };
+      }
+      return { path: names[0], content: '' };
+    };
     const indexHtml = await read('index.html');
     if (!indexHtml) return '';
     const css = `${await read('src/index.css')}\n${await read('index.css')}`;
@@ -8066,12 +9745,134 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       sourceSample += `\n${await read(rel)}`;
       if (sourceSample.length > 80000) break;
     }
+    const postcssConfig = await firstOf(['postcss.config.js', 'postcss.config.cjs', 'postcss.config.mjs', 'postcss.config.ts']);
+    const tailwindConfig = await firstOf(['tailwind.config.js', 'tailwind.config.cjs', 'tailwind.config.mjs', 'tailwind.config.ts']);
+    const viteConfig = (await firstOf(['vite.config.ts', 'vite.config.js', 'vite.config.mjs'])).content;
     return webEntryVerifyErrors({
       delivery: delivery || 'web',
       indexHtml,
       css,
-      sourceSample
+      sourceSample,
+      postcssConfig,
+      tailwindConfig,
+      viteConfig,
+      packageJson: await read('package.json')
     });
+  };
+
+  /**
+   * Render smoke check (Vite web projects, desktop only). Loads the project's own dev server in a hidden
+   * sandboxed window and judges what actually rendered. '' = pass or skipped (infrastructure trouble never
+   * blocks a plan); otherwise compiler-shaped TS91xx lines. One real check per workspace write generation.
+   */
+  const readRenderCheckBlocker = async (token?: number): Promise<string> => {
+    const api = window.electronAPI;
+    if (!workspacePath || !api?.renderCheckWorkspace || !api.readFile) return '';
+    const gen = workspaceWriteGenRef.current;
+    const prior = renderCheckRef.current;
+    if (prior && prior.gen === gen && prior.workspace === workspacePath) return prior.errors;
+    const delivery = projectBrainRef.current.delivery || plannerPlanRef.current?.delivery;
+    if (delivery && delivery !== 'web') return '';
+    const root = workspacePath.replace(/[\\/]+$/, '');
+    const sep = root.includes('\\') ? '\\' : '/';
+    const read = async (rel: string) => {
+      try {
+        const res = await api.readFile(`${root}${sep}${rel}`);
+        return res?.content || '';
+      } catch {
+        return '';
+      }
+    };
+    if (!(await read('index.html')) || !/"vite"\s*:/.test(await read('package.json'))) return '';
+    const { logRun } = scopeRunLog();
+    const stepId = activeStepId();
+    const frame = beginActivity('verify', 'Render check', 'loading the page in a hidden window');
+    try {
+      let raw: RenderCheckRaw;
+      try {
+        raw = await api.renderCheckWorkspace(workspacePath, { timeoutMs: 45000 });
+      } catch (err: any) {
+        raw = { ok: true, skipped: true, reason: String(err?.message || err).slice(0, 200) };
+      }
+      if (typeof token === 'number' && !runIsCurrent(token)) return '';
+      let files: string[] = [];
+      try {
+        files = await listSourceFolderFiles(workspacePath);
+      } catch {
+        files = [];
+      }
+      const result = evaluateRenderCheck(raw, { files });
+      const shot = raw?.screenshotRel || '';
+      renderCheckRef.current = {
+        gen,
+        workspace: workspacePath,
+        errors: result.verifyText,
+        notes: result.notes,
+        summary: result.summary,
+        skipped: result.skipped,
+        screenshotRel: shot
+      };
+      if (result.skipped) {
+        logRun({ kind: 'info', text: result.summary, ...(stepId ? { stepId } : {}) });
+      } else {
+        logRun({
+          kind: 'verify',
+          ok: result.ok,
+          output: `${result.summary}${shot ? ` — screenshot ${shot}` : ''}`,
+          ...(stepId ? { stepId } : {})
+        });
+      }
+      return result.verifyText;
+    } finally {
+      endActivity(frame);
+    }
+  };
+
+  /** Reviewer prompt block: what the real browser load showed (current write generation only). */
+  const renderNotesForReviewer = (): string => {
+    const r = renderCheckRef.current;
+    if (!r || r.skipped || r.gen !== workspaceWriteGenRef.current || r.workspace !== (workspacePath || '')) return '';
+    const shot = r.screenshotRel ? `\nScreenshot of the loaded page: ${r.screenshotRel}` : '';
+    return `\nRender check notes (the page was loaded in a real browser window): ${r.summary}${r.notes ? `\n${r.notes}` : ''}${shot}\n`;
+  };
+
+  /**
+   * UI step gate: render-check this step only when it touches UI files and no later open step does, so a
+   * half-built page (App wired in a later step) is not judged. The plan-finish gate always runs once.
+   */
+  const renderWantedForStep = (plan: PlannerPlan, step: PlannerPlan['steps'][number]): boolean => {
+    if (!collectStepFilePaths(step).some(isRenderRelevantFile)) return false;
+    const at = plan.steps.findIndex(s => String(s.id) === String(step.id));
+    return !plan.steps
+      .slice(at + 1)
+      .some(
+        s =>
+          (s.status === 'pending' || s.status === 'in_progress') && collectStepFilePaths(s).some(isRenderRelevantFile)
+      );
+  };
+
+  /**
+   * Last gate before a plan is declared finished: one render check (cached per write generation, so a
+   * UI step that already ran it costs nothing). False = the page does not render correctly; the caller
+   * stops before final review / packaging.
+   */
+  const renderGateBeforeFinish = async (parent?: ConductorRun | null): Promise<boolean> => {
+    if (!workspacePath || !window.electronAPI?.renderCheckWorkspace) return true;
+    const checked = await runProjectVerify(parent?.token, { reuse: true, render: true });
+    if (parent && !runLive(parent)) return false;
+    if (checked.ok || !hasRenderCheckErrors(checked.output)) return true;
+    const { logRun } = scopeRunLog();
+    const first =
+      (checked.output.split(/\r?\n/).find(l => /\berror TS91\d\d\b/.test(l)) || '')
+        .replace(/^.*?error TS91\d\d:\s*/, '')
+        .slice(0, 300) || 'the page does not render correctly';
+    logRun({ kind: 'info', text: `Render check failed at plan finish: ${first}` });
+    if (!parent || runOwnsUi(parent)) {
+      restorePlannerControl(
+        `The code compiles but the page does not render correctly (${first}). Final review and packaging were skipped — fix it, then ask the Coder to re-run.`
+      );
+    }
+    return false;
   };
 
   /**
@@ -8111,12 +9912,15 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
 
   /** One stack verify command. Missing workspace or command is a failure, not a pass. */
   const runProjectVerify = async (
-    token?: number
+    token?: number,
+    /** `reuse`: return the cached result when no workspace write happened since it was computed. */
+    verifyOpts?: { reuse?: boolean; render?: boolean }
   ): Promise<{
     ok: boolean;
     output: string;
     fingerprint: string;
   }> => {
+    const genAtStart = workspaceWriteGenRef.current;
     const finishVerify = (result: { ok: boolean; output: string; fingerprint: string }) => {
       if (result.fingerprint !== 'aborted' && result.output !== 'Stopped.') {
         const stepId = activeStepId();
@@ -8127,11 +9931,50 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
           output: result.output,
           ...(stepId ? { stepId } : {})
         });
+        if (result.fingerprint !== 'err') {
+          verifyCacheRef.current = {
+            gen: genAtStart,
+            at: Date.now(),
+            workspace: workspacePath || '',
+            step: stepId || '',
+            result,
+            green: result.ok ? greenVerifyRef.current : null
+          };
+        }
       }
       return result;
     };
     if (typeof token === 'number' && !runIsCurrent(token)) {
       return finishVerify({ ok: false, output: 'Stopped.', fingerprint: 'aborted' });
+    }
+    if (verifyOpts?.reuse) {
+      const cached = verifyCacheRef.current;
+      if (
+        cached &&
+        cached.gen === workspaceWriteGenRef.current &&
+        cached.workspace === (workspacePath || '') &&
+        cached.step === (activeStepId() || '') &&
+        Date.now() - cached.at < 120000 &&
+        // A green result with no render check yet cannot answer a request that wants one.
+        !(
+          verifyOpts.render &&
+          cached.result.ok &&
+          !(
+            renderCheckRef.current &&
+            renderCheckRef.current.gen === workspaceWriteGenRef.current &&
+            renderCheckRef.current.workspace === (workspacePath || '')
+          )
+        )
+      ) {
+        if (cached.result.ok && cached.green) greenVerifyRef.current = cached.green;
+        const stepId = activeStepId();
+        logRun({
+          kind: 'info',
+          text: `Verify reused: no workspace write since the last ${cached.result.ok ? 'green' : 'red'} run`,
+          ...(stepId ? { stepId } : {})
+        });
+        return cached.result;
+      }
     }
     const brain = projectBrainRef.current;
     const stack =
@@ -8165,14 +10008,27 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     }
     const verifyFrame = beginActivity('verify', 'Project verify');
     try {
-      const out = typescriptVerifyUsesCompiler(begun.command)
-        ? await runTypescriptVerify()
-        : await executeTrackedCommand(begun.command);
+      verifyCommandRunningRef.current += 1;
+      let out: string;
+      try {
+        out = typescriptVerifyUsesCompiler(begun.command)
+          ? await runTypescriptVerify()
+          : await executeTrackedCommand(begun.command);
+      } finally {
+        verifyCommandRunningRef.current -= 1;
+      }
       if (typeof token === 'number' && !runIsCurrent(token)) {
         return finishVerify({ ok: false, output: 'Stopped.', fingerprint: 'aborted' });
       }
       const visual = verifyOutputFailed(out) ? '' : await readWebEntryBlocker();
-      const combined = visual ? `${out || ''}\n${visual}` : out || '';
+      // Render smoke check: only after tsc and the web entry gate are both green.
+      const rendered =
+        verifyOpts?.render && !visual && !verifyOutputFailed(out) ? await readRenderCheckBlocker(token) : '';
+      if (typeof token === 'number' && !runIsCurrent(token)) {
+        return finishVerify({ ok: false, output: 'Stopped.', fingerprint: 'aborted' });
+      }
+      const extra = [visual, rendered].filter(Boolean).join('\n');
+      const combined = extra ? `${out || ''}\n${extra}` : out || '';
       const failed = verifyOutputFailed(combined);
       const errors = parseCompilerErrors(combined);
       const fingerprint = errorFingerprint(errors);
@@ -8210,19 +10066,226 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
 
   /** Compiler/build must pass before a step can Yay. */
   const verifyBeforeYay = async (
-    parent?: ConductorRun | null
+    parent?: ConductorRun | null,
+    /** `render`: also run the render smoke check (once per write generation) after tsc and the web entry gate pass. */
+    gateOpts?: { render?: boolean }
   ): Promise<{ ok: boolean; output: string }> => {
     const entered = bindRun(parent ?? null, false, 'verify');
     if (!entered) return { ok: false, output: 'Stopped.' };
     const run = entered.run;
     try {
       if (!runLive(run)) return { ok: false, output: 'Stopped.' };
-      const checked = await runProjectVerify(run.token);
+      const checked = await runProjectVerify(run.token, { reuse: true, ...(gateOpts?.render ? { render: true } : {}) });
       if (!runLive(run)) return { ok: false, output: 'Stopped.' };
       return { ok: checked.ok, output: checked.output };
     } finally {
       leaveConductorRun(entered.owned, run.token);
     }
+  };
+
+  /** Targeted compiler-heal turns allowed per step dispatch before the Reviewer is skipped. */
+  const PRE_REVIEW_HEAL_MAX = 2;
+
+  /** Workspace-relative path for a compiler-reported file, or '' when it is not inside the workspace. */
+  const workspaceRelOfErrorFile = (file: string): string => {
+    const root = (workspacePath || '').replace(/\\/g, '/').replace(/\/+$/, '');
+    const f = (file || '').replace(/\\/g, '/').replace(/^\.\//, '');
+    if (!root || !f) return '';
+    if (/^[a-zA-Z]:\//.test(f) || f.startsWith('/')) {
+      return f.toLowerCase().startsWith(`${root.toLowerCase()}/`) ? f.slice(root.length + 1) : '';
+    }
+    return f.split('/').includes('..') ? '' : f;
+  };
+
+  /**
+   * Deterministic hygiene: drop the unused imports the compiler named (TS6133 / TS6196 / TS6192).
+   * Writes go through the scoped workspace write path. Returns how many bindings were removed.
+   */
+  const applyHygieneFixes = async (
+    errors: ReturnType<typeof parseCompilerErrors>,
+    stepId: string,
+    run: ConductorRun
+  ): Promise<number> => {
+    const { logRun } = scopeRunLog();
+    if (!workspacePath || !window.electronAPI?.readFile) return 0;
+    const root = workspacePath.replace(/\\/g, '/').replace(/\/+$/, '');
+    const byFile = new Map<string, typeof errors>();
+    for (const error of errors) {
+      if (!isHygieneError(error)) continue;
+      const rel = workspaceRelOfErrorFile(error.file);
+      if (!rel || !/\.(?:[cm]?[jt]sx?)$/i.test(rel)) continue;
+      byFile.set(rel, [...(byFile.get(rel) || []), error]);
+    }
+    let total = 0;
+    for (const [rel, list] of byFile) {
+      if (!runLive(run)) break;
+      let body: string | undefined;
+      try {
+        const res = await window.electronAPI.readFile(`${root}/${rel}`);
+        body = typeof res?.content === 'string' ? res.content : undefined;
+      } catch {
+        body = undefined;
+      }
+      if (!runLive(run)) break;
+      if (body == null) continue;
+      const fixed = fixUnusedImports(body, list);
+      if (!fixed.removed || fixed.text === body) continue;
+      const wrote = await onApplyFileWrite(rel, fixed.text);
+      if (!wrote) continue;
+      total += fixed.removed;
+      logRun({
+        kind: 'info',
+        stepId,
+        text: `Hygiene fix removed ${fixed.removed} unused import(s) in ${rel}: ${fixed.names.join(', ')}`
+      });
+    }
+    return total;
+  };
+
+  /**
+   * Verify-first gate before the Reviewer. The unified verify (project verify / tsc + web entry
+   * gate, the same one `verifyBeforeYay` runs) must be green before a Reviewer turn is spent:
+   *  1. Red → deterministic hygiene fix (unused imports), re-verify.
+   *  2. Still red → at most PRE_REVIEW_HEAL_MAX targeted compiler heals on the error files, stopping
+   *     early when the error fingerprint does not change.
+   *  3. Green → Reviewer. Still red → Reviewer skipped; a Nay carrying the compiler output goes through
+   *     `applyStepVerdictAndContinue` so the normal rework / escalation path continues.
+   * A fresh cached verify result (no workspace write since) is reused instead of re-running.
+   */
+  const reviewStepVerifyFirst = async (run: ConductorRun): Promise<void> => {
+    const { logRun } = scopeRunLog();
+    const plan = plannerPlanRef.current;
+    const step = getActiveStep(plan);
+    if (!plan || !step) {
+      await reviewActiveStep(run);
+      return;
+    }
+    const stepId = String(step.id);
+    const halted = () => {
+      if (runLive(run)) return false;
+      if (runOwnsUi(run)) setPlanPaused(true);
+      return true;
+    };
+    setExecutingPlanNotice(`Step #${stepId}: verifying before review…`);
+    // UI steps also get a render smoke check once tsc and the web entry gate are green.
+    const gateOpts = { render: renderWantedForStep(plan, step) };
+    let gate = await verifyBeforeYay(run, gateOpts);
+    if (halted()) return;
+
+    let healAttempts = 0;
+    const settleHygiene = async () => {
+      if (gate.ok) return;
+      const removed = await applyHygieneFixes(parseCompilerErrors(gate.output), stepId, run);
+      if (removed <= 0 || !runLive(run)) return;
+      setExecutingPlanNotice(`Step #${stepId}: removed ${removed} unused import(s) — re-verifying…`);
+      gate = await verifyBeforeYay(run, gateOpts);
+    };
+    await settleHygiene();
+    if (halted()) return;
+
+    while (!gate.ok && healAttempts < PRE_REVIEW_HEAL_MAX && !typesCannotResolve(gate.output)) {
+      const errors = parseCompilerErrors(gate.output);
+      if (!errors.length) break;
+      const before = errorFingerprint(errors);
+      const errorFiles = filesFromErrors(errors);
+      const allowedFiles = [...new Set([...errorFiles, ...collectStepFilePaths(step)])].slice(0, 14);
+      healAttempts += 1;
+      const shown = errorFiles.length || allowedFiles.length || 1;
+      logRun({
+        kind: 'heal',
+        stepId,
+        attempt: healAttempts,
+        max: PRE_REVIEW_HEAL_MAX,
+        fingerprint: before,
+        note: `pre-review heal: local Coder on ${shown} error file(s)`
+      });
+      resetAgentLoopBudget();
+      const healFrame = beginActivity('heal', `Pre-review heal on step #${stepId}`, `attempt ${healAttempts}/${PRE_REVIEW_HEAL_MAX}`);
+      try {
+        await runCompilerHealTurn({
+          run,
+          step,
+          verifyOutput: gate.output,
+          errorFiles,
+          allowedFiles,
+          errorBlock: formatErrorsForCoder(errors, gate.output),
+          promptExtra: /TS9001|TS9002/.test(gate.output)
+            ? BLANK_PAGE_HEAL_HINT
+            : hasRenderCheckErrors(gate.output)
+              ? RENDER_HEAL_HINT
+              : '',
+          notice: `Pre-review heal ${healAttempts}/${PRE_REVIEW_HEAL_MAX}: local Coder on ${shown} error file(s)…`
+        });
+        if (halted()) return;
+        gate = await verifyBeforeYay(run, gateOpts);
+        if (halted()) return;
+        await settleHygiene();
+        if (halted()) return;
+      } finally {
+        endActivity(healFrame);
+      }
+      if (gate.ok) {
+        logRun({
+          kind: 'heal',
+          stepId,
+          attempt: healAttempts,
+          max: PRE_REVIEW_HEAL_MAX,
+          note: 'pre-review heal cleared verify'
+        });
+        break;
+      }
+      const after = errorFingerprint(parseCompilerErrors(gate.output));
+      if (!verifyFingerprintChanged(before, after)) {
+        logRun({
+          kind: 'heal',
+          stepId,
+          attempt: healAttempts,
+          max: PRE_REVIEW_HEAL_MAX,
+          fingerprint: after,
+          note: 'pre-review heal: error fingerprint unchanged — stopping'
+        });
+        break;
+      }
+    }
+
+    if (!gate.ok) {
+      logRun({
+        kind: 'info',
+        stepId,
+        text: `Skipped Reviewer: verify still red after ${healAttempts} pre-review heal attempt(s)`
+      });
+      const notes = `Verify failed — step cannot Yay.\n${(gate.output || '').slice(0, 1600)}`;
+      if (!autoReviewOn()) {
+        setPlanResumePhase('coder', run.token);
+        setPlanPaused(true);
+        restorePlannerControl(
+          `Step #${stepId}: verify is still red after ${healAttempts} pre-review fix attempt(s), so the Reviewer was skipped. Fix the errors, then press Play.`
+        );
+        return;
+      }
+      setPlanPaused(false);
+      await applyStepVerdictAndContinue(
+        null,
+        { stepId, stepTitle: step.title, result: 'nay', notes },
+        run
+      );
+      if (!runLive(run) && runOwnsUi(run)) setPlanPaused(true);
+      return;
+    }
+
+    // The Reviewer prompt states "verify passed" from this ref: keep it consistent with the gate.
+    if (!greenVerifyRef.current) {
+      greenVerifyRef.current = {
+        output: gate.output || '',
+        detail: `${projectBrainRef.current.verifyCommand || 'project verify'}, exit 0`
+      };
+    }
+    logRun({
+      kind: 'info',
+      stepId,
+      text: `Pre-review gate: verify green${healAttempts ? ` after ${healAttempts} heal attempt(s)` : ''} — calling Reviewer`
+    });
+    await reviewActiveStep(run);
   };
 
   /** Advance the stuck step after heal verify passes (no Reviewer round-trip). */
@@ -8259,10 +10322,40 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
         return;
       }
       if (fullAutoRef.current) {
+        // The compiler heal may have fixed exactly what the Nay named, so the Nay is stale until the
+        // Reviewer says otherwise. One fresh verdict per Nay; a still-Nay verdict continues into
+        // the rework / logic-heal path with its own notes.
+        const freshKey = `${plan.id}:${stepId}:${effectiveStepReworkCount(
+          stepId,
+          held.plan.steps.find(s => String(s.id) === String(stepId))?.reworkCount
+        )}`;
+        if (
+          String(held.plan.activeStepId || '') === String(stepId) &&
+          !healFreshReviewRef.current[freshKey]
+        ) {
+          healFreshReviewRef.current = { ...healFreshReviewRef.current, [freshKey]: 1 };
+          const { logRun } = scopeRunLog();
+          logRun({
+            kind: 'info',
+            stepId: String(stepId),
+            text: `Compiler heal made verify pass on step #${stepId}; asking the Reviewer for a fresh verdict before any logic heal`
+          });
+          setExecutingPlanNotice(`Step #${stepId}: verify passes — Reviewer re-checking the step…`);
+          await reviewActiveStep(run);
+          if (!runLive(run) && runOwnsUi(run)) setPlanPaused(true);
+          return;
+        }
+        // A compiler heal cannot fix a logic Nay: give the Coder one targeted fix first.
+        if (await healLogicNay(stepId, run)) return;
+        if (!runLive(run)) {
+          if (runOwnsUi(run)) setPlanPaused(true);
+          return;
+        }
         await deferFailedStepAndContinue(
           stepId,
-          'Verify passed, but this step failed review. Kept as debt and continued.',
-          run
+          'Verify passed, but this step failed review (a logic issue remains). Kept as debt and continued.',
+          run,
+          { logicIssue: true }
         );
         return;
       }
@@ -8309,9 +10402,232 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       setExecutingPlanNotice(`Heal: verify OK — starting step #${next.id}: ${next.title}`);
       await dispatchActiveStep(run);
       if (!runLive(run) && runOwnsUi(run)) setPlanPaused(true);
+    } else if (planHasDebt(plan)) {
+      await settlePlanWithDebt(run);
     } else {
       restorePlannerControl('Heal: verify passed — plan complete.');
     }
+    } finally {
+      leaveConductorRun(entered.owned, run.token);
+    }
+  };
+
+  /**
+   * Full auto, reworks spent, verify green, Reviewer still Nay (logic or integration issue):
+   * a compiler heal cannot fix that. Run a targeted Coder heal on the implicated files with the
+   * Nay note as the explicit task (a free-tier frontier brief first when one is available),
+   * then send the step back to the Reviewer. Bounded per step.
+   * Returns true when it ran the heal and handed the step to the Reviewer.
+   */
+  const healLogicNay = async (stepId: string, parent: ConductorRun): Promise<boolean> => {
+    if (!fullAutoRef.current || !runLive(parent)) return false;
+    const plan = plannerPlanRef.current;
+    const step = plan?.steps.find(s => String(s.id) === String(stepId));
+    if (!plan || !step || step.status !== 'failed' || step.blockerKind === 'compiler') return false;
+    const nayNote = (step.reviewNote || collectStepNayNotes(String(step.id))[0] || '').trim();
+    if (!nayNote) return false;
+    // A Nay Studio forced because writes failed is not a Reviewer logic finding.
+    if (isRepeatedEditStop(nayNote) || /^(?:[-*]\s*)?(?:write_file|edit_file)\s/i.test(nayNote)) return false;
+    const roundKey = `${plan.id}:${step.id}`;
+    const used = logicHealRoundsRef.current[roundKey] || 0;
+    if (used >= MAX_LOGIC_HEAL_ROUNDS) return false;
+    const entered = bindRun(parent, false, 'heal');
+    if (!entered) return false;
+    const run = entered.run;
+    const { logRun, hostLog } = scopeRunLog();
+    try {
+      if (!runLive(run)) return false;
+      // The logic heal is only for a green build. A red one goes to the compiler heal.
+      const preVerify = await runProjectVerify(run.token);
+      if (!runLive(run) || !preVerify.ok) return false;
+      logicHealRoundsRef.current = { ...logicHealRoundsRef.current, [roundKey]: used + 1 };
+      const allFiles = collectStepFilePaths(step);
+      const nayNamed = await existingWorkspaceFiles(filePathsInText(nayNote));
+      if (!runLive(run)) return false;
+      const implicated = reworkTargetFiles(allFiles, { nayNote }, nayNamed);
+      const contextFiles = allFiles.filter(file => !implicated.includes(file));
+      logRun({
+        kind: 'heal',
+        stepId: String(step.id),
+        attempt: used + 1,
+        max: MAX_LOGIC_HEAL_ROUNDS,
+        note: `logic heal: verify passes but the Reviewer Nay stands — ${implicated.join(', ') || 'step files'}`
+      });
+      const frame = beginActivity('heal', `Logic heal step #${step.id}`, `round ${used + 1}/${MAX_LOGIC_HEAL_ROUNDS}`);
+      try {
+        setPlanPaused(false);
+        resetAgentLoopBudget();
+        setExecutingPlanNotice(
+          `Step #${step.id}: verify passes but the Reviewer still found a logic issue — targeted Coder fix (${used + 1}/${MAX_LOGIC_HEAL_ROUNDS})…`
+        );
+        await snapshotStepFiles(String(step.id), [...new Set([...allFiles, ...implicated])]);
+        if (!runLive(run)) return false;
+        const coderTarget = roleTarget('coder', () => pickLargestLocalTarget(nodesRef.current));
+        const fit = coderTarget
+          ? resolveModelFit(coderTarget.node, coderTarget.model, 'coder', coderAgent.numCtx)
+          : null;
+        const filesBody = await buildTouchedFilesContext(
+          workspacePath,
+          [...implicated, ...contextFiles],
+          // Implicated files come first and are shown whole, so the Coder has no reason to read them.
+          fit
+            ? { ...fit.caps, maxCharsPerFile: Math.max(fit.caps.maxCharsPerFile, wholeFileCharLimit(fit.tier)) }
+            : { maxFiles: 10, maxCharsPerFile: 12000, maxTotalChars: 48000 }
+        );
+        if (!runLive(run)) return false;
+        let brief: string | null = null;
+        try {
+          brief = await requestFreeTierBrief(
+            'The project compiles, but the Reviewer rejected this step for a logic or integration bug. Say which file is wrong and the small edit that fixes exactly that.',
+            `Step #${step.id}: ${step.title}\n\n${filesBody || ''}\n\nReviewer Nay (fix exactly this):\n${nayNote}`,
+            run
+          );
+        } catch (err: any) {
+          hostLog('warn', `logic heal brief: ${err?.message || err}`);
+        }
+        if (!runLive(run)) return false;
+        const healPrompt = `### Logic heal (targeted)
+Plan step #${step.id}: ${step.title}. The project compiles, but the Reviewer rejected this step for a logic or integration problem.
+
+Fix exactly this:
+${nayNote}
+${brief?.trim() ? `\n### Fix brief\nApply this. Do not repeat the failed approach.\n${brief.trim()}\n` : ''}
+Rules:
+- Edit ONLY: ${implicated.map(f => `\`${f}\``).join(', ') || '(the step files named in the note)'} — prefer edit_file hunks on the bodies below.
+- ${contextFiles.length ? `Reference only (change them only if the note names them): ${contextFiles.map(f => `\`${f}\``).join(', ')}.` : 'No other step files.'}
+- Wire real behavior (pass the props and state the note says are missing). Do not redeclare types, create parallel copies, or append plan steps.
+- Real code only.
+${filesBody ? '- The file bodies below are complete and current. Do not call read_file, list_dir or search on them: reply with edit_file hunks (or one complete write_file).\n' : ''}${fit?.packingLine ? `\n${fit.packingLine}\n` : ''}
+${filesBody || '(No file bodies preloaded — call read_file for each path, then edit_file.)'}
+
+Work log:
+${progressForPrompt() || '(empty)'}`;
+        selectWorkerTab(coderAgent.id);
+        const pausedHere = () => {
+          if (runOwnsUi(run)) {
+            setPlanPaused(true);
+            setPlanResumePhase('review', run.token);
+            restorePlannerControl(`Paused during the logic heal on step #${step.id} — press Play to resume.`);
+          }
+        };
+        const healTurn = (prompt: string) =>
+          runSingleNodeTurn({
+            userText: `Logic heal step #${step.id}: ${plainNote(nayNote, 120)}`,
+            fullPrompt: prompt,
+            agent: coderAgent,
+            planMode: false,
+            approvedPlan: approvedPlanRef.current,
+            skipUserAppend: true,
+            notice: `Logic heal on step #${step.id}`,
+            freshContext: true,
+            run,
+            ...(coderTarget ? { pinRoute: coderTarget } : {})
+          });
+        const edited = (msg: ChatMessage | undefined) =>
+          writeToolsFromCoderOrigin(msg).some(tool => tool.status === 'done' && !isUnchangedWrite(tool.result));
+        let healMsg = await healTurn(healPrompt);
+        if (!runLive(run)) {
+          pausedHere();
+          return true;
+        }
+        if (!edited(healMsg)) {
+          // Reads only: one explicit edit turn. The bodies are already in the prompt.
+          healMsg = await healTurn(`### Edit now
+Your last turn only read files and changed nothing. The file bodies are below. Do not call read_file, list_dir or search.
+Reply with edit_file hunks (or write_file) for ${implicated.map(f => `\`${f}\``).join(', ') || 'the files named in the note'} that fix the Reviewer note.
+
+${healPrompt}`);
+          if (!runLive(run)) {
+            pausedHere();
+            return true;
+          }
+          if (!edited(healMsg)) {
+            // Reads only, or a failed edit: one last turn per implicated file with the whole file
+            // inlined, reads ignored, edit hunks or a complete write_file accepted.
+            const forcedWrite = await (async (): Promise<boolean> => {
+              const node = nodesRef.current.find(n => n.id === healMsg?.endpointId) || coderTarget?.node;
+              const model = healMsg?.model || coderTarget?.model;
+              if (!node || !model || !workspacePath) return false;
+              const root = workspacePath.replace(/\\/g, '/').replace(/\/+$/, '');
+              const readWorkspaceFile = async (rel: string): Promise<string | undefined> => {
+                try {
+                  return (await window.electronAPI.readFile(`${root}/${rel}`)).content;
+                } catch {
+                  return undefined;
+                }
+              };
+              const relOf = (p: string) => {
+                const f = p.replace(/\\/g, '/').replace(/^\.\//, '');
+                if (/^[a-zA-Z]:\//.test(f) || f.startsWith('/')) {
+                  return f.toLowerCase().startsWith(`${root.toLowerCase()}/`) ? f.slice(root.length + 1) : '';
+                }
+                return f.includes('..') ? '' : f;
+              };
+              const forcedFit = resolveModelFit(node, model, 'coder', coderAgent.numCtx);
+              const targets = [...new Set((implicated.length ? implicated : allFiles).map(relOf).filter(Boolean))].slice(0, 3);
+              for (const file of targets) {
+                const body = await readWorkspaceFile(file);
+                if (!runLive(run)) return false;
+                if (typeof body !== 'string') continue;
+                if (!canForceWholeFile(body, forcedFit.tier)) {
+                  logRun({
+                    kind: 'info',
+                    stepId: String(step.id),
+                    text: `Logic heal of ${file}: no last-chance write turn — the file is too large to inline whole (${body.length} chars; the ${forcedFit.tier} tier shows at most ${wholeFileCharLimit(forcedFit.tier)})`
+                  });
+                  continue;
+                }
+                const others: Array<{ path: string; content: string }> = [];
+                for (const rel of [...new Set([...allFiles, ...implicated].map(relOf))]
+                  .filter(rel => rel && rel.toLowerCase() !== file.toLowerCase())
+                  .slice(0, 16)) {
+                  const content = await readWorkspaceFile(rel);
+                  if (!runLive(run)) return false;
+                  if (typeof content === 'string') others.push({ path: rel, content });
+                }
+                const turn = await runForcedWriteTurn({
+                  node,
+                  model,
+                  filePath: file,
+                  run,
+                  label: `Logic heal of ${file}`,
+                  phase: 'logic-heal-forced-write',
+                  prompt: buildForcedWritePrompt({
+                    filePath: file,
+                    currentFileContent: body,
+                    tscErrors: '',
+                    reviewerNote: nayNote,
+                    tier: forcedFit.tier,
+                    relatedDeclarations: referencedDeclarationsForErrors(nayNote, others, {
+                      excludePaths: [file],
+                      maxChars: 3000
+                    })
+                  })
+                });
+                if (!runLive(run)) return false;
+                if (turn.wrote) return true;
+              }
+              return false;
+            })();
+            if (!runLive(run)) {
+              pausedHere();
+              return true;
+            }
+            if (!forcedWrite) {
+              logRun({
+                kind: 'info',
+                stepId: String(step.id),
+                text: `Logic heal on step #${step.id} made no edit: the Coder only read files or its edit failed, even after an explicit "edit now" turn and a last write turn with the whole file inlined`
+              });
+              return false;
+            }
+          }
+        }
+      } finally {
+        endActivity(frame);
+      }
+      await reviewActiveStep(run);
+      return true;
     } finally {
       leaveConductorRun(entered.owned, run.token);
     }
@@ -8324,7 +10640,8 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
   const deferFailedStepAndContinue = async (
     stepId: string,
     note: string,
-    parent?: ConductorRun | null
+    parent?: ConductorRun | null,
+    opts?: { logicIssue?: boolean }
   ) => {
     const entered = bindRun(parent ?? null, false, 'defer');
     if (!entered) {
@@ -8359,14 +10676,19 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     setPlanPaused(false);
     const next = getActiveStep(plan);
     if (plan.status === 'completed' || !next) {
-      restorePlannerControl(
-        'Plan finished. Steps left with compiler debt are marked failed — see project todo.'
-      );
+      const hint = await webRunHintForWorkspace();
+      if (!runLive(run)) return;
+      restorePlannerControl(planEndMessage(plan, hint));
       return;
     }
-    setExecutingPlanNotice(
-      `Step #${stepId} kept as debt — continuing step #${next.id}: ${next.title}`
-    );
+    setExecutingPlanNotice(leftFailedNotice(stepId, next.id, next.title, opts));
+    logRun({
+      kind: 'info',
+      stepId: String(stepId),
+      text: `Left step #${stepId} FAILED${
+        opts?.logicIssue ? ' (a logic issue remains: verify passes, the Reviewer still says Nay)' : ''
+      }; continuing with step #${next.id}`
+    });
     await dispatchActiveStep(run);
     if (!runLive(run) && runOwnsUi(run)) setPlanPaused(true);
     } finally {
@@ -8381,6 +10703,178 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
   const frontierBriefUsed = (plan: PlannerPlan | null | undefined) =>
     !!(plan as (PlannerPlan & { frontierHealBriefUsed?: boolean }) | null | undefined)
       ?.frontierHealBriefUsed;
+
+  /** Prompt addendum for a compiles-but-blank web page (TS9001 / TS9002). */
+  const BLANK_PAGE_HEAL_HINT =
+    'The project compiles, but the page is still a blank or unstyled document. Fix index.html so the file itself has a background and a visible title, and wire Tailwind (@tailwind base; @tailwind components; @tailwind utilities, plus postcss.config.js and tailwind.config.js) or replace className utilities with real CSS in src/index.css.';
+
+  /**
+   * One targeted compiler-heal turn: the local Coder on just the error files, then a last-chance
+   * write turn when it only read files. Shared by healBlockedPlan and the pre-review gate.
+   */
+  const runCompilerHealTurn = async (input: {
+    run: ConductorRun;
+    step: PlannerPlan['steps'][number];
+    verifyOutput: string;
+    errorFiles: string[];
+    allowedFiles: string[];
+    errorBlock: string;
+    promptExtra: string;
+    notice: string;
+    pin?: { node: EndpointNode; model: string };
+  }): Promise<void> => {
+    const { run, errorFiles, allowedFiles, errorBlock } = input;
+    const stuck = input.step;
+    const verify = { output: input.verifyOutput };
+    const { logRun } = scopeRunLog();
+    /**
+     * The heal Coder only read files and wrote nothing: one last write turn per error file, with
+     * the whole current file inlined (re-read from disk), its errors and the declarations they
+     * refer to. Reads in those turns are ignored. Verify and the fingerprint judge the result.
+     */
+    const forceHealWrites = async (
+      healMsg: ChatMessage | undefined,
+      fallbackRoute: { node: EndpointNode; model: string } | undefined
+    ) => {
+      if (!healMsg || !runLive(run) || !workspacePath || writeToolsFromCoderOrigin(healMsg).length) return;
+      const turnTools = messagesFromOrigin(messagesRef.current, healMsg.id).flatMap(m => m.toolCalls || []);
+      if (!turnTools.some(t => t.name === 'read_file' || t.name === 'list_dir' || t.name === 'search')) return;
+      const node = nodesRef.current.find(n => n.id === healMsg?.endpointId) || fallbackRoute?.node;
+      const model = healMsg?.model || fallbackRoute?.model;
+      if (!node || !model) return;
+      const root = workspacePath.replace(/\\/g, '/').replace(/\/+$/, '');
+      const readWorkspaceFile = async (rel: string): Promise<string | undefined> => {
+        try {
+          const res = await window.electronAPI.readFile(`${root}/${rel}`);
+          return res.content;
+        } catch {
+          return undefined;
+        }
+      };
+      const relOf = (p: string) => {
+        const f = p.replace(/\\/g, '/').replace(/^\.\//, '');
+        if (/^[a-zA-Z]:\//.test(f) || f.startsWith('/')) {
+          return f.toLowerCase().startsWith(`${root.toLowerCase()}/`) ? f.slice(root.length + 1) : '';
+        }
+        return f.includes('..') ? '' : f;
+      };
+      const targets = [...new Set(errorFiles.map(relOf).filter(Boolean))].slice(0, 3);
+      if (!targets.length) return;
+      const fit = resolveModelFit(node, model, 'coder', coderAgent.numCtx);
+      const byFile = groupTscErrorsByFile(verify.output || '', workspacePath);
+      const errorsFor = (file: string) =>
+        [...byFile].find(([key]) => relOf(key).toLowerCase() === file.toLowerCase())?.[1] || verify.output || '';
+      for (const file of targets) {
+        const body = await readWorkspaceFile(file);
+        if (!runLive(run)) return;
+        if (typeof body !== 'string') continue;
+        if (!canForceWholeFile(body, fit.tier)) {
+          logRun({
+            kind: 'info',
+            stepId: String(stuck.id),
+            text: `Heal of ${file}: no last-chance write turn — the file is too large to inline whole (${body.length} chars; the ${fit.tier} tier shows at most ${wholeFileCharLimit(fit.tier)})`
+          });
+          continue;
+        }
+        const errorText = errorsFor(file);
+        const others: Array<{ path: string; content: string }> = [];
+        const candidates = [
+          ...allowedFiles.map(relOf),
+          ...pathsNamedInText(errorText, await listSourceFolderFiles(workspacePath))
+        ].filter(rel => rel && rel.toLowerCase() !== file.toLowerCase());
+        for (const rel of [...new Set(candidates)].slice(0, 16)) {
+          const content = await readWorkspaceFile(rel);
+          if (!runLive(run)) return;
+          if (typeof content === 'string') others.push({ path: rel, content });
+        }
+        const turn = await runForcedWriteTurn({
+          node,
+          model,
+          filePath: file,
+          run,
+          label: `Heal of ${file}`,
+          phase: 'heal-forced-write',
+          prompt: buildForcedWritePrompt({
+            filePath: file,
+            currentFileContent: body,
+            tscErrors: errorText,
+            tier: fit.tier,
+            relatedDeclarations: referencedDeclarationsForErrors(errorText, others, {
+              excludePaths: [file],
+              maxChars: 3000
+            })
+          })
+        });
+        if (!runLive(run)) return;
+        if (turn.wrote) break;
+      }
+    };
+
+    const runHealCoder = async (promptExtra: string, notice: string, pin?: { node: EndpointNode; model: string }) => {
+      const healRoute =
+        pin ||
+        (() => {
+          const r = resolveRoute(`Heal step #${stuck.id}`, coderAgent);
+          return r ? { node: r.routedNode, model: r.routedModel } : undefined;
+        })();
+      const healFit = healRoute
+        ? resolveModelFit(healRoute.node, healRoute.model, 'coder', coderAgent.numCtx)
+        : null;
+      // Error files come first in allowedFiles and are shown whole: the per-file cap is raised to
+      // what the tier can show of a single file, so the Coder has no reason to read them again.
+      const filesBody = await buildTouchedFilesContext(
+        workspacePath,
+        allowedFiles,
+        healFit
+          ? {
+              ...healFit.caps,
+              maxCharsPerFile: Math.max(healFit.caps.maxCharsPerFile, wholeFileCharLimit(healFit.tier))
+            }
+          : {
+              maxFiles: 10,
+              maxCharsPerFile: 12000,
+              maxTotalChars: 48000
+            }
+      );
+      if (!runLive(run)) return;
+      const healPrompt = `### Heal pass (compiler-driven)
+You are fixing compile/verify errors for plan step #${stuck.id}: ${stuck.title}.
+${stuck.reviewNote ? `Reviewer note: ${stuck.reviewNote}` : ''}
+${healFit?.packingLine ? `\n${healFit.packingLine}` : ''}
+
+Rules:
+- Edit ONLY these files (prefer edit_file): ${allowedFiles.map(f => `\`${f}\``).join(', ') || '(paths named in the errors)'}
+- Do not invent new architecture or append plan steps.
+- No prose-as-file. Emit real code edits only.
+- Stop when the listed errors are addressed.
+
+${errorBlock}
+
+${promptExtra}
+
+${filesBody || '(No file bodies preloaded — call read_file for each path, then edit_file.)'}
+
+Work log:
+${progressForPrompt() || '(empty)'}`;
+
+      selectWorkerTab(coderAgent.id);
+      setExecutingPlanNotice(notice);
+      const healMsg = await runSingleNodeTurn({
+        userText: `Heal step #${stuck.id}: fix compiler errors`,
+        fullPrompt: healPrompt,
+        agent: coderAgent,
+        planMode: false,
+        approvedPlan: approvedPlanRef.current,
+        skipUserAppend: true,
+        notice,
+        freshContext: true,
+        run,
+        ...(pin ? { pinRoute: pin } : {})
+      });
+      await forceHealWrites(healMsg, healRoute);
+    };
+    await runHealCoder(input.promptExtra, input.notice, input.pin);
+  };
 
   const healBlockedPlan = async (): Promise<void> => {
     const entered = bindRun(null, false, 'heal');
@@ -8399,7 +10893,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     };
     try {
     if (!runLive(run)) return;
-    let plan = plannerPlanRef.current;
+    const plan = plannerPlanRef.current;
     if (!plan || !isPlanActive(plan)) {
       setExecutingPlanNotice('No active plan to heal.');
       return;
@@ -8480,63 +10974,22 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       const stepFiles = collectStepFilePaths(stuck);
       const allowedFiles = [...new Set([...errorFiles, ...stepFiles])].slice(0, 14);
 
-      const runHealCoder = async (promptExtra: string, notice: string, pin?: { node: EndpointNode; model: string }) => {
-        const healRoute =
-          pin ||
-          (() => {
-            const r = resolveRoute(`Heal step #${stuck.id}`, coderAgent);
-            return r ? { node: r.routedNode, model: r.routedModel } : undefined;
-          })();
-        const healFit = healRoute
-          ? resolveModelFit(healRoute.node, healRoute.model, 'coder', coderAgent.numCtx)
-          : null;
-        const filesBody = await buildTouchedFilesContext(
-          workspacePath,
-          allowedFiles,
-          healFit?.caps || {
-            maxFiles: 10,
-            maxCharsPerFile: 12000,
-            maxTotalChars: 48000
-          }
-        );
-        if (!runLive(run)) return;
-        const healPrompt = `### Heal pass (compiler-driven)
-You are fixing compile/verify errors for plan step #${stuck.id}: ${stuck.title}.
-${stuck.reviewNote ? `Reviewer note: ${stuck.reviewNote}` : ''}
-${healFit?.packingLine ? `\n${healFit.packingLine}` : ''}
-
-Rules:
-- Edit ONLY these files (prefer edit_file): ${allowedFiles.map(f => `\`${f}\``).join(', ') || '(paths named in the errors)'}
-- Do not invent new architecture or append plan steps.
-- No prose-as-file. Emit real code edits only.
-- Stop when the listed errors are addressed.
-
-${errorBlock}
-
-${promptExtra}
-
-${filesBody || '(No file bodies preloaded — call read_file for each path, then edit_file.)'}
-
-Work log:
-${progressForPrompt() || '(empty)'}`;
-
-        ephemeralWorkerRef.current = true;
-        onSelectAgent(coderAgent.id);
-        onConversationPatch?.({ agentId: coderAgent.id });
-        setExecutingPlanNotice(notice);
-        await runSingleNodeTurn({
-          userText: `Heal step #${stuck.id}: fix compiler errors`,
-          fullPrompt: healPrompt,
-          agent: coderAgent,
-          planMode: false,
-          approvedPlan: approvedPlanRef.current,
-          skipUserAppend: true,
-          notice,
-          freshContext: true,
+      const runHealCoder = (
+        promptExtra: string,
+        notice: string,
+        pin?: { node: EndpointNode; model: string }
+      ) =>
+        runCompilerHealTurn({
           run,
-          ...(pin ? { pinRoute: pin } : {})
+          step: stuck,
+          verifyOutput: verify.output,
+          errorFiles,
+          allowedFiles,
+          errorBlock,
+          promptExtra,
+          notice,
+          pin
         });
-      };
 
       const fingerprintBeforeLocal = fingerprint;
       await snapshotStepFiles(String(stuck.id), allowedFiles);
@@ -8560,7 +11013,7 @@ ${progressForPrompt() || '(empty)'}`;
           frontierFix && isFrontierNode(frontierFix.node) ? frontierFix : undefined;
         await runHealCoder(
           blankPage
-            ? 'The project compiles, but the page is still a blank or unstyled document. Fix index.html so the file itself has a background and a visible title, and wire Tailwind (@tailwind base; @tailwind components; @tailwind utilities, plus postcss.config.js and tailwind.config.js) or replace className utilities with real CSS in src/index.css.'
+            ? BLANK_PAGE_HEAL_HINT
             : '',
           frontierPin
             ? `Heal: frontier coder fixing the blank page on ${frontierPin.node.name} · ${frontierPin.model}…`
@@ -8774,9 +11227,12 @@ ${progressForPrompt() || '(empty)'}`;
       return { ran: false, passed: false, notes };
     }
     const frontier = isFrontierNode(target.node);
-    const caps = frontier
-      ? { maxFiles: 80, maxCharsPerFile: 14000, maxTotalChars: 180000 }
-      : { maxFiles: 24, maxCharsPerFile: 8000, maxTotalChars: 48000 };
+    const caps = resolveReviewerFileCaps(
+      resolveModelFit(target.node, target.model, 'reviewer', reviewerAgent.numCtx).maxCtx,
+      frontier
+        ? { maxFiles: 80, maxCharsPerFile: 14000, maxTotalChars: 180000 }
+        : { maxFiles: 24, maxCharsPerFile: 8000, maxTotalChars: 48000 }
+    );
     const reviewSourceFrame = beginActivity('project-review', 'Final source review', `${target.node.name} · ${target.model}`);
     setExecutingPlanNotice(
       frontier
@@ -8901,6 +11357,18 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
     }
   };
 
+  /** "Run `npm run dev`…" for a web project with a dev script, else ''. */
+  const webRunHintForWorkspace = async (): Promise<string> => {
+    const delivery = plannerPlanRef.current?.delivery || projectBrainRef.current.delivery || null;
+    if (delivery && delivery !== 'web') return '';
+    const pkg = await readWorkspacePackage();
+    const scripts =
+      pkg?.scripts && typeof pkg.scripts === 'object' && !Array.isArray(pkg.scripts)
+        ? (pkg.scripts as Record<string, unknown>)
+        : null;
+    return webRunHint(delivery, scripts);
+  };
+
   const rememberDistNote = (summary: string) => {
     const note = summary.replace(/\s+/g, ' ').trim().slice(0, 800);
     if (!note) return;
@@ -8989,13 +11457,24 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
       }
       return;
     }
+    // A page that compiles can still render wrong: look at it once before the plan is called done.
+    if (!(await renderGateBeforeFinish(parent))) return;
+    if (parent && !runLive(parent)) return;
     const shipping = markPlanFinalReview(plan);
     await commitPlannerPlan(shipping, parent?.token);
     if (parent && !runLive(parent)) return;
     const review = await reviewFinishedSource(shipping, parent);
     if (parent && !runLive(parent)) return;
     const distNote = await packageElectronDist(shipping, parent);
-    if (!distNote) return;
+    if (parent && !runLive(parent)) return;
+    if (!distNote) {
+      if (review.ran && !review.passed) return;
+      const hint = await webRunHintForWorkspace();
+      if (!hint || (parent && !runOwnsUi(parent))) return;
+      const passed = review.ran ? 'Source review passed. ' : '';
+      setExecutingPlanNotice(`${passed}${hint}`);
+      return;
+    }
     const prefix =
       review.ran && review.passed
         ? 'Source review passed. '
@@ -9005,6 +11484,47 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
     setExecutingPlanNotice(`${prefix}${distNote}`.replace(/\s+/g, ' ').trim().slice(0, 500));
   };
   finishVerifiedPlanRef.current = finishVerifiedPlan;
+
+  /**
+   * No next step, verify just passed, and failed or skipped steps remain. Full auto gives each failed
+   * step one Reviewer pass (a Yay completes it). A plan with no debt left goes to final review;
+   * otherwise it ends honestly instead of claiming completion.
+   */
+  const settlePlanWithDebt = async (run: ConductorRun): Promise<void> => {
+    const { logRun } = scopeRunLog();
+    let plan = plannerPlanRef.current;
+    if (!plan) return;
+    if (fullAutoRef.current && planHasDebt(plan)) {
+      for (const failed of plan.steps.filter(s => s.status === 'failed')) {
+        const key = `${plan.id}:${failed.id}`;
+        if (debtReviewedRef.current[key]) continue;
+        debtReviewedRef.current = { ...debtReviewedRef.current, [key]: 1 };
+        if (!runLive(run)) break;
+        logRun({
+          kind: 'info',
+          stepId: String(failed.id),
+          text: `Verify is green; giving failed step #${failed.id} one Reviewer pass`
+        });
+        setExecutingPlanNotice(`Verify passed — Reviewer checking failed step #${failed.id}: ${failed.title}…`);
+        await reviewActiveStep(run, { debtStepId: String(failed.id) });
+      }
+      if (!runLive(run)) {
+        if (runOwnsUi(run)) setPlanPaused(true);
+        return;
+      }
+      plan = plannerPlanRef.current;
+      if (!plan) return;
+    }
+    if (planReadyForRelease(plan)) {
+      setPlanPaused(false);
+      await finishVerifiedPlanRef.current(plan, run);
+      if (!runLive(run) && runOwnsUi(run)) setPlanPaused(true);
+      return;
+    }
+    const hint = await webRunHintForWorkspace();
+    if (!runLive(run)) return;
+    restorePlannerControl(planEndMessage(plan, hint));
+  };
 
   /** Apply Yay/Nay to durable plan, then next step or rework / escalate. */
   const applyStepVerdictAndContinue = async (
@@ -9150,6 +11670,11 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
       setExecutingPlanNotice(
         `Reworking step #${sid} from Reviewer Nay (${nextCount}/${MAX_STEP_REWORKS})…`
       );
+      logRun({
+        kind: 'info',
+        stepId: sid,
+        text: `Rework #${nextCount} of step #${sid}: ${plainNote(notes || stuck?.reviewNote || '', 200)}`
+      });
       await dispatchActiveStep(run);
       if (!runLive(run) && runOwnsUi(run)) setPlanPaused(true);
       return;
@@ -9176,6 +11701,8 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
       setExecutingPlanNotice(`Step Yay — starting step #${next.id}: ${next.title}`);
       await dispatchActiveStep(run);
       if (!runLive(run) && runOwnsUi(run)) setPlanPaused(true);
+    } else if (planHasDebt(plannerPlanRef.current)) {
+      await settlePlanWithDebt(run);
     } else {
       restorePlannerControl('Planner plan complete — ask Planner what to build next.');
     }
@@ -9308,6 +11835,10 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
     fullAutoGateRef.current = null;
     await commitPlannerPlan(plan, run.token);
     if (!runLive(run)) return;
+    // Bare names for files in subfolders are fixed once at lock, and again per step at dispatch.
+    await resolvePlanBareFiles(run);
+    if (!runLive(run)) return;
+    plan = plannerPlanRef.current || plan;
     setExecutingPlanNotice(
       `Plan locked (${plan.steps.length} steps) — dispatching next step…`
     );
@@ -9583,9 +12114,6 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       setInput('');
       setPendingImages([]);
     }
-    if (!projectBrainRef.current.brief) {
-      commitProjectBrain({ ...projectBrainRef.current, brief: userText.slice(0, 1200) });
-    }
     updateProgress(log => noteUserTurn(log, userText));
     fitContext(modelMaxCtx(sendNode, sendModel), sendModel);
     resetAgentLoopBudget();
@@ -9593,6 +12121,13 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
     if (!enteredSend) return;
     logRun({ kind: 'user', action: userAction, text: userText.slice(0, 300) });
     try {
+    reviewFixRoundsRef.current = {};
+    reviewFixEscalatedRef.current = new Set();
+    await ensureFreshProjectState(enteredSend.run);
+    if (!runLive(enteredSend.run)) return;
+    if (!projectBrainRef.current.brief) {
+      commitProjectBrain({ ...projectBrainRef.current, brief: userText.slice(0, 1200) });
+    }
     stuckRef.current = { key: '', stage: 'none' };
     ephemeralWorkerRef.current = false;
 
@@ -9657,9 +12192,11 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       const planHint = step
         ? `\n\n[ACTIVE PLAN — step #${step.id}: ${step.title}. Advise the user, clarify, or replan only if they ask. Do not emit a fresh <plan_options> unless they want to replan. Do not implement files — Coders are dispatched automatically.]`
         : `\n\n[ACTIVE PLAN IN PROGRESS. Advise the user or replan only if they ask. Do not implement files yourself.]`;
+      const runHint = await webRunHintForWorkspace();
+      const runHintContext = runHint ? `\n[HOW THIS PROJECT RUNS: ${runHint}]` : '';
       return await runSingleNodeTurn({
         userText,
-        fullPrompt: `${fullPrompt}${planHint}`,
+        fullPrompt: `${fullPrompt}${planHint}${runHintContext}`,
         attachedImages,
         agent: plannerAgent,
         planMode: false,
@@ -9902,7 +12439,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
           : 'Resuming Review…'
       );
       setPlanResumePhase('review');
-      await reviewActiveStep(ship.run);
+      await reviewStepVerifyFirst(ship.run);
       return;
     }
 
@@ -9989,7 +12526,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       setExecutingPlanNotice(
         step ? `Resuming Review on step #${step.id}…` : 'Resuming Review…'
       );
-      await reviewActiveStep(ship.run);
+      await reviewStepVerifyFirst(ship.run);
       return;
     }
 
@@ -10029,7 +12566,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
           ? `Resuming Review on step #${step.id}: ${step.title}…`
           : 'Resuming Review…'
       );
-      await reviewActiveStep(ship.run);
+      await reviewStepVerifyFirst(ship.run);
       return;
     }
 
@@ -10312,11 +12849,15 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
   ).length;
   const modelReady = nodes.some(n => n.online && getEnabledModelsForNode(n).length > 0);
   const meterSnap = lastContextMeter();
-  const sampledAssistant = [...messages].reverse().find(
-    m => m.role === 'assistant' && (m.stats?.promptTokens || 0) > 0
-  );
-  const contextUsed = sampledAssistant?.stats?.promptTokens || meterSnap?.promptTokens;
-  const contextPinned = activeTargetMaxCtx || meterSnap?.pinnedCtx || sampledAssistant?.stats?.numCtx || 0;
+  const meterReading = resolveContextMeter({
+    snapshot: meterSnap,
+    messages,
+    target: { model: activeTargetModel, node: selectedNode?.name, pinned: activeTargetMaxCtx },
+    nodesFor: model =>
+      nodes.filter(n => getEnabledModelsForNode(n).includes(model)).map(n => n.name)
+  });
+  const contextUsed = meterReading.used;
+  const contextPinned = meterReading.pinned;
   if (!nodeDrag.dragging) nodeBasisRef.current = nodeWorkColWidth;
   const liveColumns = limitsFor(
     paneWidth,
@@ -10407,7 +12948,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
             {agents.map(a => (
               <button
                 key={a.id}
-                onClick={() => onSelectAgent(a.id)}
+                onClick={() => pickAgentTab(a.id)}
                 title={`${a.name}: ${a.role}`}
                 className={`px-2 py-0.5 text-[11px] font-medium rounded transition ${
                   selectedAgentId === a.id
@@ -11036,7 +13577,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
               <button
                 key={a.id}
                 type="button"
-                onClick={() => onSelectAgent(a.id)}
+                onClick={() => pickAgentTab(a.id)}
                 className={`px-2 py-0.5 text-[11px] font-medium rounded transition ${
                   selectedAgentId === a.id
                     ? 'bg-indigo-600 text-white shadow-sm'
@@ -11185,10 +13726,10 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         <ContextMeter
           used={contextUsed}
           pinned={contextPinned}
-          tier={meterSnap?.tier}
-          budget={meterSnap?.promptBudget}
-          model={meterSnap?.model || activeTargetModel}
-          node={selectedNode?.name}
+          tier={meterReading.model && meterReading.model === meterSnap?.model ? meterSnap?.tier : undefined}
+          budget={meterReading.model && meterReading.model === meterSnap?.model ? meterSnap?.promptBudget : undefined}
+          model={meterReading.model}
+          node={meterReading.node}
         />
         {showStreamingUi && (
           <ActivityIndicator

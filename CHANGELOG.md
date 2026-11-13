@@ -2,7 +2,9 @@
 
 All notable changes to LocalAgents Studio are listed here. Older releases are summarized in [`AGENTS.md`](AGENTS.md) §6 and the [wiki](https://github.com/HipHopGrinch/LocalAgents-Studio/wiki/Whats-new).
 
-## Unreleased
+## 1.4.0 — 2026-11-13
+
+Per-role computer, model and context picks; Full auto; the Conductor run log; and a resizable layout. This release also fixes 110 bugs from the 2026-11-13 bug hunt, including security fixes to the command denylist, workspace jail, in-app git and web console.
 
 ### Added
 

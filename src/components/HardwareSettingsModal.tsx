@@ -193,6 +193,10 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   nodesRef.current = nodes;
 
   const currentNode = nodes.find(n => n.id === selectedNodeId) || nodes[0];
+  const hubNode =
+    currentNode && currentNode.type === 'openai'
+      ? nodes.find(n => n.type !== 'openai')
+      : currentNode;
 
   const applyShowMeta = (nodeId: string, modelName: string, show: {
     capabilities?: string[];
@@ -494,9 +498,22 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   const handleApplyGpuPreset = (presetName: string) => {
     const preset = GPU_PRESETS.find(p => p.name === presetName);
     if (!preset) return;
-    handleUpdateHardware('gpu', preset.name);
-    handleUpdateHardware('vramGB', preset.vramGB);
-    handleUpdateHardware('gpuBandwidthGBs', preset.bandwidth);
+    if (!currentNode) return;
+    onUpdateNodes(
+      nodes.map(n =>
+        n.id === currentNode.id
+          ? {
+              ...n,
+              hardware: {
+                ...n.hardware,
+                gpu: preset.name,
+                vramGB: preset.vramGB,
+                gpuBandwidthGBs: preset.bandwidth
+              }
+            }
+          : n
+      )
+    );
   };
 
   const handleSetVramOverheadMode = (mode: 'windows_desktop' | 'headless_linux' | 'igpu_display') => {
@@ -1231,11 +1248,11 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
         )}
 
         {activeTab === 'hub' &&
-          (currentNode ? (
+          (hubNode ? (
             <ModelHubPanel
               nodes={nodes}
-              currentNode={currentNode}
-              selectedNodeId={selectedNodeId || currentNode.id}
+              currentNode={hubNode}
+              selectedNodeId={hubNode.id}
               onSelectNodeId={setSelectedNodeId}
               selectedTask={selectedTask}
               onSelectTask={setSelectedTask}
@@ -1247,7 +1264,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
           ) : (
             <div className="flex-1 flex flex-col items-center justify-center text-center px-8 text-zinc-500">
               <p className="text-sm font-semibold text-zinc-200">Add a node first</p>
-              <p className="text-xs mt-2">Model Hub needs at least one endpoint to recommend pulls.</p>
+              <p className="text-xs mt-2">Model Hub needs at least one local Ollama endpoint to recommend pulls.</p>
               <button
                 type="button"
                 onClick={() => {

@@ -111,6 +111,8 @@ function mcpStdioOnce(command, args, method, params, framing, timeoutMs) {
       clearTimeout(timer);
       killTree(child);
       resolve(payload);
+      for (const waiter of pending.values()) waiter.rej(new Error('MCP call ended'));
+      pending.clear();
     };
     const send = msg => {
       try {
@@ -138,6 +140,13 @@ function mcpStdioOnce(command, args, method, params, framing, timeoutMs) {
       stderr = (stderr + d.toString()).slice(-2000);
     });
     child.on('error', err => finish({ error: err.message }));
+    child.on('close', code => {
+      const tail = stderr.trim();
+      finish({ error: `MCP server exited${code != null ? ` (code ${code})` : ''}${tail ? `: ${tail}` : ''}` });
+    });
+    child.stdin.on('error', () => {
+      /* server closed its stdin; 'close' reports the exit */
+    });
     child.stdout.on('data', chunk => {
       if (buf.length + chunk.length > MAX_FRAME_BYTES) {
         finish({ error: 'MCP frame exceeded 1 MB' });

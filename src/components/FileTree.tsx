@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { WorkspaceFile } from '../types';
 import {
   ChevronRight,
@@ -79,7 +79,11 @@ export const FileTree: React.FC<FileTreeProps> = ({
     ? focusedPath
     : visible[0]?.file.path ?? null;
 
-  const loadDir = async (dirPath: string) => {
+  const expandedRef = useRef(expandedDirs);
+  expandedRef.current = expandedDirs;
+  const lastRootRef = useRef(rootPath);
+
+  const loadDir = async (dirPath: string, silent = false) => {
     setDirErrors(prev => {
       if (!prev[dirPath]) return prev;
       const next = { ...prev };
@@ -90,7 +94,7 @@ export const FileTree: React.FC<FileTreeProps> = ({
       setDirErrors(prev => ({ ...prev, [dirPath]: true }));
       return;
     }
-    setLoadingDirs(prev => ({ ...prev, [dirPath]: true }));
+    if (!silent) setLoadingDirs(prev => ({ ...prev, [dirPath]: true }));
     try {
       const res = await window.electronAPI.readDir(dirPath);
       if (Array.isArray(res)) {
@@ -103,9 +107,28 @@ export const FileTree: React.FC<FileTreeProps> = ({
       setSubDirFiles(prev => ({ ...prev, [dirPath]: [] }));
       setDirErrors(prev => ({ ...prev, [dirPath]: true }));
     } finally {
-      setLoadingDirs(prev => ({ ...prev, [dirPath]: false }));
+      if (!silent) setLoadingDirs(prev => ({ ...prev, [dirPath]: false }));
     }
   };
+
+  const reloadExpandedDirs = () => {
+    for (const dirPath of Object.keys(expandedRef.current)) {
+      if (expandedRef.current[dirPath]) void loadDir(dirPath, true);
+    }
+  };
+
+  useEffect(() => {
+    if (lastRootRef.current !== rootPath) {
+      lastRootRef.current = rootPath;
+      setExpandedDirs({});
+      setSubDirFiles({});
+      setLoadingDirs({});
+      setDirErrors({});
+      return;
+    }
+    reloadExpandedDirs();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [files, rootPath]);
 
   const toggleDir = async (dirPath: string) => {
     let expanding = false;
@@ -174,8 +197,8 @@ export const FileTree: React.FC<FileTreeProps> = ({
   };
 
   const handleRefreshAll = () => {
-    setSubDirFiles({});
     setDirErrors({});
+    reloadExpandedDirs();
     onRefresh();
   };
 

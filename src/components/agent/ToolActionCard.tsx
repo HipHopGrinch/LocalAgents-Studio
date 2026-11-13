@@ -36,6 +36,8 @@ export const ToolActionCard: React.FC<ToolActionCardProps> = ({
   const [commandOk, setCommandOk] = useState(tool.status === 'done');
   const [loading, setLoading] = useState(false);
   const [kept, setKept] = useState<boolean[]>([]);
+  /** Hunk indices this card wrote. null means the whole diff was applied outside the card. */
+  const [appliedHunks, setAppliedHunks] = useState<number[] | null>(null);
   const [applyError, setApplyError] = useState('');
   const [commandError, setCommandError] = useState('');
 
@@ -197,19 +199,29 @@ export const ToolActionCard: React.FC<ToolActionCardProps> = ({
       return true;
     };
 
+    const allIdx = blocks.map((_, i) => i);
+    const diffApplied = applied || tool.status === 'done';
+    const hunkApplied = (i: number) => diffApplied && (appliedHunks ? appliedHunks.includes(i) : true);
+    const dropIdx = allIdx.filter(i => !keptSafe[i] && hunkApplied(i));
+
     const handleApplyEdit = async () => {
-      const chosen = blocks.filter((_, i) => keptSafe[i]);
-      const rejected = blocks.filter((_, i) => !keptSafe[i]);
-      if (!chosen.length && !rejected.length) return;
+      if (!blocks.length) return;
       setLoading(true);
       setApplyError('');
       try {
-        if (applied || tool.status === 'done') {
-          if (rejected.length) {
-            await applyBody(hunkBody(rejected.map(b => ({ search: b.replace, replace: b.search }))));
+        if (diffApplied) {
+          if (dropIdx.length) {
+            const ok = await applyBody(
+              hunkBody(dropIdx.map(i => ({ search: blocks[i].replace, replace: blocks[i].search })))
+            );
+            if (ok) setAppliedHunks(allIdx.filter(i => hunkApplied(i) && !dropIdx.includes(i)));
           }
-        } else if (chosen.length) {
-          await applyBody(hunkBody(chosen));
+        } else {
+          const chosenIdx = allIdx.filter(i => keptSafe[i]);
+          if (chosenIdx.length) {
+            const ok = await applyBody(hunkBody(chosenIdx.map(i => blocks[i])));
+            if (ok) setAppliedHunks(chosenIdx);
+          }
         }
       } catch (err: unknown) {
         setApplyError(diffFailure(err instanceof Error ? err.message : String(err)));
@@ -281,7 +293,7 @@ export const ToolActionCard: React.FC<ToolActionCardProps> = ({
               {applied ? (
                 <>
                   <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-                  <span>{keptSafe.every(Boolean) ? 'Diff Applied' : 'Drop rejected hunks'}</span>
+                  <span>{dropIdx.length ? 'Drop rejected hunks' : 'Diff Applied'}</span>
                 </>
               ) : (
                 <span>Apply accepted hunks</span>

@@ -294,4 +294,14 @@ const fileAt = stepShrunk.indexOf('FILE_BODY_SECRET');
 assert.ok(stepAt >= 0);
 assert.ok(fileAt === -1 || stepAt < fileAt);
 
+// B-51: a "#### file.ext" heading inside the user request is an instruction, not a written-file body
+const userRequestPacket =
+  '### USER REQUEST\nBuild the game\n\n#### notes.md\nKeep the score in the corner and do not remove the collision code.';
+assert.match(
+  shrinkUserPacket(userRequestPacket, 1, { cap: false }),
+  /do not remove the collision code/
+);
+const writtenPacket = '## Already written\n#### a.ts\nconst ALREADY_ON_DISK = 1;\n';
+assert.doesNotMatch(shrinkUserPacket(writtenPacket, 1, { cap: false }), /ALREADY_ON_DISK/);
+
 console.log('contextMonitor.selftest ok');

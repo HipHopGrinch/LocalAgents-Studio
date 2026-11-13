@@ -27,8 +27,7 @@ export function usesTailwindClasses(source: string): boolean {
 export function tailwindCssIsWired(css: string): boolean {
   const text = css || '';
   if (/@tailwind\s+utilities/.test(text)) return true;
-  if (/\.bg-slate-900\b/.test(text) || /\.flex\b/.test(text)) return true;
-  return text.length > 2500;
+  return /\.bg-slate-900\b/.test(text) || /\.flex\b/.test(text);
 }
 
 export interface WebEntryInput {

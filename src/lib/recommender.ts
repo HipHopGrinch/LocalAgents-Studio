@@ -193,7 +193,6 @@ export function modelFamilyBase(modelName: string): string {
 
 function paramsDistance(row: CatalogModel, queryParams: number): number {
   const points = [row.paramsB];
-  if (typeof row.activeB === 'number' && row.activeB > 0) points.push(row.activeB);
   const tagged = parseParams(row.tag);
   if (typeof tagged === 'number') points.push(tagged);
   return Math.min(...points.map(p => Math.abs(p - queryParams)));
@@ -258,7 +257,10 @@ export function findCatalogModel(modelName: string): CatalogModel | undefined {
     }
   }
   if (!best) return undefined;
-  if (bestDist > 8 && bestDist / Math.max(queryParams, 0.5) > 0.6) return undefined;
+  const relMismatch = bestDist / Math.max(queryParams, 0.5);
+  if (relMismatch > 0.5) return undefined;
+  const isMoe = typeof best.activeB === 'number' && best.activeB > 0 && best.activeB + 0.05 < best.paramsB;
+  if (isMoe && relMismatch > 0.03) return undefined;
   return best;
 }
 

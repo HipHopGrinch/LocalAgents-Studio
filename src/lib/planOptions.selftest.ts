@@ -2,7 +2,7 @@
  * Run: npx --yes tsx src/lib/planOptions.selftest.ts
  */
 import assert from 'node:assert/strict';
-import { parseStepVerdict } from './planOptions';
+import { parseReviewDelta, parseStepVerdict } from './planOptions';
 
 const prose = 'Looks good to me. No bugs. Ship it.';
 assert.equal(parseStepVerdict(prose), null);
@@ -27,5 +27,23 @@ const emptyTag = parseStepVerdict('<step_verdict step_id="4"></step_verdict>', {
 assert.equal(emptyTag.result, 'missing');
 assert.equal(emptyTag.stepId, '4');
 assert.equal(parseStepVerdict('<step_verdict step_id="4"></step_verdict>'), null);
+
+// B-46: negated verdicts are nay / failed, and any nay word beats yay
+const stepResult = (r: string) =>
+  parseStepVerdict('<step_verdict step_id="1"><result>' + r + '</result></step_verdict>')?.result;
+for (const r of ['do not approve', 'not ok', 'no good', "don't approve", 'nay', 'approved but wrong']) {
+  assert.equal(stepResult(r), 'nay', r);
+}
+for (const r of ['yay', 'approve', 'ok', 'approved']) {
+  assert.equal(stepResult(r), 'yay', r);
+}
+const deltaVerdict = (v: string, notes = 'x') =>
+  parseReviewDelta(
+    '<review_delta task_id="1"><verdict>' + v + '</verdict><notes>' + notes + '</notes></review_delta>'
+  )?.verdict;
+assert.equal(deltaVerdict('not done', 'still broken'), 'failed');
+assert.equal(deltaVerdict('failed'), 'failed');
+assert.equal(deltaVerdict('done'), 'completed');
+assert.equal(deltaVerdict('completed'), 'completed');
 
 console.log('planOptions.selftest ok');

@@ -6,12 +6,10 @@ import { HelpTip } from '../agent/HelpTip';
 import {
   DEFAULT_MODEL_NUM_CTX,
   clampNumCtx,
-  ctxSizeOptions,
   estimateContextFit,
   formatCtxLabel,
-  resolveModelMaxContext,
-  resolveModelNumCtx,
-  snapNumCtxToOption
+  modelContextSelect,
+  resolveModelNumCtx
 } from '../../lib/contextSize';
 import {
   estimateInstalledModelFit,
@@ -272,10 +270,11 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
               {/* Max context ceiling — Ollama KV budget; frontier defaults to 256k (server-managed). */}
               {!isEmbed && onSetModelNumCtx && (() => {
                 const isFrontier = currentNode.type === 'openai' || !!currentNode.apiKey;
-                const modelNativeMax = resolveModelMaxContext(m.name, m);
                 const storedMax = resolveModelNumCtx(currentNode, m.name, DEFAULT_MODEL_NUM_CTX);
-                const currentMax = snapNumCtxToOption(storedMax, modelNativeMax);
-                const options = ctxSizeOptions(modelNativeMax, currentMax);
+                const choice = modelContextSelect(m.name, m, storedMax);
+                const modelNativeMax = choice.nativeMax;
+                const currentMax = choice.value;
+                const options = choice.options;
                 const fit = estimateContextFit(currentMax);
                 const vramFit = isFrontier
                   ? null

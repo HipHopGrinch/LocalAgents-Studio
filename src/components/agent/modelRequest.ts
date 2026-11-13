@@ -152,7 +152,8 @@ export function notePromptSample(
  * Skips a second work log when the packet already has one.
  */
 export function prependVolatileContext(user: string, input: VolatileContextBlockInput): string {
-  const skipLog = /\bWork log\b/i.test(user);
+  const log = input.progressLog?.trim() || '';
+  const skipLog = !!log && (user.includes(log) || /^## Work log\r?\nThis is the memory of the task/m.test(user));
   const block = buildVolatileContextBlock({
     ...input,
     progressLog: skipLog ? undefined : input.progressLog

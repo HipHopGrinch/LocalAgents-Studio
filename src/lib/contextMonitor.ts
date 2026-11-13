@@ -69,8 +69,7 @@ function headingKind(line: string): SectionKind | null {
   if (
     /^## Already written\b/i.test(t) ||
     /^### .+\(already written\)\s*$/i.test(t) ||
-    /^### DIRECT DEPENDENCIES\b/i.test(t) ||
-    (/^#### \S/.test(t) && /\.[a-z0-9]+$/i.test(t))
+    /^### DIRECT DEPENDENCIES\b/i.test(t)
   ) {
     return 'already-written';
   }
@@ -106,7 +105,12 @@ function parseBlocks(text: string): SectionBlock[] {
     buf = [];
   };
   for (const line of text.split('\n')) {
-    const next = headingKind(line);
+    let next = headingKind(line);
+    if (/^#### \S/.test(line.trim()) && /\.[a-z0-9]+$/i.test(line.trim())) {
+      // A `#### file.ext` heading is a written-file body only under an "Already written" heading.
+      if (kind === 'already-written') next = 'already-written';
+      else if (kind === 'protected') next = null;
+    }
     if (next) {
       flush();
       kind = next;

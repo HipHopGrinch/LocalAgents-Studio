@@ -124,11 +124,11 @@ export function shouldPreserveContract(existing: string, incoming: string): bool
 
 function stemOf(path: string): string {
   const base = path.replace(/\\/g, '/').split('/').pop() || path;
-  return base
-    .replace(/\.[^.]+$/, '')
-    .toLowerCase()
-    .replace(/^(checkers|game|app)/, '')
-    .replace(/[^a-z0-9]/g, '');
+  const name = base.replace(/\.[^.]+$/, '');
+  const prefix = /^(checkers|game|app)/i.exec(name);
+  const next = prefix ? name.charAt(prefix[0].length) : '';
+  const stripPrefix = !!prefix && (/[^A-Za-z0-9]/.test(next) || (/[A-Z]/.test(next) && name !== name.toUpperCase()));
+  return (stripPrefix ? name.slice(prefix![0].length) : name).toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
 /**

@@ -69,4 +69,28 @@ assert.equal(write!.args.path, 'src/a.ts');
 assert.equal(write!.body, undefined);
 assert.equal(write!.result, undefined);
 
+const withCommand: ChatMessage[] = [
+  msg('c1', 'user', 'run the tests'),
+  msg('c2', 'assistant', 'one'),
+  msg('c3', 'user', 'go'),
+  msg('c4', 'assistant', 'ran it', {
+    toolCalls: [
+      {
+        id: 'tc',
+        name: 'run_command',
+        args: { command: 'npm test' },
+        body: 'npm test',
+        status: 'done',
+        result: 'Exit code: 0\nall passed'
+      }
+    ]
+  }),
+  msg('c5', 'user', 'again'),
+  msg('c6', 'assistant', 'done')
+];
+const foldedCommand = compactMessages(withCommand);
+const commandText = foldedCommand.map(m => `${m.raw}\n${m.display}`).join('\n');
+assert.match(commandText, /Ran command \(exit 0\) — npm test/);
+assert.doesNotMatch(commandText, /— Exit code: 0/);
+
 console.log('compactChat.selftest ok');

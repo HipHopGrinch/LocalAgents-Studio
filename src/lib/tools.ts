@@ -9,7 +9,7 @@ import {
 } from './planOptions';
 import { DELIVERY_POLICY, TOOLCHAIN_PLAYBOOK } from './deliveryIntent';
 import { formatClusterInventory, type ModelFitTier } from './clusterInventory';
-import { findCatalogModel, installedModelSizeB } from './recommender';
+import { findCatalogModel, installedModelSizeB, parseParams } from './recommender';
 import {
   isFullGpuFit,
   isModelLoaded,
@@ -133,17 +133,17 @@ export function parseResponse(
     return '';
   });
 
-  const blockRe = new RegExp(`<(${TOOL_ALT})\\b([^>]*?)(?<!/)>([\\s\\S]*?)</\\1\\s*>`, 'g');
-  const selfRe = new RegExp(`<(${TOOL_ALT})\\b([^>]*?)/>`, 'g');
+  const blockRe = new RegExp(`<(${TOOL_ALT})\\b([^>]*?)(?<!/)>([\\s\\S]*?)</\\1\\s*>`, 'gi');
+  const selfRe = new RegExp(`<(${TOOL_ALT})\\b([^>]*?)/>`, 'gi');
 
   // Replace each call with a numbered placeholder, then read placeholders back in document order
   const found: { name: ToolName; attrs: string; body?: string }[] = [];
-  work = work.replace(blockRe, (_m, name, attrs, body) => {
-    found.push({ name, attrs, body });
+  work = work.replace(blockRe, (_m, name: string, attrs, body) => {
+    found.push({ name: name.toLowerCase() as ToolName, attrs, body });
     return `\u0000${found.length - 1}\u0000`;
   });
-  work = work.replace(selfRe, (_m, name, attrs) => {
-    found.push({ name, attrs });
+  work = work.replace(selfRe, (_m, name: string, attrs) => {
+    found.push({ name: name.toLowerCase() as ToolName, attrs });
     return `\u0000${found.length - 1}\u0000`;
   });
 
@@ -215,10 +215,10 @@ export function parseResponse(
   // Hide a tool tag that is still being streamed
   let pendingTool: ParsedResponse['pendingTool'];
   if (streaming) {
-    const openRe = new RegExp(`<(${TOOL_ALT})\\b([^>]*)>?[\\s\\S]*$`);
+    const openRe = new RegExp(`<(${TOOL_ALT})\\b([^>]*)>?[\\s\\S]*$`, 'i');
     const open = display.match(openRe);
     if (open) {
-      pendingTool = { name: open[1], path: parseAttrs(open[2] || '').path };
+      pendingTool = { name: open[1].toLowerCase(), path: parseAttrs(open[2] || '').path };
       display = display.slice(0, open.index);
     }
   }
@@ -1147,9 +1147,11 @@ export function truncatedWriteToolCall(
 
 /** The reply opened a file tag and never closed it (typical of a capped frontier stream). */
 export function hasUnclosedWrite(text: string): { name: 'write_file' | 'edit_file'; path: string } | null {
-  const opens = [...text.matchAll(/<(write_file|edit_file)\b([^>]*)>/gi)];
-  const closes = (text.match(/<\/(?:write_file|edit_file)>/gi) || []).length;
-  if (opens.length <= closes) return null;
+  const outside = text
+    .replace(/<(write_file|edit_file)\b[^>]*?(?<!\/)>[\s\S]*?<\/\1\s*>/gi, ' ')
+    .replace(/<(?:write_file|edit_file)\b[^>]*?\/>/gi, ' ');
+  const opens = [...outside.matchAll(/<(write_file|edit_file)\b([^>]*?)(?<!\/)>/gi)];
+  if (opens.length === 0) return null;
   const last = opens[opens.length - 1];
   const attrs = last[2] || '';
   const path =
@@ -1443,17 +1445,19 @@ export function selectBestEndpointForTask(
   if (agentHandle === 'reviewer') return pickForPersona('reviewer', ['reviewer', 'module_coder', 'architect'], 'medium');
   if (agentHandle === 'docs') return pickForPersona('docs', ['scout', 'module_coder'], 'light');
 
-  if (/\b(test|unit test|readme|document|docstring|comment)\b/.test(lower)) {
-    const hit = pickForPersona('docs', ['scout', 'module_coder'], 'light');
-    if (hit) return hit;
-  }
-  if (/\b(review|lint|typo|css|style|color|format|quick)\b/.test(lower)) {
-    const hit = pickForPersona('coder', ['scout', 'module_coder'], 'light') || pickForPersona('reviewer', ['reviewer', 'module_coder'], 'medium');
-    if (hit) return hit;
-  }
-
   if (agentHandle === 'coder') {
     return pickForPersona('coder', ['architect', 'heavy_coder', 'module_coder'], 'heavy');
+  }
+
+  if (!agentHandle) {
+    if (/\b(test|unit test|readme|document|docstring|comment)\b/.test(lower)) {
+      const hit = pickForPersona('docs', ['scout', 'module_coder'], 'light');
+      if (hit) return hit;
+    }
+    if (/\b(review|lint|typo|css|style|color|format|quick)\b/.test(lower)) {
+      const hit = pickForPersona('coder', ['scout', 'module_coder'], 'light') || pickForPersona('reviewer', ['reviewer', 'module_coder'], 'medium');
+      if (hit) return hit;
+    }
   }
 
   return (
@@ -1490,7 +1494,10 @@ export function routingActiveParamsB(node: EndpointNode | undefined, model: stri
     typeof row.paramsB === 'number' &&
     row.activeB + 0.05 < row.paramsB
   ) {
-    return row.activeB;
+    const detailParams = parseParams(node?.models?.find(m => m.name === model)?.details?.parameter_size);
+    const sizeMatches =
+      typeof detailParams !== 'number' || Math.abs(detailParams - row.paramsB) / row.paramsB <= 0.1;
+    if (sizeMatches) return row.activeB;
   }
   return endpointModelSizeB(node, model);
 }

@@ -47,8 +47,7 @@ function isScoutLike(node: EndpointNode): boolean {
 function primaryIsThisImage(node: EndpointNode, model: string): boolean {
   const active = node.activeModel;
   if (!active) return false;
-  if (normTag(active) === normTag(model)) return true;
-  return modelLooksLikeImageGen(active);
+  return normTag(active) === normTag(model);
 }
 
 /**

@@ -10,8 +10,18 @@ export function createQueueFromReviewPlan(
   plan: ReviewFixPlan,
   messageId?: string
 ): ExecutionQueue {
+  const used = new Set<string>();
+  const uniqueId = (raw: string | undefined, i: number): string => {
+    let id = (raw || '').trim() || String(i + 1);
+    if (used.has(id)) {
+      id = String(i + 1);
+      for (let n = 2; used.has(id); n += 1) id = `${i + 1}-${n}`;
+    }
+    used.add(id);
+    return id;
+  };
   const tasks: ExecutionTask[] = plan.tasks.map((t, i) => ({
-    id: t.id || String(i + 1),
+    id: uniqueId(t.id, i),
     title: t.title,
     description: t.description,
     ...(t.file ? { file: t.file } : {}),

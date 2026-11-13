@@ -17,6 +17,8 @@ function looksSmallModel(modelName?: string): boolean {
   if (!modelName) return false;
   const m = modelName.toLowerCase();
   if (/gemini|gpt-4|claude|grok/i.test(m)) return false;
+  const moe = m.match(/(?:^|[^a-z0-9])(\d+)\s*x\s*(\d+(?:\.\d+)?)\s*b\b/);
+  if (moe) return parseFloat(moe[1]) * parseFloat(moe[2]) <= 14;
   const match = m.match(/(\d+(?:\.\d+)?)\s*b\b/);
   if (match) {
     const b = parseFloat(match[1]);
@@ -34,7 +36,7 @@ export function modelFitTier(model: string, maxCtx: number): ModelFitTier {
   }
   const small = looksSmallModel(model);
   const ctx = Math.floor(maxCtx || 0);
-  if (small || (ctx > 0 && ctx <= TIGHT_CTX)) return 'tight';
+  if (ctx <= TIGHT_CTX && (small || ctx > 0)) return 'tight';
   if (!small && ctx >= WIDE_CTX) return 'wide';
   return 'standard';
 }

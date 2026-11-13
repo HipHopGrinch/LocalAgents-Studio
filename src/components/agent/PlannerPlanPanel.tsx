@@ -94,6 +94,11 @@ export const PlannerPlanPanel: React.FC<PlannerPlanPanelProps> = ({
           )}
         </div>
       )}
+      {!isPaused && !isBusy && plan.status === 'active' && !plan.resumePhase && (
+        <div className="mt-1.5 rounded border border-[#2a2a36] bg-[#14141a] px-2 py-1.5 text-[11px] text-zinc-400 leading-snug shrink-0">
+          Idle. Ready for the next step.
+        </div>
+      )}
       <ol className="mt-2 space-y-1.5 list-none overflow-y-auto min-h-0 flex-1 pr-0.5">
         {plan.steps.map(step => {
           const active = plan.activeStepId === step.id;
@@ -176,7 +181,9 @@ export const PlannerPlanPanel: React.FC<PlannerPlanPanelProps> = ({
                     <button
                       type="button"
                       onClick={() => onSkipStep(step.id)}
-                      className="px-1.5 py-0.5 rounded border border-[#3a3a48] text-[11px] text-zinc-200 hover:bg-[#252530]"
+                      disabled={isBusy && status === 'in_progress'}
+                      title={isBusy && status === 'in_progress' ? 'Pause this step before skipping it' : undefined}
+                      className="px-1.5 py-0.5 rounded border border-[#3a3a48] text-[11px] text-zinc-200 hover:bg-[#252530] disabled:opacity-50 disabled:cursor-default disabled:hover:bg-transparent"
                     >
                       Skip
                     </button>

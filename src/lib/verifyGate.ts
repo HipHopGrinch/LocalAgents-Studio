@@ -19,10 +19,20 @@ export interface VerifyResult {
   fingerprint: string;
 }
 
+/** A command timed out, or reported any `Exit code:` that is not exactly 0 (including `null` and `-1`). */
+export function commandOutputFailed(output: string): boolean {
+  const t = output || '';
+  if (/timed out/i.test(t)) return true;
+  for (const m of t.matchAll(/Exit code:\s*([^\s,;)]+)/gi)) {
+    if (m[1] !== '0') return true;
+  }
+  return false;
+}
+
 /** Detect failed verify from tool/terminal text (exit codes + compiler idioms). */
 export function verifyOutputFailed(output: string): boolean {
   const t = output || '';
-  if (/Exit code:\s*(?!0\b)\d+/i.test(t)) return true;
+  if (commandOutputFailed(t)) return true;
   if (/error TS\d+/i.test(t)) return true;
   if (/could not compile/i.test(t)) return true;
   if (/^error(\[|:)/im.test(t)) return true;

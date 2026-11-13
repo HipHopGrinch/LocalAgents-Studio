@@ -441,20 +441,28 @@ export const EndpointsPanel: React.FC<EndpointsPanelProps> = ({
                   <div className="space-y-1.5">
                     <span className="text-[11px] text-zinc-400">Apply GPU Preset:</span>
                     <div className="flex flex-wrap gap-1.5">
-                      {GPU_PRESETS.slice(0, 10).map(p => (
-                        <button
-                          key={p.name}
-                          type="button"
-                          onClick={() => onApplyGpuPreset(p.name)}
-                          className={`px-2 py-0.5 rounded text-[11px] border transition ${
-                            currentNode.hardware.gpu.includes(p.name)
-                              ? 'bg-indigo-600 text-white border-indigo-500'
-                              : 'bg-[#1a1a20] border-[#2b2b36] text-zinc-400 hover:text-zinc-200'
-                          }`}
-                        >
-                          {p.name}
-                        </button>
-                      ))}
+                      {GPU_PRESETS.slice(0, 10).map((p, _i, shown) => {
+                        const gpuLower = currentNode.hardware.gpu.toLowerCase();
+                        const bestLen = shown.reduce(
+                          (len, q) => (gpuLower.includes(q.name.toLowerCase()) ? Math.max(len, q.name.length) : len),
+                          0
+                        );
+                        const active = bestLen > 0 && p.name.length === bestLen && gpuLower.includes(p.name.toLowerCase());
+                        return (
+                          <button
+                            key={p.name}
+                            type="button"
+                            onClick={() => onApplyGpuPreset(p.name)}
+                            className={`px-2 py-0.5 rounded text-[11px] border transition ${
+                              active
+                                ? 'bg-indigo-600 text-white border-indigo-500'
+                                : 'bg-[#1a1a20] border-[#2b2b36] text-zinc-400 hover:text-zinc-200'
+                            }`}
+                          >
+                            {p.name}
+                          </button>
+                        );
+                      })}
                     </div>
                   </div>
 

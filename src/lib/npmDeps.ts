@@ -30,6 +30,10 @@ export function sanitizeDepMap(
     const name = rewriteDepName(rawName);
     let ver = String(rawVer || '').trim() || '*';
     if (name !== rawName) {
+      if (Object.prototype.hasOwnProperty.call(out, name)) {
+        changed.push(`${rawName}@${rawVer} → ${name}@${out[name]}`);
+        continue;
+      }
       if (ALIAS_DEFAULT_VERSION[name] && (ver === '*' || !ver)) {
         ver = ALIAS_DEFAULT_VERSION[name];
       }

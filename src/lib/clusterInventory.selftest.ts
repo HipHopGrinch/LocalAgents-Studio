@@ -16,6 +16,11 @@ assert.equal(modelFitTier('qwen2.5:7b', 16384), 'tight');
 assert.equal(modelFitTier('qwen2.5:32b', 32768), 'standard');
 assert.equal(modelFitTier('qwen2.5:32b', 65536), 'wide');
 assert.equal(modelFitTier('llama3.1:70b', 131072), 'wide');
+assert.notEqual(modelFitTier('mixtral:8x7b', 32768), 'tight');
+assert.equal(modelFitTier('mixtral:8x22b', 65536), 'wide');
+assert.equal(modelFitTier('mixtral:8x7b', 16384), 'tight');
+assert.equal(modelFitTier('qwen2.5:7b', 32768), 'standard');
+assert.equal(modelFitTier('qwen2.5:7b', 0), 'tight');
 // Frontier: never tight even if Studio once fell back to 16k
 assert.equal(modelFitTier('gpt-4o', 16384), 'standard');
 assert.equal(modelFitTier('gemini-2.5-flash-lite', 16384), 'standard');

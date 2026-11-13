@@ -17,7 +17,8 @@ import {
   pinnedNumCtx,
   recordPromptSample,
   resetTokenCalibration,
-  serializeTokenCalibration
+  serializeTokenCalibration,
+  snapNumCtxToOption
 } from './contextSize';
 import { estimateImageTokens } from './images';
 
@@ -121,5 +122,9 @@ assert.equal(capActiveFileForTier('short file', 'tight', 1), 'short file');
 const standardCapped = capActiveFileForTier('x'.repeat(9000), 'standard');
 assert.ok(standardCapped.length < 9000);
 assert.ok(standardCapped.length <= 8100);
+
+// B-26: 12K and 24K are real presets
+assert.equal(snapNumCtxToOption(12288, 32768), 12288);
+assert.equal(snapNumCtxToOption(24576, 32768), 24576);
 
 console.log('contextSize.selftest ok');

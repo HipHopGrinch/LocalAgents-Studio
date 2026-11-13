@@ -7,6 +7,7 @@ import {
   imageLimitsForTier,
   MIN_IMAGE_TOKENS,
   resolveImageMaxEdge,
+  modelSupportsVision,
   selectImagesForTier
 } from './images';
 
@@ -35,5 +36,11 @@ const shot = estimateImageTokens({ width: 1920, height: 1080 });
 assert.ok(icon >= MIN_IMAGE_TOKENS);
 assert.ok(shot > icon);
 assert.ok(shot > 1500);
+
+assert.equal(modelSupportsVision('gemma3:1b'), false);
+assert.equal(modelSupportsVision('revision:7b'), false);
+assert.equal(modelSupportsVision('gemma3:12b'), true);
+assert.equal(modelSupportsVision('llava'), true);
+assert.equal(modelSupportsVision('llama3.2-vision:11b'), true);
 
 console.log('images.selftest ok');

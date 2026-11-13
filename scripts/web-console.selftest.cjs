@@ -20,6 +20,7 @@ assert.match(webRpcDenial('update:setBusy', [false]), /not available/i);
 assert.match(webRpcDenial('update:install', []), /not available/i);
 assert.match(webRpcDenial('terminal:getBuffer', []), /disabled/i);
 assert.match(webRpcDenial('terminal:kill', []), /disabled/i);
+assert.match(webRpcDenial('terminal:clearBuffer', []), /disabled/i);
 assert.match(webRpcDenial('ollama:pull', []), /disabled/i);
 assert.match(webRpcDenial('ollama:delete', []), /disabled/i);
 assert.match(webRpcDenial('web:search', ['http://127.0.0.1:8080', 'q']), /disabled/i);
@@ -48,4 +49,51 @@ const local = resolveListenPlan({ lanEnabled: false, tlsLoaded: false, tlsError:
 assert.equal(local.bindHost, '127.0.0.1');
 assert.equal(local.error, '');
 
-console.log('web-console-selftest ok');
+// Parallel wrong-password logins must hit the lockout (B-19).
+(async () => {
+  const http = require('http');
+  const net = require('net');
+  const webConsole = require('../electron/webConsole.cjs');
+  const port = await new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.once('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const p = probe.address().port;
+      probe.close(() => resolve(p));
+    });
+  });
+  webConsole.init({ getDistDir: () => __dirname, getViteDevUrl: () => null });
+  const rec = await webConsole.createPasswordRecord('correct-horse-battery');
+  const status = await webConsole.applyConfig({
+    enabled: true,
+    port,
+    passwordHash: rec.passwordHash,
+    passwordSalt: rec.passwordSalt
+  });
+  assert.ok(!status.error, status.error);
+  const login = password =>
+    new Promise((resolve, reject) => {
+      const body = JSON.stringify({ password });
+      const req = http.request(
+        { host: '127.0.0.1', port, path: '/api/login', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
+        res => {
+          res.resume();
+          res.on('end', () => resolve(res.statusCode));
+        }
+      );
+      req.once('error', reject);
+      req.end(body);
+    });
+  try {
+    const codes = await Promise.all(Array.from({ length: 12 }, () => login('wrong-password')));
+    assert.equal(codes.filter(c => c === 401).length, 5, `expected 5 failures before the lock, got ${codes}`);
+    assert.equal(codes.filter(c => c === 429).length, 7, `expected 7 locked, got ${codes}`);
+    assert.equal(await login('correct-horse-battery'), 429);
+  } finally {
+    webConsole.stopServer();
+  }
+  console.log('web-console-selftest ok');
+})().catch(err => {
+  console.error(err);
+  process.exit(1);
+});

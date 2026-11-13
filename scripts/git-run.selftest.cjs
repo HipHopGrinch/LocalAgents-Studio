@@ -87,6 +87,46 @@ try {
   assert.ok(!built.argv.slice(0, statusAt).includes('-c') || built.argv.filter(part => part === '-c').length > 0);
   assert.deepEqual(built.argv.slice(statusAt), ['status', '-sb']);
 
+  assert.ok(built.argv.includes('commit.gpgsign=false'));
+  assert.ok(built.argv.includes('tag.gpgsign=false'));
+  assert.ok(built.argv.includes('gpg.program='));
+
+  const filterRoot = path.join(root, 'filter-ws');
+  fs.mkdirSync(path.join(filterRoot, '.git', 'info'), { recursive: true });
+  fs.writeFileSync(path.join(filterRoot, '.git', 'config'), '[filter "lfsx"]\n\tclean = evil-clean\n[filter "other y"]\n\tsmudge = evil\n');
+  fs.writeFileSync(path.join(filterRoot, '.gitattributes'), '# filter=ignored\n*.txt filter=attrfilter\n');
+  fs.writeFileSync(path.join(filterRoot, '.git', 'info', 'attributes'), '*.bin filter=infofilter -text\n');
+  const filtered = buildGitArgv(['add', '-A'], { workspaceRoot: filterRoot, hooksDir });
+  assert.equal(filtered.error, undefined);
+  for (const name of ['lfsx', 'other y', 'attrfilter', 'infofilter']) {
+    for (const key of ['clean', 'smudge', 'process']) {
+      assert.ok(filtered.argv.includes(`filter.${name}.${key}=`), `${name}.${key}`);
+    }
+    assert.ok(filtered.argv.includes(`filter.${name}.required=false`), `${name}.required`);
+  }
+  assert.ok(!filtered.argv.includes('filter.ignored.clean='));
+
+  // F-10: filters defined in an include.path / includeIf file must be neutralized too.
+  const incRoot = path.join(root, 'include-ws');
+  fs.mkdirSync(path.join(incRoot, '.git'), { recursive: true });
+  fs.mkdirSync(path.join(incRoot, '.git', 'sub'), { recursive: true });
+  fs.writeFileSync(
+    path.join(incRoot, '.git', 'config'),
+    '[core]\n\tbare = false\n[include]\n\tpath = extra.config\n[includeIf "gitdir:/nowhere/"]\n\tpath = "sub/cond.config" ; trailing comment\n'
+  );
+  fs.writeFileSync(path.join(incRoot, '.git', 'extra.config'), '[filter "evil"]\n\tclean = evil-clean\n[include]\n\tpath = sub/nested.config\n');
+  fs.writeFileSync(path.join(incRoot, '.git', 'sub', 'cond.config'), '[filter "condevil"]\n\tsmudge = evil\n');
+  fs.writeFileSync(path.join(incRoot, '.git', 'sub', 'nested.config'), '[filter "nestedevil"]\n\tprocess = evil\n[include]\n\tpath = ../extra.config\n');
+  const incNames = require('../electron/gitGuard.cjs').discoverFilterNames(incRoot).sort();
+  assert.deepEqual(incNames, ['condevil', 'evil', 'nestedevil'], 'include files are followed (and cycles stop)');
+  const incBuilt = buildGitArgv(['add', '-A'], { workspaceRoot: incRoot, hooksDir });
+  assert.equal(incBuilt.error, undefined);
+  for (const name of incNames) {
+    for (const key of ['clean', 'smudge', 'process']) {
+      assert.ok(incBuilt.argv.includes(`filter.${name}.${key}=`), `included ${name}.${key}`);
+    }
+  }
+
   const diffArgv = buildGitArgv(['diff', '-c', 'HEAD'], { workspaceRoot: root, hooksDir });
   assert.equal(diffArgv.error, undefined);
   const diffAt = diffArgv.argv.indexOf('diff');
@@ -150,6 +190,14 @@ try {
   run(['config', 'core.fsmonitor', fsmon.replace(/\\/g, '/')]);
   run(['config', 'diff.external', extdiff.replace(/\\/g, '/')]);
   run(['config', 'alias.status', `!echo alias >> '${markerSh}'`]);
+  const gpgStub = path.join(root, 'gpg-stub.sh');
+  const cleanStub = path.join(root, 'clean-stub.sh');
+  writeSh(gpgStub, 'gpg');
+  fs.writeFileSync(cleanStub, `#!/bin/sh\necho clean >> '${markerSh}'\ncat\n`, 'utf8');
+  run(['config', 'commit.gpgsign', 'true']);
+  run(['config', 'gpg.program', gpgStub.replace(/\\/g, '/')]);
+  run(['config', 'filter.probe.clean', cleanStub.replace(/\\/g, '/')]);
+  fs.writeFileSync(path.join(repo, '.gitattributes'), '*.txt filter=probe\n');
   const hookDir = path.join(repo, '.git', 'hooks');
   fs.mkdirSync(hookDir, { recursive: true });
   writeSh(path.join(hookDir, 'pre-commit'), 'hook');
@@ -208,6 +256,36 @@ try {
   const branch = guarded(['branch', '--show-current']);
   assert.equal(branch.status, 0, branch.stderr);
   assert.ok(branch.stdout.trim().length > 0);
+
+  // F-10 real run: the filter is only reachable through an include file and an attributes
+  // file named in config (neither is scanned by name), so discovery alone must catch it.
+  const incRepo = path.join(root, 'include-repo');
+  fs.mkdirSync(incRepo);
+  const incGit = (args, cwd = incRepo) => spawnSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env } });
+  assert.equal(incGit(['init', '-q']).status, 0, 'git init (include repo)');
+  const incMarker = path.join(root, 'include-marker.txt');
+  const incMarkerSh = incMarker.replace(/\\/g, '/');
+  const incClean = path.join(root, 'include-clean.sh');
+  fs.writeFileSync(incClean, `#!/bin/sh\necho includeclean >> '${incMarkerSh}'\ncat\n`, 'utf8');
+  const incAttrs = path.join(root, 'include-attrs');
+  fs.writeFileSync(incAttrs, '*.txt filter=evil\n');
+  fs.writeFileSync(
+    path.join(incRepo, '.git', 'extra.config'),
+    `[filter "evil"]\n\tclean = ${incClean.replace(/\\/g, '/')}\n[core]\n\tattributesFile = ${incAttrs.replace(/\\/g, '/')}\n`
+  );
+  fs.appendFileSync(path.join(incRepo, '.git', 'config'), '[include]\n\tpath = extra.config\n');
+  fs.writeFileSync(path.join(incRepo, 'x.txt'), 'data\n');
+  // Control: unguarded git runs the included filter, so the probe is meaningful.
+  try { fs.unlinkSync(incMarker); } catch { /* none */ }
+  assert.equal(incGit(['add', 'x.txt']).status, 0, 'unguarded add');
+  assert.ok(fs.existsSync(incMarker), 'control: included clean filter runs without the guard');
+  assert.equal(incGit(['reset', '-q']).status, 0);
+  try { fs.unlinkSync(incMarker); } catch { /* none */ }
+  const incArgv = buildGitArgv(['add', 'x.txt'], { workspaceRoot: incRepo, hooksDir });
+  assert.equal(incArgv.error, undefined, incArgv.error);
+  const incRes = spawnSync('git', incArgv.argv, { cwd: incRepo, encoding: 'utf8', env: scrubGitEnv({ ...process.env }) });
+  assert.equal(incRes.status, 0, `guarded add failed\n${incRes.stderr}`);
+  assert.equal(fs.existsSync(incMarker), false, 'included clean filter ran through the guard');
 
   console.log('git-run-selftest ok');
 } finally {

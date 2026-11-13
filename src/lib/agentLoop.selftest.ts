@@ -17,7 +17,8 @@ import {
   rememberEditOutcome,
   resetEditRepeatGuard,
   shouldContinueFromTools,
-  stripThinkingForHistory
+  stripThinkingForHistory,
+  isDestructiveCommand
 } from './agentLoop';
 
 const file = ['alpha', 'beta', 'gamma line', 'delta'].join('\n');
@@ -144,3 +145,46 @@ void fulfillInOrder(['a', 'b', 'c'], [
   console.error(err);
   process.exit(1);
 });
+
+// B-42 / B-43 / B-44: destructive-command policy (shared with electron/sandbox.cjs)
+for (const cmd of [
+  'rm -Recurse -Force .\\src',
+  'del -Recurse -Force .\\src',
+  'Remove-Item -Recurse .\\src',
+  'rd /s /q src',
+  'rmdir -r src',
+  'erase -Recurse x',
+  'ri -r x',
+  'git.exe reset --hard',
+  'git -C . reset --hard',
+  'git -c core.x=y reset --hard HEAD~1',
+  'git checkout HEAD -- .',
+  'git checkout main -- .',
+  'Format-Volume -DriveLetter C -Force',
+  'Clear-Disk -Number 1',
+  'Initialize-Disk 1',
+  'Remove-Partition -DriveLetter D',
+  'Remove-Item -Recurse -Force .\\src',
+  'rm -rf src',
+  'git reset --hard',
+  'git push --force origin main',
+  'git clean -fd',
+  'git checkout -- .',
+  'format C:',
+  'diskpart'
+]) {
+  assert.equal(isDestructiveCommand(cmd), true, 'should block: ' + cmd);
+}
+for (const cmd of [
+  'Remove-Item .\\dist\\old.js',
+  'rm .\\tmp.txt',
+  'git status',
+  'git checkout -b feature',
+  'git checkout src/app.ts',
+  'npm run format',
+  'git reset src/app.ts',
+  'docker run --rm -it node',
+  'git rm -r --cached dist'
+]) {
+  assert.equal(isDestructiveCommand(cmd), false, 'should allow: ' + cmd);
+}

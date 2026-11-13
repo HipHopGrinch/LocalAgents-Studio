@@ -115,11 +115,13 @@ assert.equal(fresh.swarmEnabled, false);
 assert.equal(fresh.autoSelectEndpoint, false);
 assert.equal(fresh.autoApplyWrites, false);
 assert.equal(fresh.autoReview, false);
+assert.equal(fresh.fullAuto, false);
 assert.equal(fresh.cloudStrategistEnabled, false);
 assert.ok((fresh.chatWidth ?? 0) >= MIN_CHAT_WIDTH);
 const keptOff = mergeSettings({ swarmEnabled: false, autoReview: false });
 assert.equal(keptOff.swarmEnabled, false);
 assert.equal(keptOff.autoReview, false);
+assert.equal(keptOff.fullAuto, false);
 assert.equal(keptOff.autoApplyWrites, false);
 assert.equal(keptOff.autoSelectEndpoint, false);
 assert.equal(keptOff.cloudStrategistEnabled, false);
@@ -128,6 +130,7 @@ const keptOn = mergeSettings({
   autoSelectEndpoint: true,
   autoApplyWrites: true,
   autoReview: true,
+  fullAuto: true,
   cloudStrategistEnabled: true,
   chatWidth: 1100
 });
@@ -135,9 +138,22 @@ assert.equal(keptOn.swarmEnabled, true);
 assert.equal(keptOn.autoSelectEndpoint, true);
 assert.equal(keptOn.autoApplyWrites, true);
 assert.equal(keptOn.autoReview, true);
+assert.equal(keptOn.fullAuto, true);
 assert.equal(keptOn.cloudStrategistEnabled, true);
 assert.equal(keptOn.chatWidth, 1100);
 assert.equal(mergeSettings({ chatWidth: 400 }).chatWidth, MIN_CHAT_WIDTH);
+assert.equal(fresh.editorWidth, 640);
+assert.equal(fresh.editorHidden, false);
+assert.equal(fresh.agentControlWidth, 270);
+assert.equal(fresh.agentNodeWorkWidth, 280);
+assert.equal(mergeSettings({ editorWidth: 100 }).editorWidth, 300);
+assert.equal(mergeSettings({ editorWidth: 5000 }).editorWidth, 2400);
+assert.equal(mergeSettings({ editorHidden: true }).editorHidden, true);
+assert.equal(mergeSettings({ agentControlWidth: 10 }).agentControlWidth, 200);
+assert.equal(mergeSettings({ agentControlWidth: 900 }).agentControlWidth, 560);
+assert.equal(mergeSettings({ agentNodeWorkWidth: 1 }).agentNodeWorkWidth, 200);
+assert.equal(mergeSettings({ agentNodeWorkWidth: 900 }).agentNodeWorkWidth, 480);
+assert.equal(mergeSettings({ explorerWidth: 2000 }).explorerWidth, 800);
 
 function bench(model: string, nodeId: string, evalTokPerSec: number): BenchmarkResult {
   return {

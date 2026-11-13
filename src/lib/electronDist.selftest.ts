@@ -121,6 +121,21 @@ const runningLine = `> $env:CSC_IDENTITY_AUTO_DISCOVERY='false'; npm run "dist"`
 assert.equal(terminalLooksLikeRunningDist(`${runningLine}\nstill going`, true), true);
 assert.equal(terminalLooksLikeRunningDist(runningLine, false), false);
 assert.equal(terminalLooksLikeRunningDist('> npm test', true), false);
+assert.equal(
+  terminalLooksLikeRunningDist('> npm run "package"\n> node scripts/make-installer.js\nbuilding', true),
+  true
+);
+assert.equal(terminalLooksLikeRunningDist('> npm run dist:win\nbuilding', true), true);
+assert.equal(terminalLooksLikeRunningDist('> npm run package\nbuilding', false), false);
+assert.equal(terminalLooksLikeRunningDist('> npm run packager-docs\nbuilding', true), false);
+assert.equal(
+  terminalLooksLikeRunningDist('> npm run dist\ndone\n> npm run dev\n> app@1.0.0 dev\n> vite\nready', true),
+  false
+);
+assert.equal(
+  terminalLooksLikeRunningDist("> $env:CSC_IDENTITY_AUTO_DISCOVERY='false'; npm run dist\n> app@1.0.0 dist\n> electron-builder", true),
+  true
+);
 
 assert.equal(tryBeginElectronDist('C:\\Work\\App'), true);
 assert.equal(tryBeginElectronDist('C:/work/app'), false);

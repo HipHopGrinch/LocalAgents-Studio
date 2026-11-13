@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect } from 'react';
 import {
   AgentPersona,
   ApprovedPlan,
@@ -12,6 +12,8 @@ import {
   ExecutionQueue,
   PlannerPlan,
   AppSettings,
+  RoleRoutes,
+  ConductorRoleId,
   PlannerResumePhase,
   PlanOption,
   WorkspaceFile,
@@ -23,7 +25,6 @@ import {
   Cpu,
   Sparkles,
   Paperclip,
-  Zap,
   Cloud,
   Plus,
   History,
@@ -32,14 +33,27 @@ import {
   ImagePlus,
   X,
   Shrink,
-  SlidersHorizontal
+  SlidersHorizontal,
+  ScrollText
 } from 'lucide-react';
 import { SplitHandle } from './ui/SplitHandle';
 import { AutoConfigConfirm } from './hardware/AutoConfigConfirm';
 import { useStableCallback } from '../hooks/useStableCallback';
 import { useStickToBottom } from '../hooks/useStickToBottom';
 import { useNodeWorkCollapse } from '../hooks/useNodeWorkCollapse';
+import { usePaneDrag } from '../hooks/usePaneDrag';
 import { formatConversationTime } from '../lib/conversations';
+import {
+  CONTROL_DEFAULT,
+  CONTROL_MAX,
+  CONTROL_MIN,
+  NODE_WORK_DEFAULT,
+  NODE_WORK_MAX,
+  NODE_WORK_MIN,
+  NODE_WORK_RAIL,
+  TRANSCRIPT_MIN,
+  fitInnerColumns
+} from '../lib/paneLayout';
 import {
   parseResponse,
   buildSystemPrompt,
@@ -85,12 +99,17 @@ import {
   activityLabelOf,
   popActivity,
   pushActivity,
+  removeActivity,
+  topActivityHandle,
+  type ActivityHandle,
   type StudioActivity
 } from '../lib/studioActivity';
 import {
   deliveryToStack,
-  looksLikeRealIndexHtml,
-  scaffoldFilesForStack
+  manifestNeedsWebScaffold,
+  mergeEssentialWebPackageJson,
+  planWebScaffoldWrites,
+  shouldReplaceScaffoldIndexHtml
 } from '../lib/projectScaffold';
 import { verifyCommandForStack, type DeliveryStack } from '../lib/deliveryIntent';
 import {
@@ -117,6 +136,7 @@ import {
 import {
   annotateMissingDependencies,
   beginVerify,
+  commandOutputFailed,
   DEPENDENCY_RETRY_MESSAGE,
   errorFingerprint,
   filesFromErrors,
@@ -157,7 +177,27 @@ import {
   terminalResultFingerprint,
   toolContinuationLimit
 } from '../lib/agentLoop';
+import {
+  MISSING_REVIEW_VERDICT_NOTICE,
+  MISSING_REVIEW_VERDICT_WAIT_NOTICE,
+  boundReviewContinuation,
+  needsReviewVerdictTurn,
+  nonPlanReviewLacksMarkup,
+  reviewFollowUpBudget,
+  reviewPreloadCaps,
+  reviewVerdictNowInstruction
+} from '../lib/reviewTurn';
 import { streamChat } from '../lib/ollamaClient';
+import {
+  createRunLog,
+  runLogPath,
+  shapeToolForRunLog,
+  summarizeStats,
+  type RunLog,
+  type RunLogInput,
+  type RunLogSettings,
+  type RunLogStats
+} from '../lib/runLog';
 import { PlannerPlanPanel } from './agent/PlannerPlanPanel';
 import { ErrorCard, clipErrorCause } from './agent/ErrorCard';
 import { NodeWorkPanel } from './agent/NodeWorkPanel';
@@ -178,9 +218,22 @@ import {
 } from '../lib/thinking';
 import {
   capActiveFileForTier,
+  clampNumCtx,
+  formatCtxLabel,
+  modelContextSelect,
   pinnedNumCtx,
+  resolveModelMaxContext,
   type DynamicCtxRole
 } from '../lib/contextSize';
+import {
+  conductorRoleForPersona,
+  explicitPickStatus,
+  explicitRolePick,
+  normalizeRoleRoutes,
+  resolveRoleRoute,
+  roleRouteLabel,
+  sameRoleRoutes
+} from '../lib/roleRoutes';
 import {
   lastContextMeter,
   notePromptSample,
@@ -192,6 +245,7 @@ import {
 } from './agent/modelRequest';
 import {
   contextWasExhausted,
+  estimatePromptTokens,
   fitPromptToContext,
   shrinkUserPacket
 } from '../lib/contextMonitor';
@@ -210,9 +264,14 @@ import {
   type FreeTierUsage
 } from '../lib/freeTierAssist';
 import {
+  escalationMatchesRoute,
   isRepeatStop,
+  latestCoderRoute,
+  latestStepWritePaths,
+  priorStepWritePaths,
   nextStuckStage,
   resolveStuckStage,
+  shouldEscalateStuck,
   stripKeepFixingPrefix,
   stuckKey,
   type StuckStage
@@ -258,6 +317,22 @@ import {
   stripReviewPlanMarkup,
   stripStepVerdictMarkup
 } from '../lib/planOptions';
+import {
+  chooseFullAutoPlanOption,
+  fullAutoPickNotice,
+  messagesFromOrigin,
+  nayNotesFromReviewerProse,
+  nayNotesFromToolErrors,
+  newestReviewerMessage,
+  canReaskMissingVerdict,
+  pendingPlanChoice,
+  pickExplicitStepVerdict,
+  releaseCoderRedispatch,
+  rememberVerdictReask,
+  takeCoderRedispatch,
+  VERDICT_REASK_PROMPT,
+  type FullAutoStepGate
+} from '../lib/fullAuto';
 import {
   applyReviewDelta,
   createQueueFromReviewPlan,
@@ -334,15 +409,11 @@ import {
   tasksTooSimilar
 } from '../lib/continuationReview';
 import {
-  SPECIALTY_META,
   applyClusterAutoConfigPlan,
   buildClusterAutoConfigPlan,
   type ClusterAutoConfigPlan
 } from '../lib/clusterAdvisor';
 import { normalizeClusterNodes } from '../lib/tools';
-
-const MESSAGE_COLUMN_MIN = 320;
-const NODE_WORK_RAIL = 36;
 
 interface AgentChatProps {
   agents: AgentPersona[];
@@ -352,6 +423,7 @@ interface AgentChatProps {
   activeTab?: OpenTab;
   workspacePath: string;
   workspaceFiles?: WorkspaceFile[];
+  /** Ignored. The agent pane flexes; the code column uses editorWidth. */
   width?: number | string;
   /** Fill parent (mobile web console). */
   fill?: boolean;
@@ -361,6 +433,8 @@ interface AgentChatProps {
   /** Far-right Node Work column width */
   nodeWorkWidth?: number;
   onNodeWorkWidthChange?: (width: number) => void;
+  /** Shown conductor and node-work widths, including the collapsed rail. Not persisted. */
+  onChromeWidthsChange?: (control: number, node: number) => void;
   onSelectNodeModel?: (nodeId: string, model: string) => void;
   onApplyFileWrite: (filePath: string, content: string) => Promise<boolean>;
   onExecuteToolCommand: (
@@ -395,12 +469,22 @@ interface AgentChatProps {
   autoNodeEnabled?: boolean;
   autoApplyEnabled?: boolean;
   autoReviewEnabled?: boolean;
+  /** Accept verdicts, plan picks, and failed steps. Missing / omitted means off. */
+  fullAutoEnabled?: boolean;
   cloudStrategistEnabled?: boolean;
+  /** Saved per-role computer and model. A missing role means Auto. */
+  roleRoutesEnabled?: RoleRoutes;
   onConductorPrefsChange?: (
     patch: Partial<
       Pick<
         AppSettings,
-        'swarmEnabled' | 'autoSelectEndpoint' | 'autoApplyWrites' | 'autoReview' | 'cloudStrategistEnabled'
+        | 'swarmEnabled'
+        | 'autoSelectEndpoint'
+        | 'autoApplyWrites'
+        | 'autoReview'
+        | 'fullAuto'
+        | 'cloudStrategistEnabled'
+        | 'roleRoutes'
       >
     >
   ) => void;
@@ -423,6 +507,12 @@ interface AgentChatProps {
     conductor: LiveConductorState;
     chatMirror: { conversationId: string; messages: ChatMessage[] } | null;
   }) => void;
+  /** Desktop palette calls this to copy the in-memory run log. */
+  onRunLogApi?: (api: { copy: () => void } | null) => void;
+}
+
+function runLogFailureCount(stats: RunLogStats): number {
+  return stats.failureTotal;
 }
 
 export const AgentChat: React.FC<AgentChatProps> = ({
@@ -433,13 +523,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   activeTab,
   workspacePath,
   workspaceFiles,
-  width = 640,
   fill = false,
   controlWidth = 270,
   onControlWidthChange,
   nodeWorkWidth = 280,
   onNodeWorkWidthChange,
-  onSelectNodeModel,
+  onChromeWidthsChange,
   onApplyFileWrite,
   onExecuteToolCommand,
   onOpenFileInEditor,
@@ -460,7 +549,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   autoNodeEnabled = true,
   autoApplyEnabled = true,
   autoReviewEnabled = true,
+  fullAutoEnabled = false,
   cloudStrategistEnabled = true,
+  roleRoutesEnabled,
   onConductorPrefsChange,
   onUpdateNodes,
   maxAgentSteps = 12,
@@ -469,7 +560,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   onOpenFolder,
   peerConductor = null,
   peerChatMirror = null,
-  onLiveConductorPublish
+  onLiveConductorPublish,
+  onRunLogApi
 }) => {
   const toolStepLimit = toolContinuationLimit(maxAgentSteps);
   const currentAgent = agents.find(a => a.id === selectedAgentId) || agents[0];
@@ -481,25 +573,86 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const isReviewerSelected =
     currentAgent.handle === 'reviewer' || currentAgent.id === 'reviewer';
 
-  // Routing states
-  const [targetNodeId, setTargetNodeId] = useState<string>(currentAgent.endpointId);
-  const [targetModel, setTargetModel] = useState<string>(currentAgent.model);
+  // Per-role computer + model. Empty role means Auto. Never overwritten by a finished turn.
+  const [roleRoutes, setRoleRoutes] = useState<RoleRoutes>(() => normalizeRoleRoutes(roleRoutesEnabled));
+  const roleRoutesRef = useRef(roleRoutes);
+  roleRoutesRef.current = roleRoutes;
+  /** Web picker edit: the next conductor publish asks the desktop to save it. */
+  const roleRoutesEditRef = useRef(false);
+  /** Bumps once per model turn so a fallback is logged again on the next turn. */
+  const routeEpochRef = useRef(0);
+  const fallbackLogKeyRef = useRef('');
   const [autoSelectEndpoint, setAutoSelectEndpoint] = useState<boolean>(autoNodeEnabled);
   const nodesRef = useRef(nodes);
   nodesRef.current = nodes;
-  const targetNodeIdRef = useRef(targetNodeId);
-  targetNodeIdRef.current = targetNodeId;
-  const targetModelRef = useRef(targetModel);
-  targetModelRef.current = targetModel;
   const autoSelectRef = useRef(autoSelectEndpoint);
   autoSelectRef.current = autoSelectEndpoint;
   const [includeActiveFile, setIncludeActiveFile] = useState(true);
   const [isPipelineMode, setIsPipelineMode] = useState(swarmEnabled);
+  const pipelineModeRef = useRef(isPipelineMode);
+  pipelineModeRef.current = isPipelineMode;
   const [autoApplyWrites, setAutoApplyWrites] = useState<boolean>(autoApplyEnabled);
   const autoApplyWritesRef = useRef(autoApplyEnabled);
   /** After each coding step: Reviewer runs; ON = auto Send to Planner→Coder / continue, OFF = wait for user */
   const [autoReview, setAutoReview] = useState(autoReviewEnabled);
   const autoReviewRef = useRef(autoReviewEnabled);
+  /** Saved "accept everything" toggle. Effective apply/review OR this in; the saved boxes stay put. */
+  const [fullAuto, setFullAuto] = useState(fullAutoEnabled);
+  const fullAutoRef = useRef(fullAutoEnabled);
+  const fullAutoGateRef = useRef<FullAutoStepGate | null>(null);
+  const runLogsRef = useRef(new Map<string, RunLog>());
+  const runLogRef = useRef(createRunLog());
+  const logRunImplRef = useRef<(event: RunLogInput) => void>(() => {});
+  const logRun = (event: RunLogInput) => {
+    logRunImplRef.current(event);
+  };
+  const activeRunLogIdRef = useRef<number | null>(null);
+  const runLogTimerRef = useRef<number | null>(null);
+  const runLogFailRef = useRef(0);
+  const runLogGenerationRef = useRef(0);
+  const runLogWriteChainRef = useRef<Promise<void>>(Promise.resolve());
+  const runLogSaveErrorRef = useRef<string | null>(null);
+  const runLogMountedRef = useRef(true);
+  const copyRunLogRef = useRef<() => void>(() => {});
+  const lastNoticeRef = useRef<string | null>(null);
+  /** End-of-run tsc heals. Reset when a new owned Conductor run starts. */
+  const finalVerifyHealsRef = useRef(0);
+  const appVersionRef = useRef('');
+  /** Folder that is open right now. */
+  const workspacePathRef = useRef(workspacePath);
+  workspacePathRef.current = workspacePath;
+  /** Folder the in-memory log belongs to. A folder change starts a new buffer. */
+  const logWorkspaceRef = useRef(workspacePath);
+  const runLogMenuRef = useRef<HTMLDivElement>(null);
+  const autoApplyOn = () => fullAutoRef.current || autoApplyWritesRef.current;
+  const autoReviewOn = () => fullAutoRef.current || autoReviewRef.current;
+  const verdictReaskAllowed = (stepId: string) =>
+    canReaskMissingVerdict(fullAutoGateRef.current, stepId);
+  const markVerdictReasked = (stepId: string) => {
+    fullAutoGateRef.current = rememberVerdictReask(fullAutoGateRef.current, stepId);
+    logRun({
+      kind: 'user',
+      action: 'auto',
+      stepId,
+      text: `Re-ask verdict for step #${stepId}`
+    });
+  };
+  /** Spends the step's one coder retry before the nested dispatch awaits. False when it is already spent. */
+  const takeCoderRedispatchOnce = (stepId: string): boolean => {
+    const taken = takeCoderRedispatch(fullAutoGateRef.current, stepId);
+    if (!taken.allowed) return false;
+    fullAutoGateRef.current = taken.gate;
+    logRun({
+      kind: 'user',
+      action: 'auto',
+      stepId,
+      text: `Coder re-dispatch for step #${stepId}`
+    });
+    return true;
+  };
+  const giveBackCoderRedispatch = (stepId: string) => {
+    fullAutoGateRef.current = releaseCoderRedispatch(fullAutoGateRef.current, stepId);
+  };
   const [cloudStrategist, setCloudStrategist] = useState<boolean>(cloudStrategistEnabled);
   const cloudStrategistRef = useRef(cloudStrategistEnabled);
   cloudStrategistRef.current = cloudStrategist;
@@ -528,8 +681,17 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   }, [isStreaming, onBusyChange]);
   const conductorRevisionRef = useRef(0);
   const applyingPeerConductorRef = useRef(false);
+  /** A publish skipped during the peer-apply window. It runs again when the window ends. */
+  const pendingPublishRef = useRef(false);
+  const peerConductorRef = useRef(peerConductor);
+  peerConductorRef.current = peerConductor;
+  const [publishRetry, setPublishRetry] = useState(0);
   const peerConductorRevAppliedRef = useRef(0);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [runLogOpen, setRunLogOpen] = useState(false);
+  const [runLogCopyState, setRunLogCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
+  const [runLogSaveError, setRunLogSaveError] = useState<string | null>(null);
+  const [runLogFailures, setRunLogFailures] = useState(0);
   const [assistError, setAssistError] = useState<{ cause: string; node?: string; model?: string } | null>(null);
   const [autoConfigPlan, setAutoConfigPlan] = useState<ClusterAutoConfigPlan | null>(null);
   const [autoConfigMode, setAutoConfigMode] = useState<'confirm' | 'applied'>('confirm');
@@ -550,9 +712,15 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     activityStackRef.current = next;
     setActivityStack(next);
     setExecutingPlanNotice(activityLabelOf(next));
+    return topActivityHandle(next) as ActivityHandle;
   };
-  const endActivity = () => {
-    const next = popActivity(activityStackRef.current);
+  /** With a handle, removes exactly that frame (no-op if a Stop already cleared it). No argument pops the top. */
+  const endActivity = (handle?: ActivityHandle) => {
+    const next =
+      handle === undefined
+        ? popActivity(activityStackRef.current)
+        : removeActivity(activityStackRef.current, handle);
+    if (next === activityStackRef.current && handle !== undefined) return;
     activityStackRef.current = next;
     setActivityStack(next);
     setExecutingPlanNotice(activityLabelOf(next));
@@ -566,7 +734,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const toolResultTierRef = useRef<ModelFitTier>('standard');
   const finalReviewPlanIdRef = useRef<string | null>(null);
   /** Set after finishVerifiedPlan is created — heal completion runs before that const. */
-  const finishVerifiedPlanRef = useRef<(plan: PlannerPlan) => Promise<void>>(async () => {});
+  const finishVerifiedPlanRef = useRef<
+    (plan: PlannerPlan, parent?: ConductorRun | null) => Promise<void>
+  >(async () => {});
   const rulesCapFor = (tier: 'tight' | 'standard' | 'wide') =>
     tier === 'wide' ? 16000 : tier === 'tight' ? 4000 : 6000;
   const [pinnedFiles, setPinnedFiles] = useState<string[]>([]);
@@ -603,6 +773,15 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     stop: stopConductorSession
   } = conductor;
   const messagesRef = useRef<ChatMessage[]>([]);
+  /** Plan option clicked while a planner turn still holds the conductor run. */
+  const stashedPlanChoiceRef = useRef<{
+    messageId: string;
+    option: PlanOption;
+    confirmation: string;
+  } | null>(null);
+  const abandonedPlanPicksRef = useRef<Set<string>>(new Set());
+  /** Write/edit tools from the coder turn just dispatched, keyed by step id. */
+  const coderTurnWritesRef = useRef<{ stepId: string; tools: ToolCall[] } | null>(null);
   const continuationDepthRef = useRef(0);
   const commandFixAttemptsRef = useRef(0);
   const writeFixAttemptsRef = useRef(0);
@@ -619,8 +798,13 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   /** Pre-coder file bytes keyed by step id. Capped at 2 MB across the map. */
   const stepSnapshotsRef = useRef<Map<string, { path: string; content: string }[]>>(new Map());
   const STEP_SNAPSHOT_CAP = 2 * 1024 * 1024;
-  /** True after Stop (or idle) while a durable plan is still active — show Continue. */
-  const [planPaused, setPlanPaused] = useState(false);
+  /** True after Stop, restart, or disk hydrate while a durable plan is still active. */
+  const [planPaused, setPlanPausedState] = useState(() => isPlanActive(conversation?.plannerPlan));
+  const planPausedRef = useRef(isPlanActive(conversation?.plannerPlan));
+  const setPlanPaused = (next: boolean) => {
+    planPausedRef.current = next;
+    setPlanPausedState(next);
+  };
   /** Live Node Work column (Swarm + single-node workers). */
   const [nodeWorkSteps, setNodeWorkSteps] = useState<PipelineStep[]>([]);
   const nodeWorkStepsRef = useRef<PipelineStep[]>([]);
@@ -639,18 +823,434 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     const next = failUnfinishedNodeWork(prev, content);
     if (next !== prev) syncNodeWork(next);
   };
+  type RunLogFlushTarget = { root: string; conversationId: string; generation: number };
+  const runLogHeader = (root: string): Record<string, string> => {
+    const header: Record<string, string> = {};
+    if (appVersionRef.current) header.version = appVersionRef.current;
+    if (root) header.workspace = root;
+    return header;
+  };
+  const noteRunLogSaveError = (message: string | null) => {
+    runLogSaveErrorRef.current = message;
+    if (runLogMountedRef.current) setRunLogSaveError(message);
+  };
+  const logForFlush = (target: RunLogFlushTarget) => {
+    if (target.conversationId === conversationIdRef.current) return runLogRef.current;
+    return runLogsRef.current.get(target.conversationId) ?? null;
+  };
+  const flushRunLog = (target: RunLogFlushTarget): Promise<void> => {
+    if (isWebConsoleClient()) return Promise.resolve();
+    if (!target.root || !target.conversationId || !window.electronAPI?.writeFile) return Promise.resolve();
+    if (target.root !== workspacePathRef.current) return Promise.resolve();
+    if (target.generation !== runLogGenerationRef.current) return Promise.resolve();
+    const source = logForFlush(target);
+    if (!source) return Promise.resolve();
+    const markdown = source.formatMarkdown({ header: runLogHeader(target.root) });
+    const path = runLogPath(target.root, target.conversationId);
+    const generation = target.generation;
+    const root = target.root;
+    const job = runLogWriteChainRef.current.then(async () => {
+      if (isWebConsoleClient()) return;
+      if (root !== workspacePathRef.current || generation !== runLogGenerationRef.current) return;
+      try {
+        const res = await window.electronAPI.writeFile(path, markdown);
+        if (root !== workspacePathRef.current || generation !== runLogGenerationRef.current) return;
+        if (!runLogMountedRef.current) return;
+        noteRunLogSaveError(res?.error || null);
+      } catch (err) {
+        if (root !== workspacePathRef.current || generation !== runLogGenerationRef.current) return;
+        if (!runLogMountedRef.current) return;
+        noteRunLogSaveError(err instanceof Error ? err.message : String(err));
+      }
+    });
+    runLogWriteChainRef.current = job.then(
+      () => undefined,
+      () => undefined
+    );
+    return job;
+  };
+  const captureFlushTarget = (conversationId?: string | null): RunLogFlushTarget | null => {
+    const root = logWorkspaceRef.current;
+    const id = conversationId ?? conversationIdRef.current;
+    if (!root || !id) return null;
+    return { root, conversationId: id, generation: runLogGenerationRef.current };
+  };
+  const flushRunLogNow = (conversationId?: string | null): Promise<void> => {
+    if (runLogTimerRef.current != null) {
+      window.clearTimeout(runLogTimerRef.current);
+      runLogTimerRef.current = null;
+    }
+    const target = captureFlushTarget(conversationId);
+    if (!target) return Promise.resolve();
+    return flushRunLog(target);
+  };
+  const scheduleRunLog = () => {
+    if (isWebConsoleClient()) return;
+    const target = captureFlushTarget();
+    if (!target) return;
+    if (runLogTimerRef.current != null) window.clearTimeout(runLogTimerRef.current);
+    runLogTimerRef.current = window.setTimeout(() => {
+      runLogTimerRef.current = null;
+      void flushRunLog(target);
+    }, 1500);
+  };
+  const syncRunLogBadge = () => {
+    const count = runLogFailureCount(runLogRef.current.stats());
+    if (count === runLogFailRef.current) return;
+    runLogFailRef.current = count;
+    setRunLogFailures(count);
+  };
+  const publishRunLog = (immediate = false) => {
+    syncRunLogBadge();
+    if (immediate) flushRunLogNow();
+    else scheduleRunLog();
+  };
+  logRunImplRef.current = (event: RunLogInput) => {
+    runLogRef.current.add(event);
+    publishRunLog(false);
+  };
+  const runLogSettings = (): RunLogSettings => {
+    const live = nodesRef.current;
+    const routes = roleRoutesRef.current;
+    return {
+      fullAuto: fullAutoRef.current,
+      autoApply: autoApplyWritesRef.current,
+      autoReview: autoReviewRef.current,
+      swarm: pipelineModeRef.current,
+      autoSelect: autoSelectRef.current,
+      cloudStrategist: cloudStrategistRef.current,
+      maxAgentSteps,
+      planner: roleRouteLabel(routes, 'planner', live),
+      coder: roleRouteLabel(routes, 'coder', live),
+      reviewer: roleRouteLabel(routes, 'reviewer', live)
+    };
+  };
+  const endLoggedRun = (token: number, reason: string) => {
+    if (activeRunLogIdRef.current !== token) return;
+    activeRunLogIdRef.current = null;
+    runLogRef.current.endRun(token, reason);
+    publishRunLog(true);
+  };
+  const hostLog = (level: string, message: string) => {
+    window.electronAPI?.writeLog?.(level, message);
+    if (level === 'error' || level === 'warn') logRun({ kind: 'error', text: message });
+  };
+  const activeStepId = () => {
+    const step = getActiveStep(plannerPlanRef.current);
+    return step ? String(step.id) : undefined;
+  };
+  const estimateTurnTokens = (parts: Array<string | undefined>, model?: string) => {
+    const kept = parts.filter((part): part is string => typeof part === 'string' && part.length > 0);
+    if (!kept.length) return undefined;
+    return estimatePromptTokens(kept, model);
+  };
+  const logToolEvent = (tool: ToolCall) => {
+    const stepId = activeStepId();
+    const shaped = shapeToolForRunLog({
+      name: tool.name,
+      status: tool.status,
+      result: tool.result
+    });
+    logRun({
+      kind: 'tool',
+      name: tool.name,
+      path: tool.args?.path,
+      status: tool.status,
+      ...(shaped.exitCode != null ? { exitCode: shaped.exitCode } : {}),
+      ...(shaped.result ? { result: shaped.result } : {}),
+      ...(stepId ? { stepId } : {})
+    });
+  };
+  /**
+   * Run-scoped log writers for code that logs after an await. They capture the run-log buffer when
+   * the run starts and drop late run-log writes once a chat switch swapped it (same rule as
+   * takeChat). A Stop alone keeps the buffer, so a stopped run still logs into its own chat.
+   * hostLog still reaches the app log either way.
+   */
+  const scopeRunLog = () => {
+    const startLog = runLogRef.current;
+    const same = () => runLogRef.current === startLog;
+    return {
+      logRun: (event: RunLogInput) => {
+        if (same()) logRun(event);
+      },
+      hostLog: (level: string, message: string) => {
+        window.electronAPI?.writeLog?.(level, message);
+        if ((level === 'error' || level === 'warn') && same()) logRun({ kind: 'error', text: message });
+      },
+      logToolEvent: (tool: ToolCall) => {
+        if (same()) logToolEvent(tool);
+      }
+    };
+  };
+  const logRoute = (
+    action: 'retry' | 'failover' | 'skip' | 'stream-retry' | 'pin' | 'fallback',
+    detail: {
+      text?: string;
+      stepId?: string;
+      nodeId?: string;
+      nodeName?: string;
+      model?: string;
+    } = {}
+  ) => {
+    const stepId = detail.stepId ?? activeStepId();
+    logRun({
+      kind: 'route',
+      action,
+      ...(detail.text ? { text: detail.text } : {}),
+      ...(stepId ? { stepId } : {}),
+      ...(detail.nodeId ? { nodeId: detail.nodeId } : {}),
+      ...(detail.nodeName ? { nodeName: detail.nodeName } : {}),
+      ...(detail.model ? { model: detail.model } : {})
+    });
+  };
+  const logContext = (
+    action: 'fit' | 'resubmit' | 'compact',
+    text: string,
+    detail?: { numCtx?: number; promptBudget?: number; estPromptTokens?: number; stepId?: string }
+  ) => {
+    const stepId = detail?.stepId ?? activeStepId();
+    logRun({
+      kind: 'context',
+      action,
+      text,
+      ...(detail?.numCtx != null ? { numCtx: detail.numCtx } : {}),
+      ...(detail?.promptBudget != null ? { promptBudget: detail.promptBudget } : {}),
+      ...(detail?.estPromptTokens != null ? { estPromptTokens: detail.estPromptTokens } : {}),
+      ...(stepId ? { stepId } : {})
+    });
+  };
+  type TurnLogMeta = {
+    phase?: string;
+    role: string;
+    nodeId?: string;
+    nodeName?: string;
+    model: string;
+    numCtx?: number;
+    promptBudget?: number;
+    estPromptTokens?: number;
+  };
+  const takeChat = async (
+    meta: TurnLogMeta,
+    open: () => ReturnType<typeof streamChat>,
+    live: () => boolean
+  ) => {
+    const started = Date.now();
+    const startLog = runLogRef.current;
+    const startRunId = activeRunLogIdRef.current;
+    const logTurn = (event: RunLogInput) => {
+      if (runLogRef.current !== startLog) return;
+      logRun(startRunId != null ? { runId: startRunId, ...event } : event);
+    };
+    try {
+      const taken = await awaitConductorChat(open, {
+        registerAbort,
+        live,
+        onStreamRetry: err => {
+          if (runLogRef.current !== startLog) return;
+          logRoute('stream-retry', {
+            text: err instanceof Error ? err.message : 'stream retry',
+            nodeId: meta.nodeId,
+            nodeName: meta.nodeName,
+            model: meta.model
+          });
+        }
+      });
+      const wallMs = Date.now() - started;
+      if (taken.aborted) {
+        logTurn({ kind: 'turn', ...meta, wallMs, aborted: true });
+      } else {
+        logTurn({ kind: 'turn', ...meta, wallMs, ...summarizeStats(taken.result.stats) });
+      }
+      return taken;
+    } catch (err) {
+      logTurn({
+        kind: 'turn',
+        ...meta,
+        wallMs: Date.now() - started,
+        error: err instanceof Error ? err.message : String(err)
+      });
+      throw err;
+    }
+  };
+  const adoptRunLog = (nextId: string | null) => {
+    const prevId = conversationIdRef.current;
+    if (prevId) runLogsRef.current.set(prevId, runLogRef.current);
+    flushRunLogNow(prevId);
+    const nextLog = (nextId && runLogsRef.current.get(nextId)) || createRunLog();
+    if (nextId) runLogsRef.current.set(nextId, nextLog);
+    runLogRef.current = nextLog;
+    activeRunLogIdRef.current = null;
+    lastNoticeRef.current = null;
+    const count = runLogFailureCount(nextLog.stats());
+    runLogFailRef.current = count;
+    setRunLogFailures(count);
+  };
+  useEffect(() => {
+    let cancel = false;
+    void window.electronAPI?.getAppVersion?.()
+      .then(version => {
+        if (!cancel && version) appVersionRef.current = String(version);
+      })
+      .catch(() => {});
+    return () => {
+      cancel = true;
+    };
+  }, []);
+  useEffect(() => {
+    runLogMountedRef.current = true;
+    return () => {
+      runLogMountedRef.current = false;
+      if (runLogTimerRef.current != null) {
+        window.clearTimeout(runLogTimerRef.current);
+        runLogTimerRef.current = null;
+      }
+      if (isWebConsoleClient()) return;
+      const id = conversationIdRef.current;
+      const root = logWorkspaceRef.current;
+      if (!id || !root || root !== workspacePathRef.current || !window.electronAPI?.writeFile) return;
+      void window.electronAPI.writeFile(
+        runLogPath(root, id),
+        runLogRef.current.formatMarkdown({
+          header: {
+            ...(appVersionRef.current ? { version: appVersionRef.current } : {}),
+            ...(root ? { workspace: root } : {})
+          }
+        })
+      );
+    };
+  }, []);
+  useEffect(() => {
+    if (workspacePath === logWorkspaceRef.current) return;
+    if (runLogTimerRef.current != null) {
+      window.clearTimeout(runLogTimerRef.current);
+      runLogTimerRef.current = null;
+    }
+    runLogGenerationRef.current += 1;
+    runLogsRef.current = new Map();
+    const fresh = createRunLog();
+    runLogRef.current = fresh;
+    const id = conversationIdRef.current;
+    if (id) runLogsRef.current.set(id, fresh);
+    logWorkspaceRef.current = workspacePath;
+    activeRunLogIdRef.current = null;
+    lastNoticeRef.current = null;
+    runLogFailRef.current = 0;
+    setRunLogFailures(0);
+    runLogSaveErrorRef.current = null;
+    setRunLogSaveError(null);
+  }, [workspacePath]);
+  useEffect(() => {
+    const text = executingPlanNotice;
+    if (applyingPeerConductorRef.current) {
+      if (text) lastNoticeRef.current = text;
+      return;
+    }
+    if (!text) {
+      lastNoticeRef.current = null;
+      return;
+    }
+    if (text === lastNoticeRef.current) return;
+    // A notice set as the run ends flushes after leaveConductorRun. Do not file it unscoped.
+    if (activeRunLogIdRef.current == null) return;
+    lastNoticeRef.current = text;
+    const step = getActiveStep(plannerPlanRef.current);
+    logRunImplRef.current({
+      kind: 'notice',
+      text,
+      ...(step ? { stepId: String(step.id) } : {})
+    });
+  }, [executingPlanNotice]);
+  useEffect(() => {
+    if (!runLogOpen) return;
+    const onDown = (event: MouseEvent) => {
+      const node = runLogMenuRef.current;
+      if (node && event.target instanceof Node && !node.contains(event.target)) setRunLogOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setRunLogOpen(false);
+    };
+    window.addEventListener('mousedown', onDown);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('mousedown', onDown);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [runLogOpen]);
+  const copyRunLog = () => {
+    const root = logWorkspaceRef.current;
+    const text = runLogRef.current.formatMarkdown({ header: runLogHeader(root) });
+    const write = navigator.clipboard?.writeText?.bind(navigator.clipboard);
+    if (!write) {
+      setRunLogCopyState('failed');
+      window.setTimeout(() => setRunLogCopyState('idle'), 1600);
+      return;
+    }
+    void write(text).then(
+      () => {
+        setRunLogCopyState('copied');
+        window.setTimeout(() => setRunLogCopyState('idle'), 1600);
+      },
+      () => {
+        setRunLogCopyState('failed');
+        window.setTimeout(() => setRunLogCopyState('idle'), 1600);
+      }
+    );
+  };
+  copyRunLogRef.current = copyRunLog;
+  useEffect(() => {
+    if (!onRunLogApi) return;
+    onRunLogApi({ copy: () => copyRunLogRef.current() });
+    return () => onRunLogApi(null);
+  }, [onRunLogApi]);
+  const openRunLogFile = async () => {
+    const target = captureFlushTarget();
+    if (!target) return;
+    await flushRunLog(target);
+    if (runLogSaveErrorRef.current) return;
+    if (target.root !== workspacePathRef.current || target.generation !== runLogGenerationRef.current) return;
+    await window.electronAPI?.revealInExplorer?.(runLogPath(target.root, target.conversationId));
+  };
+  const clearRunLog = () => {
+    const token = activeRunLogIdRef.current;
+    const conversationId = conversationIdRef.current;
+    runLogRef.current.clear();
+    lastNoticeRef.current = null;
+    if (token != null && conversationId) {
+      activeRunLogIdRef.current = token;
+      runLogRef.current.startRun({
+        runId: token,
+        conversationId,
+        label: 'run',
+        settings: runLogSettings()
+      });
+    } else {
+      activeRunLogIdRef.current = null;
+    }
+    const count = runLogFailureCount(runLogRef.current.stats());
+    runLogFailRef.current = count;
+    setRunLogFailures(count);
+    void flushRunLogNow();
+  };
+
   /** Stop and chat switches: nothing is running any more, so no card or activity may still say it is. */
   const stopConductor = () => {
+    const token = activeRunLogIdRef.current;
     stopConductorSession();
     failUnfinishedWork('Stopped');
     activityStackRef.current = [];
     setActivityStack([]);
+    if (token != null) {
+      logRun({ kind: 'user', action: 'stop' });
+      endLoggedRun(token, 'stopped');
+    }
   };
   /** An owned run that ends with a card still pending or running never reported back. */
   const leaveConductorRun = (owned: boolean, token: RunToken) => {
     const releasing = owned && runIsCurrent(token);
     leaveConductorSession(owned, token);
     if (releasing && !heldRef.current) failUnfinishedWork('Stopped before finishing');
+    if (releasing) endLoggedRun(token, 'finished');
   };
 
   const syncReworkCountsFromPlan = (plan: PlannerPlan | null | undefined) => {
@@ -667,7 +1267,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
    */
   const bindRun = (
     parent: ConductorRun | undefined | null,
-    clearStop: boolean
+    clearStop: boolean,
+    label?: string
   ): { run: ConductorRun; owned: boolean } | null => {
     const entered = enterConductorRun(conversationIdRef.current, {
       clearStop,
@@ -675,12 +1276,42 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     });
     if (!entered) return null;
     if (entered.owned) {
+      finalVerifyHealsRef.current = 0;
       toolDepsRef.current = {
         ...toolDepsRef.current,
         editProgress: editProgressRef.current
       };
+      const conversationId = entered.run.conversationId || conversationIdRef.current;
+      if (conversationId) {
+        activeRunLogIdRef.current = entered.run.token;
+        runLogRef.current.startRun({
+          runId: entered.run.token,
+          conversationId,
+          label: label || 'run',
+          settings: runLogSettings()
+        });
+        publishRunLog(false);
+      }
     }
     return entered;
+  };
+
+  /**
+   * A dead run may pause the panel only when it is still the run on screen,
+   * or when nothing else holds the lock. A newer Send must not be paused by the old one.
+   */
+  const runOwnsUi = (run: ConductorRun | null | undefined) =>
+    !!run && (runIsCurrent(run.token) || !heldRef.current);
+
+  /** User click after Stop. clearStop is true so the latch does not refuse the click. */
+  const runAsUser = async (label: string, work: (run: ConductorRun) => Promise<void>) => {
+    const entered = bindRun(null, true, label);
+    if (!entered) return;
+    try {
+      await work(entered.run);
+    } finally {
+      leaveConductorRun(entered.owned, entered.run.token);
+    }
   };
 
   const savedFileFingerprints = (next?: string | null) => ({
@@ -711,13 +1342,16 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           status: s.status
         }));
         const brain = projectBrainRef.current;
+        const stepIds = new Set(todo.map(t => t.id));
+        const kept = brain.todo.filter(t => !stepIds.has(t.id));
+        const merged = [...todo, ...kept];
         const same =
-          brain.todo.length === todo.length &&
-          brain.todo.every((t, i) => t.id === todo[i].id && t.status === todo[i].status);
+          brain.todo.length === merged.length &&
+          brain.todo.every((t, i) => t.id === merged[i].id && t.status === merged[i].status);
         if (!same) {
           commitProjectBrain({
             ...brain,
-            todo,
+            todo: merged,
             ...(plan.delivery ? { delivery: plan.delivery } : {}),
             ...(plan.verifyCommand ? { verifyCommand: plan.verifyCommand } : {})
           });
@@ -732,7 +1366,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       );
       publish(saved);
     } catch (err) {
-      window.electronAPI?.writeLog?.(
+      hostLog(
         'error',
         `planner plan write failed: ${String((err as Error)?.message || err)}`
       );
@@ -793,6 +1427,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     terminalFingerprintRef.current = undefined;
   };
 
+  /** Review turns share this counter with coder continues. Zero only the read budget. */
+  const resetReadOnlyContinues = (budget?: LoopBudget) => {
+    if (budget) budget.readOnlyContinues = 0;
+    else readOnlyContinuesRef.current = 0;
+  };
+
   const continueDecisionOpts = (
     budget?: LoopBudget,
     extra?: { maxReadOnlyContinues?: number }
@@ -819,21 +1459,56 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   };
 
   const skipPersistRef = useRef(false);
+  /** Last message array handed to the persist effect. Local messages that differ from it are not saved yet. */
+  const persistedMessagesRef = useRef<ChatMessage[] | null>(null);
+  /** The switch commit's React state is still the previous chat. Skip one ref copy. */
+  const skipMessagesSyncRef = useRef(false);
+
+  const releaseStashedPlanChoice = () => {
+    const stashed = stashedPlanChoiceRef.current;
+    stashedPlanChoiceRef.current = null;
+    coderTurnWritesRef.current = null;
+    if (!stashed) return;
+    abandonedPlanPicksRef.current.add(stashed.messageId);
+    setMessages(prev => {
+      const next = prev.map(m =>
+        m.id === stashed.messageId ? { ...m, selectedPlanOptionId: undefined } : m
+      );
+      messagesRef.current = next;
+      return next;
+    });
+  };
+
+  const withoutAbandonedPicks = (msgs: ChatMessage[]): ChatMessage[] => {
+    if (!abandonedPlanPicksRef.current.size) return msgs;
+    let changed = false;
+    const next = msgs.map(m => {
+      if (!abandonedPlanPicksRef.current.has(m.id) || !m.selectedPlanOptionId) return m;
+      changed = true;
+      return { ...m, selectedPlanOptionId: undefined };
+    });
+    return changed ? next : msgs;
+  };
 
   // Sync local message buffer when App switches conversations
   useEffect(() => {
     const nextId = conversation?.id ?? null;
     if (nextId !== conversationIdRef.current) {
       stopConductor();
+      adoptRunLog(nextId);
+      releaseStashedPlanChoice();
       setIsStreaming(false);
       resetAgentLoopBudget();
+      fullAutoGateRef.current = null;
       conversationIdRef.current = nextId;
       const savedMsgs = conversation?.messages || [];
-      const nextMsgs = reopenMessages(savedMsgs);
+      const nextMsgs = withoutAbandonedPicks(reopenMessages(savedMsgs));
       // Persist only when reopening corrected Swarm steps left running.
       skipPersistRef.current = nextMsgs === savedMsgs;
+      skipMessagesSyncRef.current = true;
       setMessages(nextMsgs);
       messagesRef.current = nextMsgs;
+      persistedMessagesRef.current = nextMsgs;
       approvedPlanRef.current = conversation?.approvedPlan ?? null;
       const savedQueue = conversation?.executionQueue ?? null;
       const activeQueueTask = getActiveTask(savedQueue);
@@ -865,7 +1540,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         void window.electronAPI.readFile(plannerPlanPath(root, cid)).then(res => {
           if (conversationIdRef.current !== cid) return;
           const fromDisk = res.content ? parsePlannerPlanJson(res.content) : null;
-          if (fromDisk && (!conversation?.plannerPlan || fromDisk.updatedAt >= (conversation.plannerPlan.updatedAt || 0))) {
+          const livePlan = plannerPlanRef.current;
+          if (
+            fromDisk &&
+            !heldRef.current &&
+            (!livePlan || fromDisk.updatedAt > (livePlan.updatedAt || 0))
+          ) {
             plannerPlanRef.current = fromDisk;
             setPlannerPlanView(fromDisk);
             const seeded: Record<string, number> = {};
@@ -874,6 +1554,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
             }
             stepReworkCountRef.current = seeded;
             onConversationPatch?.({ plannerPlan: fromDisk });
+            if (!heldRef.current && isPlanActive(fromDisk)) setPlanPaused(true);
           }
         });
       }
@@ -883,23 +1564,27 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   // Adopt peer / parent conversation messages when we are not the one streaming.
   useEffect(() => {
     if (!conversation || conversation.id !== conversationIdRef.current) return;
-    if (isStreaming) return;
-    const next = conversation.messages || [];
+    if (isStreaming || heldRef.current) return;
     const prev = messagesRef.current;
+    if (persistedMessagesRef.current && prev !== persistedMessagesRef.current) return;
+    const next = withoutAbandonedPicks(conversation.messages || []);
     const lastPrev = prev[prev.length - 1];
     const lastNext = next[next.length - 1];
+    const toolSig = (m: ChatMessage | undefined) =>
+      (m?.toolCalls || []).map(t => t.status).join(',');
     if (
       prev.length === next.length &&
       lastPrev?.id === lastNext?.id &&
       lastPrev?.raw === lastNext?.raw &&
-      lastPrev?.display === lastNext?.display
+      lastPrev?.display === lastNext?.display &&
+      toolSig(lastPrev) === toolSig(lastNext)
     ) {
       return;
     }
     skipPersistRef.current = true;
     setMessages(next);
     messagesRef.current = next;
-  }, [conversation?.messages, conversation?.id, isStreaming]);
+  }, [conversation?.messages, conversation?.id, isStreaming, heldRef]);
 
   // Live chat mirror from peer (faster than disk reload during Generating…).
   useEffect(() => {
@@ -936,9 +1621,18 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     setAutoApplyWrites(!!peerConductor.autoApplyWrites);
     autoReviewRef.current = !!peerConductor.autoReview;
     setAutoReview(!!peerConductor.autoReview);
+    fullAutoRef.current = !!peerConductor.fullAuto;
+    setFullAuto(!!peerConductor.fullAuto);
     setIncludeActiveFile(!!peerConductor.includeActiveFile);
-    if (peerConductor.targetNodeId) setTargetNodeId(peerConductor.targetNodeId);
-    if (peerConductor.targetModel) setTargetModel(peerConductor.targetModel);
+    // Desktop keeps its own picks. A web mirror is applied only for a deliberate edit,
+    // which App persists before this snapshot arrives without the flag.
+    if (peerConductor.roleRoutes && (isWebConsoleClient() || peerConductor.roleRoutesEdit)) {
+      const nextRoutes = normalizeRoleRoutes(peerConductor.roleRoutes);
+      if (!sameRoleRoutes(roleRoutesRef.current, nextRoutes)) {
+        roleRoutesRef.current = nextRoutes;
+        setRoleRoutes(nextRoutes);
+      }
+    }
     if (peerConductor.executingPlanNotice !== undefined) {
       setExecutingPlanNotice(peerConductor.executingPlanNotice || null);
     }
@@ -947,16 +1641,44 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     }
     window.setTimeout(() => {
       applyingPeerConductorRef.current = false;
+      if (pendingPublishRef.current) {
+        pendingPublishRef.current = false;
+        setPublishRetry(n => n + 1);
+      }
     }, 200);
   }, [peerConductor]);
 
   // Publish local conductor + chat buffer for peers.
   useEffect(() => {
     if (!onLiveConductorPublish) return;
-    if (applyingPeerConductorRef.current) return;
+    const skipForPeerApply = () => {
+      // Only a local edit that differs from the peer snapshot needs a re-publish. An echo would ping-pong.
+      const peerConductor = peerConductorRef.current;
+      pendingPublishRef.current =
+        !!peerConductor &&
+        !(
+          !!peerConductor.isPipelineMode === isPipelineMode &&
+          !!peerConductor.autoSelectEndpoint === autoSelectEndpoint &&
+          !!peerConductor.autoApplyWrites === autoApplyWrites &&
+          !!peerConductor.autoReview === autoReview &&
+          !!peerConductor.fullAuto === fullAuto &&
+          !!peerConductor.includeActiveFile === includeActiveFile &&
+          (!peerConductor.roleRoutes ||
+            sameRoleRoutes(roleRoutes, normalizeRoleRoutes(peerConductor.roleRoutes)))
+        );
+    };
+    if (applyingPeerConductorRef.current) {
+      skipForPeerApply();
+      return;
+    }
     const timer = window.setTimeout(() => {
-      if (applyingPeerConductorRef.current) return;
+      if (applyingPeerConductorRef.current) {
+        skipForPeerApply();
+        return;
+      }
       conductorRevisionRef.current += 1;
+      const publishRoleEdit = roleRoutesEditRef.current;
+      roleRoutesEditRef.current = false;
       const latestAssistant = [...messagesRef.current].reverse().find(m => m.role === 'assistant');
       onLiveConductorPublish({
         conductor: {
@@ -964,6 +1686,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           autoSelectEndpoint,
           autoApplyWrites,
           autoReview,
+          fullAuto,
           includeActiveFile,
           isStreaming,
           activityLabel: describeRunStatus({
@@ -972,8 +1695,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
             notice: executingPlanNotice,
             message: isStreaming ? latestAssistant : undefined
           }).text,
-          targetNodeId,
-          targetModel,
+          roleRoutes,
+          ...(publishRoleEdit ? { roleRoutesEdit: true } : {}),
           executingPlanNotice,
           ...(nodeWorkOwnedRef.current
             ? {
@@ -998,14 +1721,15 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     autoSelectEndpoint,
     autoApplyWrites,
     autoReview,
+    fullAuto,
     includeActiveFile,
     isStreaming,
-    targetNodeId,
-    targetModel,
+    roleRoutes,
     executingPlanNotice,
     activityStack,
     messages,
-    nodeWorkSteps
+    nodeWorkSteps,
+    publishRetry
   ]);
 
   useEffect(() => {
@@ -1024,8 +1748,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     if (conversation?.id === conversationIdRef.current && conversation?.plannerPlan) {
       plannerPlanRef.current = conversation.plannerPlan;
       setPlannerPlanView(conversation.plannerPlan);
+      if (!heldRef.current && isPlanActive(conversation.plannerPlan)) setPlanPaused(true);
     }
-  }, [conversation?.plannerPlan, conversation?.id]);
+  }, [conversation?.plannerPlan, conversation?.id, heldRef]);
 
   const progressRef = useRef<WorkLog>(emptyWorkLog());
   const progressRev = useRef(0);
@@ -1114,9 +1839,11 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   useEffect(() => {
     if (skipPersistRef.current) {
       skipPersistRef.current = false;
+      persistedMessagesRef.current = messages;
       return;
     }
     if (!conversation?.id || conversationIdRef.current !== conversation.id) return;
+    persistedMessagesRef.current = messages;
     onMessagesChange(messages);
   }, [messages]);
 
@@ -1126,20 +1853,24 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     : '(empty workspace or loading)';
 
   const executeTrackedCommand = async (command: string, opts?: { timeoutSec?: number }) => {
-    beginActivity('tool', 'Terminal', command.slice(0, 90));
+    const startedRun = runRef.current;
+    const startedWorkspace = workspacePathRef.current;
+    const frame = beginActivity('tool', 'Terminal', command.slice(0, 90));
     try {
       const out = await onExecuteToolCommand(command, opts);
-      commitProjectBrain({
-        ...projectBrainRef.current,
-        lastTerminal: {
-          command: command.slice(0, 240),
-          output: (out || '').slice(-1800),
-          at: Date.now()
-        }
-      });
+      if (workspacePathRef.current === startedWorkspace && (!startedRun || runLive(startedRun))) {
+        commitProjectBrain({
+          ...projectBrainRef.current,
+          lastTerminal: {
+            command: command.slice(0, 240),
+            output: (out || '').slice(-1800),
+            at: Date.now()
+          }
+        });
+      }
       return out;
     } finally {
-      endActivity();
+      endActivity(frame);
     }
   };
 
@@ -1153,7 +1884,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     getRepoMap: () => repoMapRef.current,
     mcpServersJson,
     editProgress: editProgressRef.current,
-    toolResultTier: toolResultTierRef.current
+    toolResultTier: toolResultTierRef.current,
+    onTool: logToolEvent
   };
   const toolDepsRef = useRef(toolDeps);
   toolDepsRef.current = toolDeps;
@@ -1256,104 +1988,218 @@ ${instruction}`,
     autoReviewRef.current = autoReviewEnabled;
     setAutoReview(autoReviewEnabled);
   }, [autoReviewEnabled]);
-
-  // Sync the pinned endpoint when the persona changes. Node polls must not snap
-  // the dropdown back onto a model the user just disabled.
   useEffect(() => {
-    const id = currentAgent.endpointId;
-    if (!id) return;
-    if (nodesRef.current.some(n => n.id === id)) setTargetNodeId(id);
-  }, [currentAgent.id, currentAgent.endpointId]);
-
-  // Selected node with fallback to online node if offline (undefined when cluster is empty)
-  const requestedNode = nodes.find(n => n.id === targetNodeId) || nodes[0];
-  const onlineLocalNodes = nodes.filter(
-    n => n.online && n.type !== 'openai' && getEnabledModelsForNode(n).length > 0
-  );
-  const selectedNode =
-    requestedNode &&
-    requestedNode.online &&
-    getEnabledModelsForNode(requestedNode).length > 0
-      ? requestedNode
-      : onlineLocalNodes[0] || requestedNode;
-
-  const isFrontier = selectedNode?.type === 'openai' || !!selectedNode?.apiKey;
-
-  // Enabled models on selected node (live catalog when online — never invent deleted models)
-  const availableModels = getEnabledModelsForNode(selectedNode);
-  const effectiveModels =
-    availableModels.length > 0
-      ? availableModels
-      : isFrontier && !selectedNode?.online
-        ? ['grok-2-1212', 'grok-beta', 'gpt-4o', 'claude-3-5-sonnet']
-        : [];
-
-  // Drop a disabled model or an offline node on the next render. A newly enabled
-  // larger model becomes the target when the previous one is no longer usable.
+    fullAutoRef.current = fullAutoEnabled;
+    setFullAuto(fullAutoEnabled);
+  }, [fullAutoEnabled]);
   useEffect(() => {
-    const live = nodes;
-    const current = live.find(n => n.id === targetNodeId);
-    const enabledHere = getEnabledModelsForNode(current);
-    const usable = !!current?.online && enabledHere.length > 0;
-    if (!usable) {
+    const next = normalizeRoleRoutes(roleRoutesEnabled);
+    setRoleRoutes(prev => (sameRoleRoutes(prev, next) ? prev : next));
+  }, [roleRoutesEnabled]);
+
+  const noteRoleFallback = (
+    role: ConductorRoleId,
+    reason: string,
+    used?: { node: EndpointNode; model: string }
+  ) => {
+    const label = role.charAt(0).toUpperCase() + role.slice(1);
+    const where = used ? ` ${used.node.name} / ${used.model}` : '';
+    const text = `${label} pick unavailable (${reason}). Using automatic routing${where ? `:${where}` : ''}.`;
+    const logKey = `${routeEpochRef.current}|${text}`;
+    if (fallbackLogKeyRef.current !== logKey) {
+      fallbackLogKeyRef.current = logKey;
+      logRoute('fallback', {
+        text,
+        nodeId: used?.node.id,
+        nodeName: used?.node.name,
+        model: used?.model
+      });
+    }
+    if (lastNoticeRef.current !== text) {
+      lastNoticeRef.current = text;
+      setExecutingPlanNotice(text);
+    }
+  };
+
+  /** Auto routing for a role left on Auto. No single dropdown remains. */
+  const automaticRoute = (userText: string, agent: AgentPersona) => {
+    const live = nodesRef.current;
+    const handle = (agent.handle || agent.id || '').toLowerCase();
+    const fitRole =
+      handle === 'planner' ? 'planner' : handle === 'reviewer' ? 'reviewer' : handle === 'docs' ? 'docs' : null;
+    if (fitRole === 'planner' && cloudStrategistRef.current) {
+      const arch = findLeadArchitect(live, { preferCloudStrategist: true });
+      if (arch) {
+        return {
+          routedNode: arch.node,
+          routedModel: arch.model,
+          routedIsFrontier: isFrontierNode(arch.node)
+        };
+      }
+    }
+    if (autoSelectRef.current && (fitRole === 'planner' || fitRole === 'reviewer')) {
+      const picked = pickCapableReviewTarget(live, fitRole);
+      if (picked) {
+        return {
+          routedNode: picked.node,
+          routedModel: picked.model,
+          routedIsFrontier: isFrontierNode(picked.node)
+        };
+      }
+    }
+    let routedNode = autoSelectRef.current
+      ? selectBestEndpointForTask(userText, agent.handle, live)
+      : undefined;
+    if (!routedNode || !routedNode.online || getEnabledModelsForNode(routedNode).length === 0) {
       const locals = live.filter(
         n => n.online && !isFrontierNode(n) && getEnabledModelsForNode(n).length > 0
       );
-      const next =
-        rankModelsForWeight(locals, 'heavy', { role: 'planner' }) ||
-        rankModelsForWeight(
-          live.filter(n => n.online && getEnabledModelsForNode(n).length > 0),
-          'heavy',
-          { role: 'planner' }
-        );
-      if (next && (next.node.id !== targetNodeId || next.model !== targetModel)) {
-        setTargetNodeId(next.node.id);
-        setTargetModel(next.model);
-      }
-      return;
+      routedNode =
+        rankModelsForWeight(locals, fitRole === 'docs' ? 'medium' : 'heavy', {
+          role: fitRole || 'coder'
+        })?.node || live.find(n => n.online && getEnabledModelsForNode(n).length > 0);
     }
-    if (!enabledHere.includes(targetModel)) {
-      const nextModel = pickBestModelForComplexity(current, 'heavy') || enabledHere[0];
-      if (nextModel && nextModel !== targetModel) setTargetModel(nextModel);
+    if (!routedNode) return null;
+    const enabled = getEnabledModelsForNode(routedNode);
+    if (!enabled.length) return null;
+    const weight = fitRole === 'docs' ? 'medium' : 'heavy';
+    const routedModel = pickBestModelForComplexity(routedNode, weight) || enabled[0];
+    if (!routedModel || !enabled.includes(routedModel)) return null;
+    return {
+      routedNode,
+      routedModel,
+      routedIsFrontier: isFrontierNode(routedNode)
+    };
+  };
+
+  const roleTarget = (
+    role: ConductorRoleId,
+    auto: () => { node: EndpointNode; model: string } | undefined
+  ): { node: EndpointNode; model: string } | undefined => {
+    if (!explicitRolePick(roleRoutesRef.current, role)) return auto();
+    const resolved = resolveRoleRoute(nodesRef.current, roleRoutesRef.current, role, auto);
+    if (!resolved) return undefined;
+    if (resolved.fallbackReason) noteRoleFallback(role, resolved.fallbackReason, resolved);
+    return { node: resolved.node, model: resolved.model };
+  };
+
+  const resolveRoute = (userText: string, agent: AgentPersona) => {
+    const chosen = roleTarget(conductorRoleForPersona(agent), () => {
+      const auto = automaticRoute(userText, agent);
+      return auto ? { node: auto.routedNode, model: auto.routedModel } : undefined;
+    });
+    if (!chosen) return null;
+    return {
+      routedNode: chosen.node,
+      routedModel: chosen.model,
+      routedIsFrontier: isFrontierNode(chosen.node)
+    };
+  };
+
+  const leadArchitectNow = () => {
+    routeEpochRef.current += 1;
+    const live = nodesRef.current;
+    const fromAuto = () => {
+      const route = automaticRoute('', plannerAgent);
+      if (!route) return null;
+      const frontier = isFrontierNode(route.routedNode);
+      return {
+        node: route.routedNode,
+        model: route.routedModel,
+        tokPerSec: 0,
+        usedCloudStrategist: frontier,
+        usedFrontierBackup: frontier && !cloudStrategistRef.current
+      };
+    };
+    if (!explicitRolePick(roleRoutesRef.current, 'planner')) return fromAuto();
+    let autoHit: ReturnType<typeof fromAuto> = null;
+    const resolved = resolveRoleRoute(live, roleRoutesRef.current, 'planner', () => {
+      autoHit = fromAuto();
+      return autoHit ? { node: autoHit.node, model: autoHit.model } : undefined;
+    });
+    if (!resolved) return null;
+    if (resolved.source === 'auto') {
+      noteRoleFallback('planner', resolved.fallbackReason || 'Pick unavailable', resolved);
+      return autoHit;
     }
-  }, [nodes, targetNodeId, targetModel]);
+    const frontier = isFrontierNode(resolved.node);
+    return {
+      node: resolved.node,
+      model: resolved.model,
+      tokPerSec: 0,
+      usedCloudStrategist: frontier,
+      usedFrontierBackup: false
+    };
+  };
 
-  useEffect(() => {
-    messagesRef.current = messages;
-  }, [messages]);
+  const commitRoleRoutes = (next: RoleRoutes) => {
+    const normalized = normalizeRoleRoutes(next);
+    roleRoutesRef.current = normalized;
+    setRoleRoutes(normalized);
+    if (!applyingPeerConductorRef.current) {
+      if (isWebConsoleClient()) roleRoutesEditRef.current = true;
+      onConductorPrefsChange?.({ roleRoutes: normalized });
+    }
+  };
 
-  // Persona defaults (qwen2.5-coder:7b, etc.) are only a hint. The label and the
-  // request use a model that is actually enabled on the selected node.
-  const activeTargetModel = effectiveModels.includes(targetModel)
-    ? targetModel
-    : (selectedNode
-        ? pickBestModelForComplexity(selectedNode, 'heavy') || effectiveModels[0]
-        : effectiveModels[0]) || '';
+  const writeModelNumCtx = (nodeId: string, model: string, raw: number) => {
+    if (!onUpdateNodes || isStreaming) return;
+    const node = nodesRef.current.find(item => item.id === nodeId);
+    if (!node || !model) return;
+    const info = node.models?.find(item => item.name === model);
+    const numCtx = clampNumCtx(raw, resolveModelMaxContext(model, info));
+    onUpdateNodes(
+      nodesRef.current.map(item => {
+        if (item.id !== nodeId) return item;
+        return {
+          ...item,
+          modelPrefs: {
+            ...(item.modelPrefs || {}),
+            [model]: { ...(item.modelPrefs?.[model] || {}), numCtx }
+          }
+        };
+      })
+    );
+  };
+
+  const personaForRole = (role: ConductorRoleId) =>
+    role === 'planner' ? plannerAgent : role === 'reviewer' ? reviewerAgent : coderAgent;
+
+  /** Same route resolveRoute would use: a usable pick, otherwise that role's Auto path. */
+  const resolvedRole = (role: ConductorRoleId) => {
+    const persona = personaForRole(role);
+    const auto = () => {
+      const route = automaticRoute('', persona);
+      return route ? { node: route.routedNode, model: route.routedModel } : undefined;
+    };
+    const resolved = resolveRoleRoute(nodesRef.current, roleRoutes, role, auto);
+    if (resolved) return resolved;
+    const fallback = auto();
+    return fallback ? { node: fallback.node, model: fallback.model, source: 'auto' as const } : undefined;
+  };
+
+  const onlineLocalNodes = nodes.filter(
+    n => n.online && n.type !== 'openai' && getEnabledModelsForNode(n).length > 0
+  );
+  const chatResolved = resolvedRole(conductorRoleForPersona(currentAgent));
+  const selectedNode = chatResolved?.node;
+  const activeTargetModel = chatResolved?.model || '';
   const activeTargetMaxCtx = activeTargetModel
     ? pinnedNumCtx(selectedNode, activeTargetModel, currentAgent.numCtx)
     : 0;
-
-  const benchmarkStat = selectedNode?.benchmarks?.[activeTargetModel];
-  const selectedModelInfo =
-    selectedNode?.models?.find(m => m.name === activeTargetModel) ||
-    (selectedNode?.modelMeta?.[activeTargetModel]
-      ? {
-          name: activeTargetModel,
-          capabilities: selectedNode.modelMeta[activeTargetModel].capabilities,
-          thinking: selectedNode.modelMeta[activeTargetModel].thinking
-        }
-      : undefined);
-  const selectedSupportsThink = modelSupportsThinking(selectedModelInfo);
-  const selectedThinkPref = selectedNode?.modelPrefs?.[activeTargetModel]?.think;
-  const selectedThinkOn =
-    selectedThinkPref === true ||
-    selectedThinkPref === 'true' ||
-    (typeof selectedThinkPref === 'string' && selectedThinkPref !== 'false');
   const selectedSupportsVision = modelSupportsVision(
     activeTargetModel,
     selectedNode,
     selectedNode?.models?.find(m => m.name === activeTargetModel)
   );
+
+  useEffect(() => {
+    if (skipMessagesSyncRef.current) {
+      skipMessagesSyncRef.current = false;
+      return;
+    }
+    messagesRef.current = messages;
+  }, [messages]);
 
   const addImageFiles = async (files: FileList | File[] | null) => {
     if (!files) return;
@@ -1458,17 +2304,23 @@ ${instruction}`,
     countFreeTier: boolean,
     parent?: ConductorRun
   ): Promise<string | null> => {
-    const entered = bindRun(parent ?? null, false);
+    const entered = bindRun(parent ?? null, false, 'assist');
     if (!entered) return null;
     const run = entered.run;
+    const { hostLog } = scopeRunLog();
     try {
     if (!runLive(run)) return null;
 
     const runOnce = async (): Promise<{ content: string; aborted: boolean; stats?: { evalCount?: number; promptEvalCount?: number }; error?: string }> => {
       if (countFreeTier) {
         const waited = await waitForFreeTierRpm(target.node, {
-          signal: stopRequestedRef.current ? { aborted: true } : undefined,
+          signal: {
+            get aborted() {
+              return !runLive(run);
+            }
+          },
           onWait: ms => {
+            if (!runLive(run)) return;
             setExecutingPlanNotice(
               `Free-tier RPM limit — waiting ${Math.ceil(ms / 1000)}s before assist on ${target.node.name}…`
             );
@@ -1476,7 +2328,7 @@ ${instruction}`,
         });
         if (!runLive(run)) return { content: '', aborted: true };
         if (waited > 0) {
-          window.electronAPI?.writeLog?.(
+          hostLog(
             'info',
             `free-tier RPM wait ${waited}ms on ${target.node.name}`
           );
@@ -1486,6 +2338,7 @@ ${instruction}`,
         { role: 'system', content: FREE_TIER_ASSIST_SYSTEM },
         { role: 'user', content: `${purpose}\n\n${tailForAssist(payload)}` }
       ];
+      const assistCtx = pinnedNumCtx(target.node, target.model, currentAgent.numCtx);
       const body = {
         model: target.model,
         messages: assistMessages,
@@ -1493,13 +2346,25 @@ ${instruction}`,
         options: {
           temperature: 0.1,
           num_predict: ASSIST_MAX_PREDICT,
-          num_ctx: pinnedNumCtx(target.node, target.model, currentAgent.numCtx)
+          num_ctx: assistCtx
         }
       };
       try {
-        const taken = await awaitConductorChat(
+        const taken = await takeChat(
+          {
+            phase: 'assist',
+            role: 'assist',
+            nodeId: target.node.id,
+            nodeName: target.node.name,
+            model: target.model,
+            numCtx: assistCtx,
+            estPromptTokens: estimateTurnTokens(
+              [FREE_TIER_ASSIST_SYSTEM, `${purpose}\n\n${tailForAssist(payload)}`],
+              target.model
+            )
+          },
           () => streamChat(target.node.url, body, () => {}, target.node.type, target.node.apiKey),
-          { registerAbort, live: () => runLive(run) }
+          () => runLive(run)
         );
         if (taken.aborted) return { content: '', aborted: true };
         return {
@@ -1523,10 +2388,16 @@ ${instruction}`,
       setExecutingPlanNotice(
         `Free-tier rate limit — waiting ${Math.ceil(backoff / 1000)}s then retrying assist…`
       );
-      window.electronAPI?.writeLog?.(
+      hostLog(
         'warn',
         `free-tier rate limit retry in ${backoff}ms: ${result.error}`
       );
+      logRoute('retry', {
+        text: `free-tier rate limit retry in ${backoff}ms`,
+        nodeId: target.node.id,
+        nodeName: target.node.name,
+        model: target.model
+      });
       await new Promise<void>(r => setTimeout(r, backoff));
       if (!runLive(run)) return null;
       result = await runOnce();
@@ -1534,7 +2405,7 @@ ${instruction}`,
 
     if (result.aborted || !runLive(run)) return null;
     if (result.error && !result.content.trim()) {
-      window.electronAPI?.writeLog?.('warn', `free-tier assist failed: ${result.error}`);
+      hostLog('warn', `free-tier assist failed: ${result.error}`);
       setAssistError({
         cause: clipErrorCause(result.error, 'Cloud assist failed.'),
         node: target.node.name,
@@ -1578,12 +2449,47 @@ ${instruction}`,
 
   const progressForPrompt = () => (hasWorkLog(progressRef.current) ? renderWorkLog(progressRef.current) : '');
 
+  /** Log a status notice while this run is still live. A stopped run does not touch the status line. */
+  const logNoticeNow = (text: string | null, run: ConductorRun) => {
+    if (!runLive(run)) return;
+    if (!text) {
+      lastNoticeRef.current = null;
+      setExecutingPlanNotice(null);
+      return;
+    }
+    if (text === lastNoticeRef.current) {
+      setExecutingPlanNotice(text);
+      return;
+    }
+    if (activeRunLogIdRef.current == null) return;
+    lastNoticeRef.current = text;
+    const stepId = activeStepId();
+    logRun({
+      kind: 'notice',
+      text,
+      ...(stepId ? { stepId } : {})
+    });
+    setExecutingPlanNotice(text);
+  };
+
   /** Hand control back to Planner after an ephemeral Coder/Reviewer worker finishes. */
   const restorePlannerControl = (notice?: string) => {
     ephemeralWorkerRef.current = false;
     onSelectAgent(plannerAgent.id);
     onConversationPatch?.({ agentId: plannerAgent.id });
-    if (notice) setExecutingPlanNotice(notice);
+    if (!notice) return;
+    if (notice === lastNoticeRef.current) {
+      setExecutingPlanNotice(notice);
+      return;
+    }
+    lastNoticeRef.current = notice;
+    const stepId = activeStepId();
+    logRun({
+      kind: planPausedRef.current ? 'pause' : 'notice',
+      text: notice,
+      ...(stepId ? { stepId } : {})
+    });
+    setExecutingPlanNotice(notice);
   };
 
   const fitContext = (numCtx: number, forceOrModel?: boolean | string, modelKey?: string) => {
@@ -1603,6 +2509,7 @@ ${instruction}`,
       workLog: progressForPrompt()
     });
     if (next.length >= current.length && historyTokens(next, key) >= historyTokens(current, key) * 0.9) return;
+    logContext('compact', `${current.length} messages to ${next.length}`, { numCtx });
     messagesRef.current = next;
     setMessages(next);
   };
@@ -1616,6 +2523,7 @@ ${instruction}`,
     expectedFilePath: string | undefined,
     token: number
   ): Promise<string> => {
+    const { hostLog } = scopeRunLog();
     const open = hasUnclosedWrite(content);
     if (!open || !runIsCurrent(token) || stopRequestedRef.current) return content;
     // Local models often report "stop" while forgetting </write_file>. Still continue once
@@ -1645,27 +2553,40 @@ ${instruction}`,
           '>.'
       }
     ];
+    const finishOptions = chatOptions(node, model, 'coder', { createIntent: true, temperature: 0.2 });
     const body = withThink(
       {
         model,
         messages: continueMsgs,
-        options: chatOptions(node, model, 'coder', { createIntent: true, temperature: 0.2 })
+        options: finishOptions
       },
       node,
       model,
       'coder'
     );
     try {
-      const taken = await awaitConductorChat(
+      const taken = await takeChat(
+        {
+          phase: 'truncated-write',
+          role: 'coder',
+          nodeId: node.id,
+          nodeName: node.name,
+          model,
+          numCtx: finishOptions.num_ctx,
+          estPromptTokens: estimateTurnTokens(
+            continueMsgs.map(message => message.content),
+            model
+          )
+        },
         () => streamChat(node.url, body, () => {}, node.type, node.apiKey),
-        { registerAbort, live: () => runIsCurrent(token) && !stopRequestedRef.current }
+        () => runIsCurrent(token) && !stopRequestedRef.current
       );
       if (taken.aborted || !runIsCurrent(token)) return content;
       const extra = (taken.result.content || '').trim();
       if (!extra) return content;
       return content + (content.endsWith('\n') ? '' : '\n') + extra;
     } catch (err: any) {
-      window.electronAPI?.writeLog?.('error', `finish truncated write: ${err?.message || err}`);
+      hostLog('error', `finish truncated write: ${err?.message || err}`);
       return content;
     }
   };
@@ -1686,17 +2607,17 @@ ${instruction}`,
     if (captured && !runIsCurrent(captured.token)) return updated;
     updateProgress(log => noteSavedFiles(log, [updated], savedFileFingerprints()));
     let hostMsg: ChatMessage | undefined;
-    setMessages(prev =>
-      prev.map(m => {
-        if (!m.toolCalls?.some(t => t.id === tool.id)) return m;
-        const next = {
-          ...m,
-          toolCalls: m.toolCalls!.map(t => (t.id === tool.id ? updated : t))
-        };
-        hostMsg = next;
-        return next;
-      })
-    );
+    const toolMessages = messagesRef.current.map(m => {
+      if (!m.toolCalls?.some(t => t.id === tool.id)) return m;
+      const next = {
+        ...m,
+        toolCalls: m.toolCalls!.map(t => (t.id === tool.id ? updated : t))
+      };
+      hostMsg = next;
+      return next;
+    });
+    messagesRef.current = toolMessages;
+    setMessages(toolMessages);
     // Manual Run on a failed command → one self-correct attempt
     if (
       updated.name === 'run_command' &&
@@ -1705,7 +2626,10 @@ ${instruction}`,
       shouldContinueFromTools(hostMsg.toolCalls || [], continueDecisionOpts())
     ) {
       resetAgentLoopBudget();
-      await continueWithToolResults(hostMsg, { createIntent: true });
+      const host = hostMsg;
+      await runAsUser('tool', async run => {
+        await continueWithToolResults(host, { createIntent: true, run });
+      });
     }
     return updated;
   };
@@ -1725,12 +2649,16 @@ ${instruction}`,
       reviewMode?: boolean;
       /** Cleared-context worker continue (only this turn + tool feedback). */
       freshContext?: boolean;
+      /** Final source-folder review. A final_review tag counts as the structured result. */
+      finalSourceReview?: boolean;
+      /** One last answer turn after the read cap. Tool tags in that reply are not run. */
+      verdictNow?: boolean;
       run?: ConductorRun;
     }
-  ) => {
+  ): Promise<ChatMessage | undefined> => {
+    const { logToolEvent, hostLog } = scopeRunLog();
     const budget = opts?.budget;
     const depth = budget ? budget.depth : continuationDepthRef.current;
-    if (depth >= toolStepLimit) return;
 
     const feedbackTools = collectFeedbackTools(originMsg.toolCalls || []);
     if (feedbackTools.length === 0) return;
@@ -1758,9 +2686,52 @@ ${instruction}`,
       maxReadOnlyContinues: reviewModeGate ? 1 : undefined
     });
     const prevTerminalFp = continueOpts.terminalFingerprint;
-    if (!shouldContinueFromTools(originMsg.toolCalls || [], continueOpts)) {
-      rememberTerminalFingerprint(originMsg.toolCalls || [], budget);
-      return;
+    const activeReviewStepId = () => {
+      const id = getActiveStep(plannerPlanRef.current)?.id;
+      return id != null && String(id) !== '' ? String(id) : undefined;
+    };
+    const reviewVerdictTurnNeeded = (batch: ToolCall[], raw: string, used: number, max?: number) =>
+      needsReviewVerdictTurn({
+        reviewMode: reviewModeContinue,
+        stepVerdictMode: !!opts?.stepVerdictMode || originMsg.stepVerdict != null,
+        finalSourceReview: !!opts?.finalSourceReview,
+        tools: batch,
+        raw,
+        readOnlyContinues: used,
+        maxReadOnlyContinues: max ?? 1,
+        activeStepId: activeReviewStepId()
+      });
+    // Cap reached with only reads and no verdict tag: one answer turn, then stop.
+    // That single answer turn still runs when the tool-step depth budget is already spent.
+    let verdictNow = !!opts?.verdictNow;
+    const atDepthLimit = depth >= toolStepLimit;
+    if (!verdictNow && !shouldContinueFromTools(originMsg.toolCalls || [], continueOpts)) {
+      if (
+        reviewVerdictTurnNeeded(
+          originMsg.toolCalls || [],
+          originMsg.raw || '',
+          continueOpts.readOnlyContinues,
+          continueOpts.maxReadOnlyContinues
+        )
+      ) {
+        verdictNow = true;
+      } else {
+        rememberTerminalFingerprint(originMsg.toolCalls || [], budget);
+        return;
+      }
+    } else if (!verdictNow && atDepthLimit) {
+      if (
+        reviewVerdictTurnNeeded(
+          originMsg.toolCalls || [],
+          originMsg.raw || '',
+          continueOpts.readOnlyContinues,
+          continueOpts.maxReadOnlyContinues
+        )
+      ) {
+        verdictNow = true;
+      } else {
+        return;
+      }
     }
 
     const cmdFailed = feedbackTools.some(t => t.name === 'run_command' && t.status === 'error');
@@ -1784,7 +2755,7 @@ ${instruction}`,
       if (budget) budget.writeFixAttempts += 1;
       else writeFixAttemptsRef.current += 1;
     }
-    if (isReadOnlyToolBatch(originMsg.toolCalls || [])) {
+    if (!verdictNow && isReadOnlyToolBatch(originMsg.toolCalls || [])) {
       if (budget) budget.readOnlyContinues += 1;
       else readOnlyContinuesRef.current += 1;
     }
@@ -1800,15 +2771,21 @@ ${instruction}`,
       prevTerminalFp && currentTerminalFp && prevTerminalFp === currentTerminalFp
     );
     rememberTerminalFingerprint(originMsg.toolCalls || [], budget);
-    const routeNode = opts?.node || selectedNode;
-    if (!routeNode) return;
-    const routeModel = opts?.model || activeTargetModel;
-    const followUpId = `followup-${Date.now()}`;
     const continueAgent = reviewModeContinue
       ? reviewerAgent
       : planModeContinue || lockPlanContinue
         ? plannerAgent
         : coderAgent;
+    const continueRoute =
+      opts?.node && opts?.model ? undefined : resolveRoute('Continue the current task', continueAgent);
+    const routeNode =
+      opts?.node ||
+      nodesRef.current.find(item => item.id === originMsg.endpointId) ||
+      continueRoute?.routedNode;
+    if (!routeNode) return;
+    const routeModel = opts?.model || originMsg.model || continueRoute?.routedModel || '';
+    if (!routeModel) return;
+    const followUpId = `followup-${Date.now()}`;
     const followUpMsg: ChatMessage = {
       id: followUpId,
       role: 'assistant',
@@ -1820,7 +2797,9 @@ ${instruction}`,
           : lockPlanContinue
             ? 'Explored the workspace. Locking execution steps...'
           : reviewModeContinue
-            ? 'Explored the workspace. Drafting the review fix plan...'
+            ? verdictNow
+              ? 'Read budget used — writing the verdict...'
+              : 'Explored the workspace. Drafting the review fix plan...'
             : 'Analyzed project files. Now generating implementation...',
       agentId: continueAgent.id,
       personaHandle: continueAgent.handle || originRole,
@@ -1831,14 +2810,30 @@ ${instruction}`,
       toolCalls: []
     };
 
-    const entered = bindRun(opts?.run ?? null, false);
+    let homeConversationId: string | null = null;
+    const writeMessages = (next: ChatMessage[]) => {
+      if (conversationIdRef.current !== homeConversationId) return;
+      messagesRef.current = next;
+      setMessages(next);
+    };
+    const writeFollowUp = (message: ChatMessage) => {
+      if (conversationIdRef.current !== homeConversationId) return;
+      const prev = messagesRef.current;
+      const next = prev.some(item => item.id === message.id)
+        ? prev.map(item => (item.id === message.id ? message : item))
+        : [...prev, message];
+      writeMessages(next);
+    };
+
+    const entered = bindRun(opts?.run ?? null, false, 'follow-up');
     if (!entered) return;
     const run = entered.run;
+    homeConversationId = run.conversationId;
     if (!runLive(run)) {
       leaveConductorRun(entered.owned, entered.run.token);
       return;
     }
-    setMessages(prev => [...prev, followUpMsg]);
+    writeFollowUp(followUpMsg);
     setIsStreaming(true);
 
     try {
@@ -1876,10 +2871,22 @@ ${instruction}`,
         planMode: planModeContinue,
         reviewMode: reviewModeContinue,
         lockPlanMode: lockPlanContinue && !reviewModeContinue,
-        stepVerdictMode: stepVerdictContinue || (planLocked && reviewModeContinue),
+        stepVerdictMode: opts?.finalSourceReview
+          ? false
+          : stepVerdictContinue || (planLocked && reviewModeContinue),
         projectContext: projectContextForPrompt(rulesCapFor(continueTier)),
         inferenceModel: routeModel
       });
+      const followBudget = reviewFollowUpBudget(modelMaxCtx(routeNode, routeModel), continueRole);
+      if (verdictNow) {
+        continuationPrompt += `\n\n${reviewVerdictNowInstruction({
+          stepVerdictMode: stepVerdictContinue && !opts?.finalSourceReview,
+          finalSourceReview: !!opts?.finalSourceReview
+        })}`;
+      }
+      if (verdictNow || reviewModeContinue) {
+        continuationPrompt = boundReviewContinuation(continuationPrompt, followBudget.toolChars);
+      }
       // Ephemeral workers: only this turn + tool feedback. Planner keeps full chat memory.
       const historySlice = freshContinue
         ? []
@@ -1887,50 +2894,71 @@ ${instruction}`,
             messagesRef.current.filter(m => m.id !== followUpId),
             stripThinking
           );
+      let userContent = prependVolatileContext(
+        planModeContinue
+          ? `${continuationPrompt}\n\n[PLANNER DIRECTIVE: After using exploration results, produce the plan and end with a <plan_options> block. Do NOT write deliverable files.]`
+          : lockPlanContinue && !reviewModeContinue
+            ? `${continuationPrompt}\n\n[PLANNER DIRECTIVE: Finish the <execution_plan> steps/tasks for the chosen option. Do NOT emit <plan_options>. Do NOT write deliverable files.]`
+            : reviewModeContinue
+              ? opts?.finalSourceReview
+                ? `${continuationPrompt}\n\n[REVIEWER DIRECTIVE: STOP reading. Do not call any tools. Reply with <final_review><result>pass|issues</result><notes>...</notes></final_review>. Do NOT emit <review_plan>, <review_delta>, or <step_verdict>. Do NOT write files.]`
+                : stepVerdictContinue || planLocked
+                  ? `${continuationPrompt}\n\n[REVIEWER DIRECTIVE: STOP reading. Emit <step_verdict> yay or nay for the active step only. Do NOT emit <plan_options> or <review_plan>. Do NOT write files.]`
+                  : `${continuationPrompt}\n\n[REVIEWER DIRECTIVE: STOP reading more files. Report findings and end with a <review_plan> that has <task> items for Planner→Coder. Do NOT write/edit/Apply files yourself.]`
+              : continuationPrompt,
+        {
+          nodes: nodesRef.current,
+          inferenceNodeId: routeNode.id,
+          includeInventory: planModeContinue || lockPlanContinue,
+          fallbackNumCtx: modelMaxCtx(routeNode, routeModel),
+          progressLog: progressForPrompt(),
+          overview: workspaceOverview,
+          approvedPlan:
+            planModeContinue || reviewModeContinue || lockPlanContinue
+              ? null
+              : approvedPlanRef.current
+        }
+      );
+      const fittedContinue = fitPromptToContext({
+        system: systemPrompt,
+        userContent,
+        history: historySlice.map(message => ({
+          role: message.role,
+          content: message.content,
+          ...(message.images?.length ? { images: message.images } : {})
+        })),
+        maxCtx: followBudget.pinnedCtx,
+        frontier: routeNode.type === 'openai' || !!routeNode.apiKey,
+        modelKey: routeModel,
+        promptBudget: followBudget.promptBudget
+      });
+      userContent = fittedContinue.userContent;
+      if (fittedContinue.note) {
+        logContext('fit', fittedContinue.note, {
+          numCtx: followBudget.pinnedCtx,
+          promptBudget: followBudget.promptBudget
+        });
+      }
       const conversationPayload = [
         { role: 'system', content: systemPrompt },
-        ...historySlice,
+        ...fittedContinue.history,
         {
           role: 'assistant',
           content: stripThinking(originMsg.raw || 'I inspected the project / terminal.')
         },
-        {
-          role: 'user',
-          content: prependVolatileContext(
-            planModeContinue
-              ? `${continuationPrompt}\n\n[PLANNER DIRECTIVE: After using exploration results, produce the plan and end with a <plan_options> block. Do NOT write deliverable files.]`
-              : lockPlanContinue && !reviewModeContinue
-                ? `${continuationPrompt}\n\n[PLANNER DIRECTIVE: Finish the <execution_plan> steps/tasks for the chosen option. Do NOT emit <plan_options>. Do NOT write deliverable files.]`
-                : reviewModeContinue
-                  ? stepVerdictContinue || planLocked
-                    ? `${continuationPrompt}\n\n[REVIEWER DIRECTIVE: STOP reading. Emit <step_verdict> yay or nay for the active step only. Do NOT emit <plan_options> or <review_plan>. Do NOT write files.]`
-                    : `${continuationPrompt}\n\n[REVIEWER DIRECTIVE: STOP reading more files. Report findings and end with a <review_plan> that has <task> items for Planner→Coder. Do NOT write/edit/Apply files yourself.]`
-                  : continuationPrompt,
-            {
-              nodes: nodesRef.current,
-              inferenceNodeId: routeNode.id,
-              includeInventory: planModeContinue || lockPlanContinue,
-              fallbackNumCtx: modelMaxCtx(routeNode, routeModel),
-              progressLog: progressForPrompt(),
-              overview: workspaceOverview,
-              approvedPlan:
-                planModeContinue || reviewModeContinue || lockPlanContinue
-                  ? null
-                  : approvedPlanRef.current
-            }
-          )
-        }
+        { role: 'user', content: userContent }
       ];
 
+      const continueOptions = chatOptions(routeNode, routeModel, continueRole, {
+        createIntent: !readOnlyContinue,
+        tier: continueTier,
+        temperature: continueAgent.temperature,
+        fallbackNumCtx: continueAgent.numCtx
+      });
       const body = withThink({
         model: routeModel,
         messages: conversationPayload,
-        options: chatOptions(routeNode, routeModel, continueRole, {
-          createIntent: !readOnlyContinue,
-          tier: continueTier,
-          temperature: continueAgent.temperature,
-          fallbackNumCtx: continueAgent.numCtx
-        })
+        options: continueOptions
       }, routeNode, routeModel, continueRole);
 
       const openContinue = () => streamChat(
@@ -1953,49 +2981,59 @@ ${instruction}`,
           displayLive = scrubStructuredMarkup(displayLive);
           if (liveVerdict || liveReview || parseExecutionPlan(content)) displayLive = '';
           if (!runLive(run)) return;
-          setMessages(prev => prev.map(m => {
-            if (m.id === followUpId) {
-              return {
-                ...m,
-                raw: content,
-                display: displayLive,
-                thinking: parsed.thinking || thinking,
-                toolCalls: collapseDuplicateReadTools(
+          const streaming = messagesRef.current.find(item => item.id === followUpId) || followUpMsg;
+          writeFollowUp({
+            ...streaming,
+            raw: content,
+            display: displayLive,
+            thinking: parsed.thinking || thinking,
+            toolCalls: verdictNow
+              ? []
+              : collapseDuplicateReadTools(
                   readOnlyContinue
                     ? parsed.toolCalls.filter(t =>
                         ['read_file', 'list_dir', 'search', 'read_terminal'].includes(t.name)
                       )
                     : parsed.toolCalls
                 ),
-                ...(liveOptions.length >= 2
-                  ? {
-                      planOptions: liveOptions,
-                      planSummary: buildPlanSummary(content, liveOptions)
-                    }
-                  : {}),
-                ...(liveReview ? { reviewPlan: liveReview } : {}),
-                ...(liveVerdict
-                  ? {
-                      stepVerdict: {
-                        stepId: liveVerdict.stepId || getActiveStep(plannerPlanRef.current)?.id || '',
-                        stepTitle: getActiveStep(plannerPlanRef.current)?.title || 'Step',
-                        result: liveVerdict.result,
-                        notes: liveVerdict.notes
-                      }
-                    }
-                  : {})
-              };
-            }
-            return m;
-          }));
+            ...(liveOptions.length >= 2
+              ? {
+                  planOptions: liveOptions,
+                  planSummary: buildPlanSummary(content, liveOptions)
+                }
+              : {}),
+            ...(liveReview ? { reviewPlan: liveReview } : {}),
+            ...(liveVerdict
+              ? {
+                  stepVerdict: {
+                    stepId: liveVerdict.stepId || getActiveStep(plannerPlanRef.current)?.id || '',
+                    stepTitle: getActiveStep(plannerPlanRef.current)?.title || 'Step',
+                    result: liveVerdict.result,
+                    notes: liveVerdict.notes
+                  }
+                }
+              : {})
+          });
         },
         routeNode.type,
         routeNode.apiKey
       );
-      const taken = await awaitConductorChat(openContinue, {
-        registerAbort,
-        live: () => runLive(run)
-      });
+      const taken = await takeChat(
+        {
+          phase: 'follow-up',
+          role: continueAgent.handle || originRole,
+          nodeId: routeNode.id,
+          nodeName: routeNode.name,
+          model: routeModel,
+          numCtx: continueOptions.num_ctx,
+          estPromptTokens: estimateTurnTokens(
+            conversationPayload.map(message => message.content),
+            routeModel
+          )
+        },
+        openContinue,
+        () => runLive(run)
+      );
       if (taken.aborted || !runLive(run)) return;
       const result = taken.result;
       notePromptSample(routeModel, conversationPayload, result.stats);
@@ -2023,26 +3061,34 @@ ${instruction}`,
         hasUnclosedWrite(finished)
       ) {
         const truncated = truncatedWriteToolCall(finished, followUpId, opts?.expectedFilePath);
-        if (truncated) tools = [...tools, truncated];
+        if (truncated) {
+          tools = [...tools, truncated];
+          logToolEvent(truncated);
+        }
       }
-      if (readOnlyContinue) {
-        tools = tools.filter(t =>
-          ['read_file', 'list_dir', 'search', 'read_terminal'].includes(t.name)
-        );
-      }
-      if (!runLive(run)) return;
-      const readPass = await runReadOnlyTools(tools, toolDepsRef.current);
-      tools = readPass.tools;
-      if (!runLive(run)) return;
-
-      if (!readOnlyContinue && autoApplyWritesRef.current) {
-        tools = await autoApplyWritableTools(tools, toolDepsRef.current);
+      if (verdictNow) {
+        // The answer turn may still emit tool tags. Do not run them.
+        tools = [];
+      } else {
+        if (readOnlyContinue) {
+          tools = tools.filter(t =>
+            ['read_file', 'list_dir', 'search', 'read_terminal'].includes(t.name)
+          );
+        }
         if (!runLive(run)) return;
-        tools = await runAuxTools(tools, toolDepsRef.current);
-        const cmdPass = await runCommandTools(tools, toolDepsRef.current);
-        tools = cmdPass.tools;
-        updateProgress(log => noteSavedFiles(log, tools, savedFileFingerprints()));
-        noteAppliedWrites(tools);
+        const readPass = await runReadOnlyTools(tools, toolDepsRef.current);
+        tools = readPass.tools;
+        if (!runLive(run)) return;
+
+        if (!readOnlyContinue && autoApplyOn()) {
+          tools = await autoApplyWritableTools(tools, toolDepsRef.current);
+          if (!runLive(run)) return;
+          tools = await runAuxTools(tools, toolDepsRef.current);
+          const cmdPass = await runCommandTools(tools, toolDepsRef.current);
+          tools = cmdPass.tools;
+          updateProgress(log => noteSavedFiles(log, tools, savedFileFingerprints()));
+          noteAppliedWrites(tools);
+        }
       }
 
       const stillFailing =
@@ -2091,35 +3137,49 @@ ${instruction}`,
           : {})
       };
 
-      setMessages(prev => prev.map(m => (m.id === followUpId ? followUpMsgFinal : m)));
+      let produced: ChatMessage = followUpMsgFinal;
+      writeFollowUp(produced);
 
-      if (runLive(run) && shouldContinueFromTools(tools, continueDecisionOpts(budget))) {
-        await continueWithToolResults(followUpMsgFinal, { ...opts, run });
+      if (!runLive(run)) return produced;
+      if (!verdictNow && runLive(run)) {
+        const afterOpts = continueDecisionOpts(budget, {
+          maxReadOnlyContinues: reviewModeGate ? 1 : undefined
+        });
+        let deeper: ChatMessage | undefined;
+        if (shouldContinueFromTools(tools, afterOpts)) {
+          deeper = await continueWithToolResults(followUpMsgFinal, { ...opts, run });
+        } else if (
+          reviewVerdictTurnNeeded(
+            tools,
+            finished,
+            afterOpts.readOnlyContinues,
+            afterOpts.maxReadOnlyContinues
+          )
+        ) {
+          deeper = await continueWithToolResults(followUpMsgFinal, { ...opts, run, verdictNow: true });
+        }
+        if (deeper) produced = deeper;
       }
+      return produced;
     } catch (err: any) {
-      window.electronAPI?.writeLog?.('error', `code generation: ${err?.message || err}`);
+      hostLog('error', `code generation: ${err?.message || err}`);
       if (runLive(run)) {
-        setMessages(prev => prev.map(m => {
-          if (m.id === followUpId) {
-            return {
-              ...m,
-              error: err?.message || String(err),
-              endpointName: m.endpointName || routeNode.name,
-              model: m.model || routeModel
-            };
-          }
-          return m;
-        }));
+        const current = messagesRef.current.find(item => item.id === followUpId) || followUpMsg;
+        writeFollowUp({
+          ...current,
+          error: err?.message || String(err),
+          endpointName: current.endpointName || routeNode.name,
+          model: current.model || routeModel
+        });
       }
     } finally {
       if (!runLive(run)) {
-        setMessages(prev =>
-          prev.map(m =>
-            m.id === followUpId && m.display === followUpMsg.display ? { ...m, display: 'Stopped.' } : m
-          )
-        );
+        const current = messagesRef.current.find(item => item.id === followUpId);
+        if (current && current.display === followUpMsg.display) {
+          writeFollowUp({ ...current, display: 'Stopped.' });
+        }
       }
-      if (runIsCurrent(run.token) || !heldRef.current) setIsStreaming(false);
+      if (entered.owned && (runIsCurrent(run.token) || !heldRef.current)) setIsStreaming(false);
       leaveConductorRun(entered.owned, entered.run.token);
     }
   };
@@ -2138,13 +3198,18 @@ ${instruction}`,
       stepDispatch?: { files: string[]; brief: string };
     }
   ) => {
-    const entered = bindRun(opts?.run ?? null, false);
+    const entered = bindRun(opts?.run ?? null, false, 'swarm');
     if (!entered) return;
     const run = entered.run;
+    const { logRun, hostLog, logToolEvent } = scopeRunLog();
     try {
     void fullPrompt;
     resetAgentLoopBudget();
-    fitContext(modelMaxCtx(selectedNode, activeTargetModel), activeTargetModel);
+    const swarmPlanner = leadArchitectNow();
+    fitContext(
+      modelMaxCtx(swarmPlanner?.node, swarmPlanner?.model || ''),
+      swarmPlanner?.model || ''
+    );
     const lockedPlan = opts?.approvedPlan ?? approvedPlanRef.current;
     const userMsg: ChatMessage = {
       id: `msg-${Date.now()}`,
@@ -2156,18 +3221,21 @@ ${instruction}`,
     };
 
     const agentMsgId = `pipeline-${Date.now()}`;
-    let architect = findLeadArchitect(nodesRef.current);
+    let architect = swarmPlanner;
+    let pass1Frame: ActivityHandle | undefined;
 
     const patchPipelineMsg = (
       patch: Partial<ChatMessage> | ((m: ChatMessage) => ChatMessage)
     ) => {
       if (!runLive(run)) return;
-      setMessages(prev =>
-        prev.map(m => {
+      setMessages(prev => {
+        const next = prev.map(m => {
           if (m.id !== agentMsgId) return m;
           return typeof patch === 'function' ? patch(m) : { ...m, ...patch };
-        })
-      );
+        });
+        messagesRef.current = next;
+        return next;
+      });
     };
 
     const readWorkspaceRel = async (rel: string): Promise<string | undefined> => {
@@ -2252,6 +3320,19 @@ ${instruction}`,
           },
           idx
         );
+      const failRepeatedOutput = () => {
+        const reason = 'Model output repeated itself; aborted';
+        patchPipelineMsg(m => {
+          if (!m.pipelineSteps) return m;
+          const updatedSteps = [...m.pipelineSteps];
+          if (updatedSteps[idx]) {
+            updatedSteps[idx] = { ...updatedSteps[idx], status: 'failed', content: reason };
+          }
+          return { ...m, pipelineSteps: updatedSteps };
+        });
+        failWorkerCard(reason);
+        return false;
+      };
       if (!opts.retargeted) {
         const liveNode = nodesRef.current.find(n => n.id === node.id);
         const stillLive = !!liveNode?.online && getEnabledModelsForNode(liveNode).includes(model);
@@ -2264,6 +3345,12 @@ ${instruction}`,
             fail.node.online &&
             getEnabledModelsForNode(fail.node).includes(fail.model)
           ) {
+            logRoute('failover', {
+              text: `${node.name}/${model} -> ${fail.node.name}/${fail.model}`,
+              nodeId: fail.node.id,
+              nodeName: fail.node.name,
+              model: fail.model
+            });
             return runWorkerTurn({
               ...opts,
               assignment: { ...assignment, node: fail.node, model: fail.model },
@@ -2284,6 +3371,12 @@ ${instruction}`,
             return { ...m, pipelineSteps: updatedSteps };
           });
           failWorkerCard(`Skipped: ${node.name} is offline or ${model} is disabled`);
+          logRoute('skip', {
+            text: `${node.name} is offline or ${model} is disabled`,
+            nodeId: node.id,
+            nodeName: node.name,
+            model
+          });
           return false;
         }
         node = liveNode!;
@@ -2302,6 +3395,12 @@ ${instruction}`,
           return { ...m, pipelineSteps: updatedSteps };
         });
         failWorkerCard(`Skipped: ${skippedReason}`);
+        logRoute('skip', {
+          text: skippedReason,
+          nodeId: node.id,
+          nodeName: node.name,
+          model
+        });
         return false;
       }
 
@@ -2332,6 +3431,14 @@ ${instruction}`,
       });
       if (workerFitPrompt.note) {
         setExecutingPlanNotice(workerFitPrompt.note);
+        logContext('fit', workerFitPrompt.note, {
+          numCtx: workerReq.pinnedCtx,
+          promptBudget: workerReq.promptBudget,
+          estPromptTokens: estimateTurnTokens(
+            [workerSystemPrompt, workerFitPrompt.userContent],
+            model
+          )
+        });
       }
       const workerOptions = ollamaOptions(workerReq);
       let sentWorkerMsgs: Array<{ role: string; content: string }> = [
@@ -2401,10 +3508,24 @@ ${instruction}`,
             node.type,
             node.apiKey
           );
-        const taken = await awaitConductorChat(() => openWorker(body), {
-          registerAbort,
-          live: () => runLive(run)
-        });
+        const taken = await takeChat(
+          {
+            phase: 'swarm-worker',
+            role: 'coder',
+            nodeId: node.id,
+            nodeName: node.name,
+            model,
+            numCtx: workerOptions.num_ctx,
+            promptBudget: workerReq.promptBudget,
+            estPromptTokens: estimateTurnTokens(
+              sentWorkerMsgs.map(message => message.content),
+              model
+            )
+          },
+          () => openWorker(body),
+          () => runLive(run)
+        );
+        if (taken.aborted && runLive(run)) return failRepeatedOutput();
         if (taken.aborted || !runLive(run)) return false;
         let res = taken.result;
         if (
@@ -2417,6 +3538,18 @@ ${instruction}`,
             { role: 'system', content: workerSystemPrompt },
             { role: 'user', content: smaller }
           ];
+          logContext(
+            'resubmit',
+            `Context monitor: ${model} filled its window. Resent ${expectedFilePath} with a smaller packet.`,
+            {
+              numCtx: workerOptions.num_ctx,
+              promptBudget: workerReq.promptBudget,
+              estPromptTokens: estimateTurnTokens(
+                sentWorkerMsgs.map(message => message.content),
+                model
+              )
+            }
+          );
           const retryBody = withThink(
             {
               model,
@@ -2427,10 +3560,24 @@ ${instruction}`,
             model,
             'coder'
           );
-          const retried = await awaitConductorChat(
+          const retried = await takeChat(
+            {
+              phase: 'swarm-worker-resubmit',
+              role: 'coder',
+              nodeId: node.id,
+              nodeName: node.name,
+              model,
+              numCtx: workerOptions.num_ctx,
+              promptBudget: workerReq.promptBudget,
+              estPromptTokens: estimateTurnTokens(
+                sentWorkerMsgs.map(message => message.content),
+                model
+              )
+            },
             () => streamChat(node.url, retryBody, () => {}, node.type, node.apiKey),
-            { registerAbort, live: () => runLive(run) }
+            () => runLive(run)
           );
+          if (retried.aborted && runLive(run)) return failRepeatedOutput();
           if (retried.aborted || !runLive(run)) return false;
           res = retried.result;
           setExecutingPlanNotice(
@@ -2456,7 +3603,11 @@ ${instruction}`,
         }).toolCalls.map(t => anchorWritePath(t, expectedFilePath));
         if (!continuationClosedWrite(res.content, finished) && hasUnclosedWrite(finished)) {
           const truncated = truncatedWriteToolCall(finished, `${agentMsgId}-${idx}`, expectedFilePath);
-          if (truncated) tools = [...tools, anchorWritePath(truncated, expectedFilePath)];
+          if (truncated) {
+            const anchored = anchorWritePath(truncated, expectedFilePath);
+            tools = [...tools, anchored];
+            logToolEvent(anchored);
+          }
         }
 
         tools = tools.map(t => {
@@ -2497,7 +3648,7 @@ ${instruction}`,
         if (!runLive(run)) return false;
         updateProgress(log => noteSavedFiles(log, tools, savedFileFingerprints()));
         noteAppliedWrites(tools);
-        if (autoApplyWritesRef.current) {
+        if (autoApplyOn()) {
           tools = await runAuxTools(tools, toolDepsRef.current);
           const cmdPass = await runCommandTools(tools, toolDepsRef.current);
           tools = cmdPass.tools;
@@ -2511,6 +3662,7 @@ ${instruction}`,
           readOnlyContinues: 0,
           terminalFingerprint: undefined
         };
+        let continuedWork: ChatMessage | undefined;
         if (shouldContinueFromTools(tools, continueDecisionOpts(workerBudget))) {
           const origin: ChatMessage = {
             id: `${agentMsgId}-worker-${idx}`,
@@ -2521,7 +3673,7 @@ ${instruction}`,
             personaHandle: 'coder',
             timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
           };
-          await continueWithToolResults(origin, {
+          continuedWork = await continueWithToolResults(origin, {
             expectedFilePath,
             createIntent: true,
             node,
@@ -2532,9 +3684,35 @@ ${instruction}`,
           });
         }
 
-        const writeErrors = tools.filter(
-          t => (t.name === 'write_file' || t.name === 'edit_file') && t.status === 'error'
+        const isWriteTool = (tool: ToolCall) =>
+          tool.name === 'write_file' || tool.name === 'edit_file';
+        const followWrites = (continuedWork?.toolCalls || []).filter(isWriteTool);
+        let cardTools = tools;
+        let writeErrors = tools.filter(tool => isWriteTool(tool) && tool.status === 'error');
+        if (followWrites.length) {
+          const latest = new Map<string, ToolCall>();
+          for (const tool of [...tools.filter(isWriteTool), ...followWrites]) {
+            const key = (tool.args?.path || expectedFilePath || tool.id).replace(/\\/g, '/').toLowerCase();
+            latest.set(key, tool);
+          }
+          const judged = [...latest.values()];
+          writeErrors = judged.filter(tool => tool.status !== 'done');
+          cardTools = [...tools.filter(tool => !isWriteTool(tool)), ...judged];
+        }
+        const workspaceRoot = (workspacePathRef.current || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+        const normWritePath = (p: string) => {
+          let rel = p.replace(/\\/g, '/').toLowerCase();
+          if (workspaceRoot && rel.startsWith(workspaceRoot + '/')) rel = rel.slice(workspaceRoot.length + 1);
+          return rel.replace(/^(?:\.\/|\/)+/, '');
+        };
+        const wroteExpected = cardTools.some(
+          tool =>
+            isWriteTool(tool) &&
+            tool.status === 'done' &&
+            normWritePath(tool.args?.path || expectedFilePath || '') === normWritePath(expectedFilePath || '')
         );
+        const noWrite = !writeErrors.length && !wroteExpected;
+        const workerFailed = writeErrors.length > 0 || noWrite;
 
         const doneStats =
           res.stats?.evalCount && res.stats?.evalDuration
@@ -2547,21 +3725,23 @@ ${instruction}`,
           ? writeErrors
               .map(t => t.result || `Failed to write ${t.args?.path || expectedFilePath}`)
               .join('\n')
-          : `Completed ${expectedFilePath}`;
+          : noWrite
+            ? `No write for ${expectedFilePath}`
+            : `Completed ${expectedFilePath}`;
         patchPipelineMsg(m => {
           if (!m.pipelineSteps) return m;
           const updatedSteps = [...m.pipelineSteps];
           if (updatedSteps[idx]) {
             updatedSteps[idx] = {
               ...updatedSteps[idx],
-              status: writeErrors.length ? 'failed' : 'completed',
+              status: workerFailed ? 'failed' : 'completed',
               content: doneContent,
-              toolCalls: tools,
+              toolCalls: cardTools,
               stats: doneStats
             };
           }
           const allTools = updatedSteps.flatMap(s => s.toolCalls || []);
-          const annot = annotateAppliedWrites(tools);
+          const annot = annotateAppliedWrites(cardTools);
           return {
             ...m,
             pipelineSteps: updatedSteps,
@@ -2579,22 +3759,28 @@ ${instruction}`,
             targetFile: expectedFilePath,
             agentHandle: 'coder',
             role: `${model} (local)`,
-            status: writeErrors.length ? 'failed' : 'completed',
+            status: workerFailed ? 'failed' : 'completed',
             content: doneContent,
-            toolCalls: tools,
+            toolCalls: cardTools,
             stats: doneStats
           },
           idx
         );
-        return writeErrors.length === 0;
+        return !workerFailed;
       } catch (workerErr: any) {
         const errText = String(workerErr?.message || workerErr || '');
         if (!runLive(run)) return false;
         if (!opts.retriedSame) {
-          window.electronAPI?.writeLog?.(
+          hostLog(
             'warn',
             `swarm: ${node.name} failed (${errText.slice(0, 120)}); retrying ${expectedFilePath} once`
           );
+          logRoute('retry', {
+            text: errText.slice(0, 300),
+            nodeId: node.id,
+            nodeName: node.name,
+            model
+          });
           patchPipelineMsg(m => {
             if (!m.pipelineSteps) return m;
             const updatedSteps = [...m.pipelineSteps];
@@ -2620,10 +3806,16 @@ ${instruction}`,
           getEnabledModelsForNode(fallback.node).includes(fallback.model) &&
           (fallback.node.id !== node.id || fallback.model !== model)
         ) {
-          window.electronAPI?.writeLog?.(
+          hostLog(
             'warn',
             `swarm: ${node.name} failed (${errText.slice(0, 120)}); rerouting ${expectedFilePath} to ${fallback.node.name}`
           );
+          logRoute('failover', {
+            text: `${node.name} -> ${fallback.node.name}`,
+            nodeId: fallback.node.id,
+            nodeName: fallback.node.name,
+            model: fallback.model
+          });
           patchPipelineMsg(m => {
             if (!m.pipelineSteps) return m;
             const updatedSteps = [...m.pipelineSteps];
@@ -2674,8 +3866,8 @@ ${instruction}`,
       role: 'assistant',
       raw: '',
       display: architect
-        ? `⚡ Pass 1 — Lead Architect (${architect.node.name} • ${architect.model}, largest model for this contract${
-            architect.usedFrontierBackup ? ' · frontier backup' : ''
+        ? `⚡ Pass 1 — ${isFrontierNode(architect.node) ? 'Cloud' : 'Lead Architect'} (${architect.node.name} • ${architect.model}, largest model for this contract${
+            isFrontierNode(architect.node) ? ' · frontier' : ''
           }) is locking the shared TypeScript contract...`
         : '',
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
@@ -2708,49 +3900,75 @@ ${instruction}`,
         return;
       }
 
-      // ── Scaffold gate (stack from locked delivery) ──
+      // Scaffold writes wait until after Pass 1, when worker ownership is known.
+      // Contract typecheck uses isolated tsc flags and does not need tsconfig.json.
+      let mergeOwnedPackageJson = false;
+      let scaffoldWrotePackageJson = false;
+      const writeMissingScaffoldFiles = async (
+        files: { path: string; content: string }[]
+      ): Promise<string[]> => {
+        const written: string[] = [];
+        if (!workspacePath || !window.electronAPI?.writeFile) return written;
+        const root = workspacePath.replace(/[\\/]+$/, '');
+        const sep = workspacePath.includes('\\') ? '\\' : '/';
+        for (const f of files) {
+          if (!runLive(run)) break;
+          const abs = `${root}${sep}${f.path.replace(/\//g, sep)}`;
+          let shouldWrite = true;
+          try {
+            const existing = await window.electronAPI.readFile?.(abs);
+            if (existing && !existing.error && existing.content != null) {
+              const rel = f.path.replace(/\\/g, '/').toLowerCase();
+              if (rel === 'index.html' || rel.endsWith('/index.html')) {
+                shouldWrite = shouldReplaceScaffoldIndexHtml(existing.content);
+              } else if (String(existing.content).trim()) {
+                shouldWrite = false;
+              }
+            }
+          } catch {
+            /* missing — write */
+          }
+          if (!shouldWrite) continue;
+          if (!runLive(run)) break;
+          const saved = await window.electronAPI.writeFile(abs, f.content);
+          if (saved?.error || saved?.success === false) continue;
+          written.push(f.path);
+        }
+        return written;
+      };
+      const installSwarmPackageDeps = async (reason: string) => {
+        if (!runLive(run) || !workspacePath || !window.electronAPI?.installWorkspaceDeps) return;
+        const tool: ToolCall = {
+          id: `auto-npm-install-${Date.now()}`,
+          name: 'run_command',
+          args: { command: 'npm install' },
+          body: 'npm install',
+          status: 'running'
+        };
+        try {
+          const res = await window.electronAPI.installWorkspaceDeps(workspacePath, { timeoutMs: 300000 });
+          // Stop may have released this run while npm install was in flight.
+          if (!runLive(run)) return;
+          const rewrite = res.rewritten?.length ? `\nRewrote: ${res.rewritten.join('; ')}` : '';
+          const tail = (res.output || res.error || '').slice(-4000);
+          logToolEvent({
+            ...tool,
+            status: res.ok ? 'done' : 'error',
+            result: res.ok
+              ? `Exit code: 0\n(auto) npm install after ${reason}${rewrite}\n${tail}`
+              : `Exit code: ${res.code ?? 1}\n(auto) npm install failed${rewrite}\n${tail}`
+          });
+        } catch (err) {
+          if (!runLive(run)) return;
+          logToolEvent({
+            ...tool,
+            status: 'error',
+            result: `(auto) npm install error: ${err instanceof Error ? err.message : String(err)}`
+          });
+        }
+      };
       const lockedDelivery =
         lockedPlan?.delivery || plannerPlanRef.current?.delivery || undefined;
-      const scaffoldStack =
-        deliveryToStack(lockedDelivery) ||
-        (/\breact|typescript|vite|r3f|three\b/i.test(userText) ? 'typescript' : null);
-      if (!skipPass1 && scaffoldStack && workspacePath && window.electronAPI?.writeFile) {
-        beginActivity('install', 'Scaffolding project', scaffoldStack);
-        try {
-          const files = scaffoldFilesForStack(scaffoldStack);
-          for (const f of files) {
-            const abs = `${workspacePath.replace(/[\\/]+$/, '')}${
-              workspacePath.includes('\\') ? '\\' : '/'
-            }${f.path.replace(/\//g, workspacePath.includes('\\') ? '\\' : '/')}`;
-            let shouldWrite = true;
-            try {
-              const existing = await window.electronAPI.readFile?.(abs);
-              if (existing?.content != null) {
-                if (f.path === 'index.html' && looksLikeRealIndexHtml(existing.content)) {
-                  shouldWrite = false;
-                } else if (f.path !== 'index.html' && String(existing.content).trim()) {
-                  shouldWrite = false;
-                } else if (
-                  f.path === 'index.html' &&
-                  !looksLikeRealIndexHtml(existing.content)
-                ) {
-                  shouldWrite = true; // replace plan prose
-                }
-              }
-            } catch {
-              /* missing — write */
-            }
-            if (shouldWrite) {
-              await window.electronAPI.writeFile(abs, f.content);
-            }
-          }
-          patchPipelineMsg({
-            display: `🧱 Ensured ${scaffoldStack} scaffold (package/tsconfig/entry) before Pass 1…`
-          });
-        } finally {
-          endActivity();
-        }
-      }
 
       // ── Pass 1: Generate Shared Contract & Manifest (skipped for an active plan step) ──
       const swarmTaskText = lockedPlan
@@ -2786,9 +4004,7 @@ ${instruction}`,
           } (Pass 1 skipped).`
         });
       } else {
-      architect = findLeadArchitect(nodesRef.current, {
-        preferCloudStrategist: cloudStrategistRef.current
-      });
+      architect = swarmPlanner;
       if (!architect?.node?.online || !getEnabledModelsForNode(architect.node).includes(architect.model)) {
         patchPipelineMsg({
           display: 'No online computers with a model enabled.',
@@ -2796,7 +4012,7 @@ ${instruction}`,
         });
         return;
       }
-      beginActivity(
+      pass1Frame = beginActivity(
         'pass1',
         architect.usedCloudStrategist ? 'Pass 1 — Cloud Strategist' : 'Pass 1 — Lead Architect',
         architect.node.name
@@ -2851,7 +4067,17 @@ ${instruction}`,
             promptBudget: passOpts.promptBudget
           });
           architectUser = fittedPass.userContent;
-          if (fittedPass.note) setExecutingPlanNotice(fittedPass.note);
+          if (fittedPass.note) {
+            setExecutingPlanNotice(fittedPass.note);
+            logContext('fit', fittedPass.note, {
+              numCtx: passOpts.pinnedCtx,
+              promptBudget: passOpts.promptBudget,
+              estPromptTokens: estimateTurnTokens(
+                [architectSystem, fittedPass.userContent],
+                architect.model
+              )
+            });
+          }
         }
         const architectMsgs = [
           { role: 'system', content: architectSystem },
@@ -2867,7 +4093,21 @@ ${instruction}`,
         const lead = architect;
         await warmModels([{ node: lead.node, model: lead.model }], plannerAgent.numCtx);
         if (!runLive(run)) return;
-        const decompTaken = await awaitConductorChat(
+        const passOptions = ollamaOptions(passOpts);
+        const decompTaken = await takeChat(
+          {
+            phase: 'pass1',
+            role: 'planner',
+            nodeId: lead.node.id,
+            nodeName: lead.node.name,
+            model: lead.model,
+            numCtx: passOptions.num_ctx,
+            promptBudget: passOpts.promptBudget,
+            estPromptTokens: estimateTurnTokens(
+              architectMsgs.map(message => message.content),
+              lead.model
+            )
+          },
           () =>
             streamChat(
               lead.node.url,
@@ -2876,21 +4116,31 @@ ${instruction}`,
               lead.node.type,
               lead.node.apiKey
             ),
-          { registerAbort, live: () => runLive(run) }
+          () => runLive(run)
         );
+        if (decompTaken.aborted && runLive(run)) {
+          patchPipelineMsg({
+            display: 'Pass 1 stopped: model output repeated itself; aborted.',
+            error: 'Model output repeated itself; aborted'
+          });
+          return;
+        }
         if (decompTaken.aborted || !runLive(run)) return;
         const decompRes = decompTaken.result;
         recordTok(architect.node, decompRes.stats, { model: architect.model, messages: architectMsgs });
         const parsed = parseSwarmManifest(decompRes.content, swarmTaskText);
         if (parsed) manifest = parsed;
-        else console.warn('Pass 1 JSON parse failed — using fallback manifest');
+        else hostLog('warn', `Swarm Pass 1: ${architect.model} did not return a usable manifest; using the fallback task list.`);
       } catch (decompErr) {
-        console.warn('Pass 1 Lead Architect failed — using fallback:', decompErr);
+        hostLog('warn', `Swarm Pass 1 failed; using the fallback task list: ${decompErr instanceof Error ? decompErr.message : String(decompErr)}`);
       }
       }
 
       if (!skipPass1) {
-      if (!architect) return;
+      if (!architect) {
+        hostLog('error', 'Swarm stopped: no Lead Architect model is online.');
+        return;
+      }
       // ── Stage 2: Write Contract & Verify Syntax ──
       patchPipelineMsg({
         display: `📝 Writing shared contract \`${manifest.contractFile}\` (${manifest.tasks.length} worker file${
@@ -2899,6 +4149,7 @@ ${instruction}`,
       });
 
       const priorContract = await readWorkspaceRel(manifest.contractFile);
+      if (!runLive(run)) return;
       if (priorContract && shouldPreserveContract(priorContract, manifest.contractCode)) {
         manifest = { ...manifest, contractCode: priorContract };
         patchPipelineMsg({
@@ -2906,6 +4157,7 @@ ${instruction}`,
         });
       }
       const writeOk = await onApplyFileWrite(manifest.contractFile, manifest.contractCode);
+      if (!runLive(run)) return;
       noteOwnedPath(manifest.contractFile);
       // Do not lock until typecheck passes (or the stack has no checker).
       commitProjectBrain({
@@ -2929,6 +4181,7 @@ ${instruction}`,
         rebuildRepoMap();
       }
       if (!writeOk) {
+        hostLog('error', `Swarm stopped: couldn't write the contract file ${manifest.contractFile}.`);
         patchPipelineMsg({
           display: `Couldn't write the contract file \`${manifest.contractFile}\`.`,
           error: `Couldn't write ${manifest.contractFile}.`
@@ -2949,9 +4202,16 @@ ${instruction}`,
           file: manifest.contractFile,
           timeoutMs: 45000
         });
+        if (!runLive(run)) return;
         const checkText = `${check.output || ''}\n${check.error || ''}`;
         if (!check.ok && typesCannotResolve(checkText)) {
           const failText = annotateMissingDependencies(checkText);
+          logRun({
+            kind: 'verify',
+            ok: false,
+            output: failText,
+            fingerprint: errorFingerprint(parseCompilerErrors(failText))
+          });
           patchPipelineMsg({
             display: `Contract typecheck failed. ${DEPENDENCY_RETRY_MESSAGE}\n\`\`\`\n${failText.slice(0, 1500)}\n\`\`\``,
             error: DEPENDENCY_RETRY_MESSAGE,
@@ -2986,20 +4246,33 @@ ${instruction}`,
               },
               { role: 'user', content: repairPrompt }
             ];
+            const repairOptions = chatOptions(architect.node, architect.model, 'pass1', {
+              createIntent: false,
+              tier: repairTier,
+              temperature: 0.1,
+              fallbackNumCtx: plannerAgent.numCtx
+            });
             const repairBody: Record<string, unknown> = {
               model: architect.model,
               messages: repairMsgs,
               format: 'json',
-              options: chatOptions(architect.node, architect.model, 'pass1', {
-                createIntent: false,
-                tier: repairTier,
-                temperature: 0.1,
-                fallbackNumCtx: plannerAgent.numCtx
-              })
+              options: repairOptions
             };
             if (!architect || !runLive(run)) return;
             const repairLead = architect;
-            const repairTaken = await awaitConductorChat(
+            const repairTaken = await takeChat(
+              {
+                phase: 'contract-repair',
+                role: 'planner',
+                nodeId: repairLead.node.id,
+                nodeName: repairLead.node.name,
+                model: repairLead.model,
+                numCtx: repairOptions.num_ctx,
+                estPromptTokens: estimateTurnTokens(
+                  repairMsgs.map(message => message.content),
+                  repairLead.model
+                )
+              },
               () =>
                 streamChat(
                   repairLead.node.url,
@@ -3008,8 +4281,15 @@ ${instruction}`,
                   repairLead.node.type,
                   repairLead.node.apiKey
                 ),
-              { registerAbort, live: () => runLive(run) }
+              () => runLive(run)
             );
+            if (repairTaken.aborted && runLive(run)) {
+              patchPipelineMsg({
+                display: 'Pass 1 stopped: model output repeated itself during contract repair; aborted.',
+                error: 'Model output repeated itself; aborted'
+              });
+              return;
+            }
             if (repairTaken.aborted || !runLive(run)) return;
             const repairRes = repairTaken.result;
             recordTok(architect.node, repairRes.stats, {
@@ -3019,11 +4299,13 @@ ${instruction}`,
             const repaired = parseSwarmManifest(repairRes.content, swarmTaskText);
             if (repaired) {
               const keep = await readWorkspaceRel(repaired.contractFile || manifest.contractFile);
+              if (!runLive(run)) return;
               if (keep && shouldPreserveContract(keep, repaired.contractCode)) {
                 repaired.contractCode = keep;
               }
               manifest = repaired;
               const repairedOk = await onApplyFileWrite(manifest.contractFile, manifest.contractCode);
+              if (!runLive(run)) return;
               if (repairedOk) {
                 updateProgress(log =>
                   noteSavedFiles(
@@ -3039,13 +4321,20 @@ ${instruction}`,
                 file: manifest.contractFile,
                 timeoutMs: 45000
               });
+              if (!runLive(run)) return;
             }
           } catch (repairErr) {
-            console.warn('Contract repair failed:', repairErr);
+            hostLog('warn', `Swarm contract repair failed: ${repairErr instanceof Error ? repairErr.message : String(repairErr)}`);
           }
 
           if (!check.ok) {
             const failText = check.output || check.error || 'Contract typecheck failed.';
+            logRun({
+              kind: 'verify',
+              ok: false,
+              output: failText,
+              fingerprint: errorFingerprint(parseCompilerErrors(failText))
+            });
             patchPipelineMsg({
               display: `Contract typecheck failed. Stopped in Pass 1 — workers were not started.\n\`\`\`\n${failText.slice(0, 1500)}\n\`\`\``,
               error: failText.slice(0, 500),
@@ -3066,6 +4355,7 @@ ${instruction}`,
         }
       }
 
+      if (!runLive(run)) return;
       if (contractVerified) {
         commitProjectBrain({
           ...projectBrainRef.current,
@@ -3073,11 +4363,52 @@ ${instruction}`,
           contractLocked: true
         });
       } else {
-        endActivity();
+        endActivity(pass1Frame);
         return;
       }
 
-      endActivity(); // Pass 1 done
+      endActivity(pass1Frame); // Pass 1 done
+      }
+      if (!runLive(run)) return;
+      if (
+        manifestNeedsWebScaffold(manifest, swarmTaskText) &&
+        workspacePath &&
+        typeof window.electronAPI.writeFile === 'function'
+      ) {
+        const scaffoldPlan = planWebScaffoldWrites(manifest.tasks);
+        const written = await writeMissingScaffoldFiles(scaffoldPlan.toWrite);
+        if (!runLive(run)) return;
+        if (scaffoldPlan.notes.length) {
+          const byPath = new Map(
+            scaffoldPlan.notes.map(note => [note.path.replace(/\\/g, '/').toLowerCase(), note.note])
+          );
+          manifest = {
+            ...manifest,
+            tasks: manifest.tasks.map(task => {
+              const note = byPath.get(task.filePath.replace(/\\/g, '/').toLowerCase());
+              if (!note || task.instructions.includes(note)) return task;
+              return { ...task, instructions: `${task.instructions.trim()}\n${note}` };
+            })
+          };
+        }
+        if (scaffoldPlan.ownedSkips.some(path => path.replace(/\\/g, '/').toLowerCase() === 'package.json')) {
+          mergeOwnedPackageJson = true;
+        }
+        scaffoldWrotePackageJson = written.some(path => path.replace(/\\/g, '/').toLowerCase() === 'package.json');
+        const ownedNote = scaffoldPlan.ownedSkips.length
+          ? ` Worker-owned files left for their tasks: ${scaffoldPlan.ownedSkips.join(', ')}.`
+          : '';
+        if (written.length || ownedNote) {
+          const scaffoldNote = written.length
+            ? `Scaffolded typescript before Pass 2: ${written.join(', ')}.${ownedNote}`
+            : `Scaffold skipped worker-owned files before Pass 2.${ownedNote}`;
+          logNoticeNow(scaffoldNote, run);
+          patchPipelineMsg({
+            display: written.length
+              ? `🧱 Ensured typescript scaffold before Pass 2 (${written.join(', ')})…`
+              : `🧱 Scaffold files are worker-owned or already on disk.`
+          });
+        }
       }
       beginActivity('pass2', skipPass1 ? 'Step workers' : 'Pass 2 — file workers');
 
@@ -3092,7 +4423,19 @@ ${instruction}`,
           assignmentWaveIndex.push(wi);
         }
       });
+      logRun({
+        kind: 'swarm-assign',
+        assignments: assignments.map((item, index) => ({
+          file: item.task.filePath,
+          node: item.node.name,
+          model: item.model,
+          wave: assignmentWaveIndex[index],
+          ...(item.skippedReason ? { skippedReason: item.skippedReason } : {}),
+          ...(item.usedFrontierBackup ? { frontierBackup: true } : {})
+        }))
+      });
       if (!assignments.length) {
+        hostLog('error', 'Swarm stopped: no workers were assigned.');
         patchPipelineMsg({
           display: 'No workers were assigned.',
           error: 'No workers were assigned. Open Hardware and check that a computer is online.'
@@ -3117,7 +4460,7 @@ ${instruction}`,
           agentHandle: 'coder',
           role: skipPass1
             ? 'Step dispatch'
-            : `Lead Architect · contract${architect?.usedFrontierBackup ? ' (frontier)' : ' (local)'}`,
+            : `Lead Architect · contract${leadLabel && isFrontierNode(leadLabel) ? ' (frontier)' : ' (local)'}`,
           status: 'completed',
           content: skipPass1
             ? `Pass 1 skipped (${manifest.tasks.length} files${waveLabel})`
@@ -3283,6 +4626,44 @@ ${instruction}`,
         completedPaths.push(...waveDone);
       }
 
+      let packageMerged = false;
+      if (mergeOwnedPackageJson && runLive(run)) {
+        const currentPkg = await readWorkspaceRel('package.json');
+        if (currentPkg) {
+          const packageHint = `${swarmTaskText}\n${manifest.contractCode || ''}\n${manifest.tasks
+            .map(task => task.instructions)
+            .join('\n')}`;
+          const mergedPkg = mergeEssentialWebPackageJson(currentPkg, packageHint);
+          if (mergedPkg.changed) {
+            const wrotePkg = await onApplyFileWrite('package.json', mergedPkg.content);
+            if (wrotePkg) {
+              packageMerged = true;
+              logNoticeNow(
+                'Merged essential Vite devDependencies and dev/build scripts into package.json.',
+                run
+              );
+            }
+          }
+        }
+      }
+      const workerWrotePackageJson = completedPaths.some(path => {
+        const norm = path.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+        return norm === 'package.json' || norm.endsWith('/package.json');
+      });
+      // A Swarm worker write goes through autoApplyWritableTools, which already npm-installs.
+      // Install again only when this run changed package.json after that, or the scaffold wrote it directly.
+      const workerAlreadyInstalled = workerWrotePackageJson && !packageMerged;
+      if (
+        runLive(run) &&
+        !workerAlreadyInstalled &&
+        (packageMerged || scaffoldWrotePackageJson || workerWrotePackageJson)
+      ) {
+        await installSwarmPackageDeps(
+          packageMerged ? 'package.json merge' : scaffoldWrotePackageJson ? 'scaffold package.json' : 'worker package.json'
+        );
+      }
+      if (!runLive(run)) return;
+
       // ── Stage 4: Verify (tsc only for TypeScript stacks) ──
       if (manifest.stack !== 'typescript' && manifest.verifyCommand) {
         patchPipelineMsg(m => ({
@@ -3290,7 +4671,7 @@ ${instruction}`,
           display: `${m.display || ''}\n\n🔍 Verifying ${manifest.stack}: \`${manifest.verifyCommand}\``
         }));
         const output = await executeTrackedCommand(manifest.verifyCommand);
-        const failed = /Exit code:\s*(?!0\b)\d+/i.test(output) || /timed out/i.test(output);
+        const failed = commandOutputFailed(output);
         patchPipelineMsg(m => ({
           ...m,
           display: failed
@@ -3311,14 +4692,43 @@ ${instruction}`,
 
         if (wsCheck.skipped) {
           // Missing tsconfig must fail — never treat skip as green.
+          const skippedOutput = wsCheck.output || 'no tsconfig.json — project typecheck skipped';
+          logRun({
+            kind: 'verify',
+            ok: false,
+            output: `skipped: ${skippedOutput}`,
+            fingerprint: 'skipped'
+          });
           patchPipelineMsg(m => ({
             ...m,
-            display: `⚠️ Conductor Swarm finished ${assignments.length} worker file(s), but project typecheck was skipped (${wsCheck.output || 'no tsconfig'}). Scaffold a tsconfig and re-run verify — this is NOT a pass.`
+            display: `⚠️ Conductor Swarm finished ${assignments.length} worker file(s), but project typecheck was skipped (${wsCheck.output || 'no tsconfig'}). Scaffold a tsconfig and re-run verify — this is NOT a pass.`,
+            error: skippedOutput.slice(0, 500)
           }));
         } else if (wsCheck.ok) {
           patchPipelineMsg(m => ({
             ...m,
             display: `✅ Conductor Swarm finished ${assignments.length} worker file(s). Workspace typecheck passed.`
+          }));
+        } else if (
+          wsCheck.timedOut ||
+          wsCheck.missingTsc ||
+          typesCannotResolve(`${wsCheck.output || ''}\n${wsCheck.error || ''}`)
+        ) {
+          const raw = `${wsCheck.output || ''}\n${wsCheck.error || ''}`.trim();
+          const shown = typesCannotResolve(raw)
+            ? annotateMissingDependencies(raw)
+            : raw ||
+              (wsCheck.timedOut ? 'Workspace typecheck timed out.' : 'TypeScript compiler is missing.');
+          logRun({
+            kind: 'verify',
+            ok: false,
+            output: shown,
+            fingerprint: errorFingerprint(parseCompilerErrors(shown))
+          });
+          patchPipelineMsg(m => ({
+            ...m,
+            display: `Workspace typecheck could not be repaired from source.\n\`\`\`\n${shown.slice(0, 2000)}\n\`\`\``,
+            error: shown.slice(0, 500)
           }));
         } else {
           const fpBefore = errorFingerprint(parseCompilerErrors(wsCheck.output || ''));
@@ -3424,6 +4834,28 @@ ${instruction}`,
                 ...m,
                 display: `Conductor Swarm finished — workspace typecheck passed after targeted repair.`
               }));
+            } else if (
+              runLive(run) &&
+              (recheck.timedOut ||
+                recheck.missingTsc ||
+                typesCannotResolve(`${recheck.output || ''}\n${recheck.error || ''}`))
+            ) {
+              const raw = `${recheck.output || ''}\n${recheck.error || ''}`.trim();
+              const shown = typesCannotResolve(raw)
+                ? annotateMissingDependencies(raw)
+                : raw ||
+                  (recheck.timedOut ? 'Workspace typecheck timed out.' : 'TypeScript compiler is missing.');
+              logRun({
+                kind: 'verify',
+                ok: false,
+                output: shown,
+                fingerprint: errorFingerprint(parseCompilerErrors(shown))
+              });
+              patchPipelineMsg(m => ({
+                ...m,
+                display: `Workspace typecheck could not be repaired from source.\n\`\`\`\n${shown.slice(0, 2000)}\n\`\`\``,
+                error: shown.slice(0, 500)
+              }));
             } else if (runLive(run)) {
               const fpAfter = errorFingerprint(parseCompilerErrors(recheck.output || ''));
               if (verifyFingerprintChanged(fpBefore, fpAfter)) {
@@ -3445,10 +4877,18 @@ ${instruction}`,
                       ? `Conductor Swarm finished — workspace typecheck passed after the second repair.`
                       : `Conductor Swarm finished with remaining type errors after two repairs.\n\`\`\`\n${(
                           recheck2.output || ''
-                        ).slice(0, 2000)}\n\`\`\``,
+                          ).slice(0, 2000)}\n\`\`\``,
                     ...(recheck2.ok
                       ? {}
                       : { error: (recheck2.output || 'Typecheck still failing.').slice(0, 500) })
+                  }));
+                } else if (runLive(run)) {
+                  patchPipelineMsg(m => ({
+                    ...m,
+                    display: `Conductor Swarm finished with type errors after repair that map to no swarm-owned file, so no second repair was run.\n\`\`\`\n${(
+                      recheck.output || ''
+                    ).slice(0, 2000)}\n\`\`\``,
+                    error: (recheck.output || 'Typecheck still failing.').slice(0, 500)
                   }));
                 }
               } else {
@@ -3471,7 +4911,7 @@ ${instruction}`,
       }
     } catch (err: any) {
       console.error('Pipeline error:', err);
-      window.electronAPI?.writeLog?.('error', `swarm: ${err?.message || err}`);
+      hostLog('error', `swarm: ${err?.message || err}`);
       patchPipelineMsg({
         display: 'Conductor Swarm stopped because of an error.',
         error: err?.message || String(err),
@@ -3500,6 +4940,7 @@ ${instruction}`,
         );
       }
     }
+    return agentMsgId;
     } finally {
       leaveConductorRun(entered.owned, entered.run.token);
     }
@@ -3507,62 +4948,8 @@ ${instruction}`,
 
   // ==========================================
   // STANDARD SINGLE-TASK EXECUTION (+ Planner → Coder)
+  // resolveRoute is defined with the other role-route helpers.
   // ==========================================
-
-  const resolveRoute = (userText: string, agent: AgentPersona) => {
-    const live = nodesRef.current;
-    const fitRole =
-      agent.handle === 'planner' || agent.id === 'planner'
-        ? 'planner'
-        : agent.handle === 'reviewer' || agent.id === 'reviewer'
-          ? 'reviewer'
-          : agent.handle === 'docs' || agent.id === 'docs'
-            ? 'docs'
-            : null;
-    if (autoSelectRef.current && (fitRole === 'planner' || fitRole === 'reviewer')) {
-      const picked = pickCapableReviewTarget(live, fitRole);
-      if (picked) {
-        return {
-          routedNode: picked.node,
-          routedModel: picked.model,
-          routedIsFrontier: picked.node.type === 'openai' || !!picked.node.apiKey
-        };
-      }
-    }
-    const requested = live.find(n => n.id === targetNodeIdRef.current);
-    const requestedOk = !!requested?.online && getEnabledModelsForNode(requested).length > 0;
-    let routedNode = autoSelectRef.current
-      ? selectBestEndpointForTask(userText, agent.handle, live)
-      : requestedOk
-        ? requested
-        : undefined;
-    if (!routedNode || !routedNode.online || getEnabledModelsForNode(routedNode).length === 0) {
-      const locals = live.filter(
-        n => n.online && !isFrontierNode(n) && getEnabledModelsForNode(n).length > 0
-      );
-      routedNode =
-        rankModelsForWeight(locals, fitRole === 'docs' ? 'medium' : 'heavy', {
-          role: fitRole || 'coder'
-        })?.node ||
-        live.find(n => n.online && getEnabledModelsForNode(n).length > 0);
-    }
-    if (!routedNode) return null;
-    const enabled = getEnabledModelsForNode(routedNode);
-    if (!enabled.length) return null;
-    const weight = fitRole === 'docs' ? 'medium' : 'heavy';
-    const manual = targetModelRef.current;
-    const routedModel = autoSelectRef.current
-      ? pickBestModelForComplexity(routedNode, weight) || enabled[0]
-      : enabled.includes(manual)
-        ? manual
-        : pickBestModelForComplexity(routedNode, weight) || enabled[0];
-    if (!routedModel || !enabled.includes(routedModel)) return null;
-    return {
-      routedNode,
-      routedModel,
-      routedIsFrontier: routedNode.type === 'openai' || !!routedNode.apiKey
-    };
-  };
 
   /** Single-node chat turn with optional plan/review/contract mode or locked approved plan. */
   const runSingleNodeTurn = async (opts: {
@@ -3587,6 +4974,11 @@ ${instruction}`,
     /** Keep a fix on the review model instead of the worker that wrote the files. */
     pinRoute?: { node: EndpointNode; model: string };
     /**
+     * Use pinRoute even when this role has a usable explicit pick.
+     * The stuck ladder sets this when it must leave the picked model.
+     */
+    forceRoute?: boolean;
+    /**
      * Cleared model context: system + this task packet only (no prior chat).
      * Use for Coder/Reviewer workers under Planner control.
      */
@@ -3597,6 +4989,8 @@ ${instruction}`,
     retriedSame?: boolean;
     /** Failover to another node already used. */
     failedOver?: boolean;
+    /** Run-log phase when this turn is a Full auto re-ask or similar. */
+    logPhase?: string;
     run?: ConductorRun;
   }): Promise<ChatMessage | undefined> => {
     const {
@@ -3615,9 +5009,13 @@ ${instruction}`,
       skipUserAppend,
       notice,
       pinRoute,
+      forceRoute,
       freshContext
     } = opts;
+    const { hostLog, logToolEvent } = scopeRunLog();
     const readOnlyMode = !!planMode || !!reviewMode || !!lockPlanMode || !!stepVerdictMode;
+    // Each review starts with a fresh read budget. Depth and command-fix counters stay put.
+    if (reviewMode || stepVerdictMode) resetReadOnlyContinues();
     const useFreshContext = !!(freshContext || ephemeralWorkerRef.current);
 
     const pinRole =
@@ -3628,14 +5026,63 @@ ${instruction}`,
           : agent.handle === 'docs' || agent.id === 'docs'
             ? 'docs'
             : 'coder';
-    const livePin = pinRoute ? liveRoutePin(nodesRef.current, pinRoute, pinRole) : undefined;
-    const route = livePin
+    routeEpochRef.current += 1;
+    const role = conductorRoleForPersona(agent);
+    const pickStatus = explicitPickStatus(nodesRef.current, roleRoutesRef.current, role);
+    const explicitUsable = pickStatus?.ok === true;
+    // forceRoute means this pin, not a larger model liveRoutePin might swap in.
+    let forcedExact: { node: EndpointNode; model: string } | undefined;
+    if (forceRoute && pinRoute) {
+      const live = nodesRef.current.find(n => n.id === pinRoute.node.id);
+      const pinOk = !!live?.online && getEnabledModelsForNode(live).includes(pinRoute.model);
+      if (pinOk && live) {
+        forcedExact = { node: live, model: pinRoute.model };
+      } else {
+        logRoute('fallback', {
+          text: `Forced route ${pinRoute.node.name} / ${pinRoute.model} is not usable.`,
+          nodeId: pinRoute.node.id,
+          nodeName: pinRoute.node.name,
+          model: pinRoute.model
+        });
+      }
+    }
+    const honorPin = !!pinRoute && !forceRoute && !explicitUsable;
+    const livePin = honorPin && pinRoute ? liveRoutePin(nodesRef.current, pinRoute, pinRole) : undefined;
+    if (
+      honorPin &&
+      pinRoute &&
+      livePin &&
+      (livePin.node.id !== pinRoute.node.id || livePin.model !== pinRoute.model)
+    ) {
+      logRoute('pin', {
+        text: `${pinRoute.node.name}/${pinRoute.model} -> ${livePin.node.name}/${livePin.model}`,
+        nodeId: livePin.node.id,
+        nodeName: livePin.node.name,
+        model: livePin.model
+      });
+    }
+    if (pickStatus && !pickStatus.ok && livePin) {
+      noteRoleFallback(role, pickStatus.reason, { node: livePin.node, model: livePin.model });
+    }
+    const route = forcedExact
       ? {
-          routedNode: livePin.node,
-          routedModel: livePin.model,
-          routedIsFrontier: livePin.node.type === 'openai' || !!livePin.node.apiKey
+          routedNode: forcedExact.node,
+          routedModel: forcedExact.model,
+          routedIsFrontier: isFrontierNode(forcedExact.node)
         }
-      : resolveRoute(userText, agent);
+      : explicitUsable && !forceRoute && pickStatus?.ok
+      ? {
+          routedNode: pickStatus.node,
+          routedModel: pickStatus.model,
+          routedIsFrontier: isFrontierNode(pickStatus.node)
+        }
+      : livePin
+        ? {
+            routedNode: livePin.node,
+            routedModel: livePin.model,
+            routedIsFrontier: isFrontierNode(livePin.node)
+          }
+        : resolveRoute(userText, agent);
     if (!route) {
       setMessages(prev => [
         ...prev,
@@ -3666,8 +5113,6 @@ ${instruction}`,
     }
 
     const { routedNode, routedModel, routedIsFrontier } = route;
-    if (routedNode.id !== targetNodeId) setTargetNodeId(routedNode.id);
-    if (routedModel !== targetModel) setTargetModel(routedModel);
 
     const createIntent = !readOnlyMode && looksLikeCreateIntent(userText);
     const userMsg: ChatMessage = {
@@ -3696,7 +5141,22 @@ ${instruction}`,
       ...(notice ? { notice } : {})
     };
 
-    const entered = bindRun(opts.run ?? null, false);
+    const turnPhase =
+      opts.logPhase ||
+      (finalSourceReview
+        ? 'final-review'
+        : stepVerdictMode
+          ? 'verdict'
+          : reviewMode
+            ? 'review'
+            : lockPlanMode
+              ? 'lock-plan'
+              : contractMode
+                ? 'contract'
+                : planMode
+                  ? 'plan'
+                  : 'coder');
+    const entered = bindRun(opts.run ?? null, false, turnPhase);
     if (!entered) return;
     const run = entered.run;
     if (!runLive(run)) {
@@ -3712,6 +5172,8 @@ ${instruction}`,
     let turnError = '';
     let handedOff = '';
     let retryBubble = '';
+    /** The stream was aborted for repeating itself while the run was still live (not a Stop). */
+    let repeatAborted = false;
     const workCardIndex = () =>
       workCard ? findNodeWorkIndex(nodeWorkStepsRef.current, { ...workCard, role: '' }) : -1;
     const settleWorkCard = (status: 'completed' | 'failed', content: string) => {
@@ -3840,7 +5302,15 @@ ${instruction}`,
       let historySent = fittedPrompt.history;
       if (fittedPrompt.note) {
         setExecutingPlanNotice(fittedPrompt.note);
-        window.electronAPI?.writeLog?.('info', fittedPrompt.note);
+        hostLog('info', fittedPrompt.note);
+        logContext('fit', fittedPrompt.note, {
+          numCtx: turnReq.pinnedCtx,
+          promptBudget: turnReq.promptBudget,
+          estPromptTokens: estimateTurnTokens(
+            [systemPrompt, fittedPrompt.userContent],
+            routedModel
+          )
+        });
       }
       if (stopRequestedRef.current) return undefined;
 
@@ -3951,11 +5421,30 @@ ${instruction}`,
         routedNode.type,
         routedNode.apiKey
       );
-      const taken = await awaitConductorChat(openTurn, {
-        registerAbort,
-        live: () => runLive(run)
-      });
-      if (taken.aborted || !runLive(run)) return;
+      const taken = await takeChat(
+        {
+          phase: turnPhase,
+          role: turnRole,
+          nodeId: routedNode.id,
+          nodeName: routedNode.name,
+          model: routedModel,
+          numCtx: turnOptions.num_ctx,
+          promptBudget: turnReq.promptBudget,
+          estPromptTokens: estimateTurnTokens(
+            conversationPayload.map(message => message.content),
+            routedModel
+          )
+        },
+        openTurn,
+        () => runLive(run)
+      );
+      if (taken.aborted || !runLive(run)) {
+        if (runLive(run)) {
+          turnError = 'Model output repeated itself; aborted';
+          repeatAborted = true;
+        }
+        return;
+      }
       let result = taken.result;
       if (
         !routedIsFrontier &&
@@ -3964,13 +5453,21 @@ ${instruction}`,
       ) {
         const note = `Context monitor: ${routedModel} filled ${turnOptions.num_ctx} tokens. Resubmitting a smaller packet.`;
         setExecutingPlanNotice(note);
-        window.electronAPI?.writeLog?.('info', note);
+        hostLog('info', note);
         userContent = shrinkUserPacket(userContent, 2);
         historySent = [];
         conversationPayload = [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userContent }
         ];
+        logContext('resubmit', note, {
+          numCtx: turnOptions.num_ctx,
+          promptBudget: turnReq.promptBudget,
+          estPromptTokens: estimateTurnTokens(
+            conversationPayload.map(message => message.content),
+            routedModel
+          )
+        });
         const retryBody = withThink(
           {
             model: routedModel,
@@ -3981,7 +5478,20 @@ ${instruction}`,
           routedModel,
           turnRole
         );
-        const retried = await awaitConductorChat(
+        const retried = await takeChat(
+          {
+            phase: 'context-resubmit',
+            role: turnRole,
+            nodeId: routedNode.id,
+            nodeName: routedNode.name,
+            model: routedModel,
+            numCtx: turnOptions.num_ctx,
+            promptBudget: turnReq.promptBudget,
+            estPromptTokens: estimateTurnTokens(
+              conversationPayload.map(message => message.content),
+              routedModel
+            )
+          },
           () =>
             streamChat(
               routedNode.url,
@@ -3990,9 +5500,15 @@ ${instruction}`,
               routedNode.type,
               routedNode.apiKey
             ),
-          { registerAbort, live: () => runLive(run) }
+          () => runLive(run)
         );
-        if (retried.aborted || !runLive(run)) return;
+        if (retried.aborted || !runLive(run)) {
+          if (runLive(run)) {
+            turnError = 'Model output repeated itself; aborted';
+            repeatAborted = true;
+          }
+          return;
+        }
         result = retried.result;
       }
       if (!runLive(run)) return;
@@ -4016,7 +5532,10 @@ ${instruction}`,
       let tools = collapseDuplicateReadTools(finalParsed.toolCalls);
       if (!readOnlyMode && !continuationClosedWrite(result.content, finished) && hasUnclosedWrite(finished)) {
         const truncated = truncatedWriteToolCall(finished, agentMsgId);
-        if (truncated) tools = [...tools, truncated];
+        if (truncated) {
+          tools = [...tools, truncated];
+          logToolEvent(truncated);
+        }
       }
       if (readOnlyMode) {
         // Planner / Reviewer: explore only — drop accidental write/edit/run tools
@@ -4030,7 +5549,7 @@ ${instruction}`,
       tools = readPass.tools;
       if (!runLive(run)) return;
 
-      if (!readOnlyMode && autoApplyWritesRef.current) {
+      if (!readOnlyMode && autoApplyOn()) {
         tools = await autoApplyWritableTools(tools, toolDepsRef.current);
         if (!runLive(run)) return;
         tools = await runAuxTools(tools, toolDepsRef.current);
@@ -4061,13 +5580,7 @@ ${instruction}`,
           ? parsePlanOptions(finished)
           : [];
       const reviewPlan =
-        reviewMode && !stepVerdictMode
-          ? parseReviewPlan(finished) ||
-            ({
-              summary: 'No structured issues found.',
-              tasks: []
-            } as const)
-          : null;
+        reviewMode && !stepVerdictMode ? parseReviewPlan(finished) : null;
       const parsedVerdict = stepVerdictMode ? parseStepVerdict(finished) : null;
       let displayText = safeAssistantDisplay(
         { ...finalParsed, toolCalls: tools },
@@ -4122,7 +5635,9 @@ ${instruction}`,
         ...(notice ? { notice } : {})
       };
 
-      setMessages(prev => prev.map(m => (m.id === agentMsgId ? origin : m)));
+      const originMessages = messagesRef.current.map(m => (m.id === agentMsgId ? origin : m));
+      messagesRef.current = originMessages;
+      setMessages(originMessages);
       originOut = origin;
 
       // Surface Reviewer fix tasks under Conductor immediately (not only after Send).
@@ -4200,9 +5715,10 @@ ${instruction}`,
         workCardSettled = true;
       }
 
+      const reviewReadCap =
+        reviewMode || stepVerdictMode ? 1 : planMode || lockPlanMode ? 2 : undefined;
       const turnContinueOpts = continueDecisionOpts(undefined, {
-        maxReadOnlyContinues:
-          reviewMode || stepVerdictMode ? 1 : planMode || lockPlanMode ? 2 : undefined
+        maxReadOnlyContinues: reviewReadCap
       });
       const continueRole =
         (agent.handle as 'planner' | 'reviewer' | 'coder' | 'docs') ||
@@ -4211,6 +5727,19 @@ ${instruction}`,
           : reviewMode || stepVerdictMode
             ? 'reviewer'
             : 'coder');
+      const activeReviewStepId = getActiveStep(plannerPlanRef.current)?.id;
+      const reviewNeedsVerdictNow =
+        (!!reviewMode || !!stepVerdictMode) &&
+        needsReviewVerdictTurn({
+          reviewMode: !!reviewMode || !!stepVerdictMode,
+          stepVerdictMode: !!stepVerdictMode,
+          finalSourceReview: !!finalSourceReview,
+          tools,
+          raw: finished,
+          readOnlyContinues: turnContinueOpts.readOnlyContinues,
+          maxReadOnlyContinues: reviewReadCap ?? 1,
+          activeStepId: activeReviewStepId != null ? String(activeReviewStepId) : undefined
+        });
       if (!runLive(run)) return;
       if (!readOnlyMode && shouldContinueFromTools(tools, turnContinueOpts)) {
         await continueWithToolResults(origin, {
@@ -4224,9 +5753,13 @@ ${instruction}`,
           freshContext: useFreshContext,
           run
         });
-      } else if (readOnlyMode && shouldContinueFromTools(tools, turnContinueOpts)) {
-        // Planner/Reviewer: bounded explore continues, then they must emit the plan
-        await continueWithToolResults(origin, {
+      } else if (
+        readOnlyMode &&
+        (shouldContinueFromTools(tools, turnContinueOpts) || reviewNeedsVerdictNow)
+      ) {
+        // Planner/Reviewer: bounded explore continues, then they must emit the plan.
+        // A spent read cap with no verdict tag gets one answer turn and no tool execution.
+        const continued = await continueWithToolResults(origin, {
           createIntent: false,
           node: routedNode,
           model: routedModel,
@@ -4234,34 +5767,89 @@ ${instruction}`,
           lockPlanMode: !!lockPlanMode,
           reviewMode: !!reviewMode || !!stepVerdictMode,
           stepVerdictMode: !!stepVerdictMode,
+          finalSourceReview: !!finalSourceReview,
           freshContext: useFreshContext,
+          verdictNow: reviewNeedsVerdictNow && !shouldContinueFromTools(tools, turnContinueOpts),
           run
         });
-        // After tool continuations, refresh reviewPlan from latest follow-up if reviewer
-        if (reviewMode && !stepVerdictMode) {
-          const latest = [...messagesRef.current].reverse().find(
-            m => m.personaHandle === 'reviewer' && m.role === 'assistant'
+        if (continued) originOut = continued;
+        // Parse the returned follow-up. messagesRef can still be behind a React updater.
+        if (reviewMode && !stepVerdictMode && continued) {
+          const fromRaw = parseReviewPlan(continued.raw || '');
+          const rp = coerceDirtyReviewPlan(
+            fromRaw,
+            `${continued.display || ''}\n${continued.raw || ''}`
           );
-          if (latest) {
-            const rp = coerceDirtyReviewPlan(
-              latest.reviewPlan || parseReviewPlan(latest.raw || ''),
-              `${latest.display || ''}\n${latest.raw || ''}`
-            );
-            originOut = { ...latest, reviewPlan: rp };
-            setMessages(prev =>
-              prev.map(m => (m.id === latest.id ? { ...m, reviewPlan: rp } : m))
-            );
-            if (rp?.tasks?.length && !hasOpenTasks(executionQueueRef.current)) {
-              commitExecutionQueue(createQueueFromReviewPlan(rp, latest.id));
+          const stamped = fromRaw || rp.tasks.length > 0 ? rp : null;
+          if (stamped) {
+            const patched = { ...continued, reviewPlan: stamped };
+            originOut = patched;
+            if (conversationIdRef.current === run.conversationId) {
+              const next = messagesRef.current.some(m => m.id === patched.id)
+                ? messagesRef.current.map(m => (m.id === patched.id ? patched : m))
+                : [...messagesRef.current, patched];
+              messagesRef.current = next;
+              setMessages(next);
+            }
+            if (stamped.tasks.length > 0 && !hasOpenTasks(executionQueueRef.current)) {
+              commitExecutionQueue(createQueueFromReviewPlan(stamped, continued.id));
+            }
+          }
+        }
+        if (stepVerdictMode) {
+          const fromRef = messagesFromOrigin(messagesRef.current, agentMsgId);
+          const pool =
+            continued && !fromRef.some(m => m.id === continued.id)
+              ? [...fromRef, continued]
+              : fromRef.length
+                ? fromRef
+                : continued
+                  ? [continued]
+                  : [];
+          const active = getActiveStep(plannerPlanRef.current);
+          const picked = pickExplicitStepVerdict(pool, active?.id);
+          if (picked) {
+            const packedVerdict = {
+              stepId: String(active?.id || picked.parsed.stepId || ''),
+              stepTitle: active?.title || 'Step',
+              result: picked.parsed.result,
+              notes: picked.parsed.notes
+            };
+            originOut = { ...picked.message, stepVerdict: packedVerdict };
+            if (conversationIdRef.current === run.conversationId) {
+              const next = messagesRef.current.some(m => m.id === picked.message.id)
+                ? messagesRef.current.map(m =>
+                    m.id === picked.message.id ? { ...m, stepVerdict: packedVerdict } : m
+                  )
+                : [...messagesRef.current, originOut];
+              messagesRef.current = next;
+              setMessages(next);
             }
           }
         }
       }
+      if (planMode && !lockPlanMode && runLive(run)) {
+        await maybeFullAutoPickPlan(run, originOut);
+      }
     } catch (err: any) {
       const errText = String(err?.message || err || '');
       turnError = errText;
-      window.electronAPI?.writeLog?.('error', `single-node ${routedNode?.name || ''}: ${errText}`);
-      if (runLive(run) && !opts.retriedSame) {
+      hostLog('error', `single-node ${routedNode?.name || ''}: ${errText}`);
+      const willRetryHere = runLive(run) && !opts.retriedSame;
+      const willFailover =
+        runLive(run) &&
+        !opts.failedOver &&
+        !!pickFailoverTarget(nodesRef.current, routedNode.id, routedModel, { role: pinRole });
+      if (planMode && !lockPlanMode && !willRetryHere && !willFailover) {
+        releaseStashedPlanChoice();
+      }
+      if (willRetryHere) {
+        logRoute('retry', {
+          text: errText.slice(0, 300),
+          nodeId: routedNode.id,
+          nodeName: routedNode.name,
+          model: routedModel
+        });
         retryBubble = `Retrying ${routedNode.name}…`;
         setMessages(prev =>
           prev.map(m =>
@@ -4269,7 +5857,10 @@ ${instruction}`,
           )
         );
         await new Promise(r => setTimeout(r, 400));
-        if (!runLive(run)) return originOut;
+        if (!runLive(run)) {
+          if (planMode && !lockPlanMode) releaseStashedPlanChoice();
+          return originOut;
+        }
         handedOff = `retried on ${routedNode.name}`;
         return await runSingleNodeTurn({
           ...opts,
@@ -4287,6 +5878,25 @@ ${instruction}`,
           getEnabledModelsForNode(fail.node).includes(fail.model) &&
           (fail.node.id !== routedNode.id || fail.model !== routedModel)
         ) {
+          logRoute('failover', {
+            text: `${routedNode.name} -> ${fail.node.name}`,
+            nodeId: fail.node.id,
+            nodeName: fail.node.name,
+            model: fail.model
+          });
+          const leavingPick = explicitRolePick(roleRoutesRef.current, role);
+          if (
+            leavingPick &&
+            leavingPick.nodeId === routedNode.id &&
+            leavingPick.model === routedModel
+          ) {
+            logRoute('fallback', {
+              text: `${role} pick failed on ${routedNode.name} / ${routedModel}. Using ${fail.node.name} / ${fail.model}.`,
+              nodeId: fail.node.id,
+              nodeName: fail.node.name,
+              model: fail.model
+            });
+          }
           retryBubble = `Rerouting to ${fail.node.name}…`;
           setMessages(prev =>
             prev.map(m =>
@@ -4302,6 +5912,7 @@ ${instruction}`,
             retriedSame: true,
             failedOver: true,
             pinRoute: { node: fail.node, model: fail.model },
+            forceRoute: true,
             notice: `Rerouted to ${fail.node.name}`
           });
         }
@@ -4334,7 +5945,9 @@ ${instruction}`,
         // The retry or reroute answers in its own bubble; this one must not keep saying it is retrying.
         const outcome = handedOff
           ? `${routedNode.name} failed (${turnError.slice(0, 160)}) — ${handedOff}.`
-          : 'Stopped.';
+          : repeatAborted
+            ? 'Model output repeated itself; aborted'
+            : 'Stopped.';
         setMessages(prev =>
           prev.map(m => (m.id === agentMsgId && m.display === retryBubble ? { ...m, display: outcome } : m))
         );
@@ -4352,9 +5965,15 @@ ${instruction}`,
   const sendReviewPlanToPlanner = async (
     planMsg?: ChatMessage | null,
     resumeDepth?: number,
-    reviewNotes?: string
-  ) => {
+    reviewNotes?: string,
+    parent?: ConductorRun | null
+  ): Promise<void> => {
     if (planMsg?.reviewSentToCoder && !executionQueueRef.current) return;
+    const entered = bindRun(parent ?? null, !parent, 'review');
+    if (!entered) return;
+    const run = entered.run;
+    try {
+    if (!runLive(run)) return;
 
     const depth =
       resumeDepth ?? pendingReviewResumeRef.current?.depth ?? 0;
@@ -4371,7 +5990,7 @@ ${instruction}`,
     if (!task || task.status === 'completed') {
       const next = pickNextPending(queue);
       if (!next) {
-        if (autoReviewRef.current) await decideNextStepAndAdvance(depth, '');
+        if (autoReviewOn()) await decideNextStepAndAdvance(depth, '', run);
         return;
       }
       queue = markInProgress(queue, next.id);
@@ -4399,7 +6018,7 @@ ${instruction}`,
     const activeTaskId = task.id;
     const taskConversationId = conversationIdRef.current;
     const stoppedMidTask = () => {
-      if (!stopRequestedRef.current) return false;
+      if (runLive(run)) return false;
       // After a chat switch the queue ref holds the other chat's tasks.
       if (conversationIdRef.current !== taskConversationId) return true;
       const q = executionQueueRef.current;
@@ -4421,7 +6040,6 @@ ${instruction}`,
 
     onSelectAgent(plannerAgent.id);
     resetAgentLoopBudget();
-    stopRequestedRef.current = false;
 
     const plannerPrompt = formatReviewPlanForPlanner(
       singlePlan,
@@ -4447,10 +6065,10 @@ ${instruction}`,
       await handleSendPipelineMessage(
         `Review fix task #${task.id}: ${task.title}`,
         plannerPrompt,
-        { approvedPlan: syntheticPlan, skipUserAppend: true }
+        { approvedPlan: syntheticPlan, skipUserAppend: true, run }
       );
       if (!stoppedMidTask()) {
-        await reviewAndAdvance(depth + 1, `Task #${task.id}: ${task.title}`);
+        await reviewAndAdvance(depth + 1, `Task #${task.id}: ${task.title}`, run);
       }
       return;
     }
@@ -4463,7 +6081,8 @@ ${instruction}`,
       reviewMode: false,
       contractMode: true,
       skipUserAppend: true,
-      notice: `Planner locking fix contract — task #${task.id}`
+      notice: `Planner locking fix contract — task #${task.id}`,
+      run
     });
 
     if (stoppedMidTask()) return;
@@ -4493,18 +6112,36 @@ ${instruction}`,
       contractMode: false,
       approvedPlan: approvedPlanRef.current,
       notice: `Coder implementing task #${task.id}`,
-      freshContext: true
+      freshContext: true,
+      run
     });
     if (!stoppedMidTask()) {
-      await reviewAndAdvance(depth + 1, `Task #${task.id}: ${task.title}`);
+      await reviewAndAdvance(depth + 1, `Task #${task.id}: ${task.title}`, run);
     }
-    restorePlannerControl();
+    if (runIsCurrent(run.token) || !heldRef.current) restorePlannerControl();
+    } finally {
+      leaveConductorRun(entered.owned, run.token);
+    }
   };
 
   /** User approved a clean review — resume next-step continuation. */
   const continueAfterCleanReview = async (planMsg: ChatMessage) => {
     if (!planMsg.reviewNeedsContinue) return;
     const resume = pendingReviewResumeRef.current;
+    const entered = bindRun(null, true, 'continue');
+    if (!entered) return;
+    const restoreCard = () => {
+      pendingReviewResumeRef.current = resume;
+      setMessages(prev => {
+        const next = prev.map(m =>
+          m.id === planMsg.id
+            ? { ...m, reviewSentToCoder: false, reviewNeedsContinue: true }
+            : m
+        );
+        messagesRef.current = next;
+        return next;
+      });
+    };
     pendingReviewResumeRef.current = null;
     setMessages(prev => {
       const next = prev.map(m =>
@@ -4515,22 +6152,171 @@ ${instruction}`,
       messagesRef.current = next;
       return next;
     });
-    setExecutingPlanNotice('Continuing after clean review…');
-    await decideNextStepAndAdvance(resume?.depth ?? 0, resume?.previousTask ?? '');
+    try {
+      setExecutingPlanNotice('Continuing after clean review…');
+      await decideNextStepAndAdvance(
+        resume?.depth ?? 0,
+        resume?.previousTask ?? '',
+        entered.run
+      );
+      if (!runLive(entered.run)) restoreCard();
+    } catch (err) {
+      restoreCard();
+      throw err;
+    } finally {
+      leaveConductorRun(entered.owned, entered.run.token);
+    }
+  };
+
+  /**
+   * After the non-plan continuation stops, typecheck a workspace that has tsconfig.json.
+   * Full auto may spend up to two coder heals, then the errors stay on the chat card.
+   * Returns a notice when the check failed or was skipped. Null when it passed or did not apply.
+   */
+  const verifyTypescriptBeforeFinish = async (run: ConductorRun): Promise<string | null> => {
+    const { logRun } = scopeRunLog();
+    if (!runLive(run) || isPlanActive(plannerPlanRef.current)) return null;
+    if (!workspacePath || !window.electronAPI?.typecheckWorkspace || !window.electronAPI.readFile) return null;
+    const root = workspacePath.replace(/[\\/]+$/, '');
+    const sep = root.includes('\\') ? '\\' : '/';
+    let tsconfig = '';
+    try {
+      const res = await window.electronAPI.readFile(`${root}${sep}tsconfig.json`);
+      tsconfig = res?.content || '';
+    } catch {
+      tsconfig = '';
+    }
+    if (!String(tsconfig).trim()) {
+      if (projectBrainRef.current.stack === 'typescript') {
+        logRun({
+          kind: 'verify',
+          ok: false,
+          output: 'skipped: no tsconfig.json',
+          fingerprint: 'skipped'
+        });
+        return 'Workspace typecheck skipped — no tsconfig.json';
+      }
+      return null;
+    }
+
+    const runCheck = async () => {
+      if (!runLive(run) || !window.electronAPI?.typecheckWorkspace || !workspacePath) return null;
+      const check = await window.electronAPI.typecheckWorkspace(workspacePath, {
+        mode: 'workspace',
+        timeoutMs: 90000
+      });
+      if (!runLive(run)) return null;
+      const output = `${check.output || ''}\n${check.error || ''}`.trim();
+      const blocked = !!check.timedOut || !!check.missingTsc;
+      logRun({
+        kind: 'verify',
+        ok: check.ok === true && !check.skipped && !blocked,
+        output: check.skipped ? `skipped: ${output || 'no tsconfig.json'}` : output,
+        fingerprint: check.skipped ? 'skipped' : errorFingerprint(parseCompilerErrors(output))
+      });
+      return check;
+    };
+
+    const showFailure = (output: string) => {
+      const clipped = output.slice(0, 2000);
+      const cause = (output || 'Workspace typecheck failed.').slice(0, 500);
+      setMessages(prev => {
+        let target = -1;
+        for (let i = prev.length - 1; i >= 0; i--) {
+          if (prev[i]?.role === 'assistant') {
+            target = i;
+            break;
+          }
+        }
+        if (target < 0) return prev;
+        const next = prev.map((message, index) =>
+          index === target
+            ? {
+                ...message,
+                display: `${message.display || ''}\n\nWorkspace typecheck failed.\n\`\`\`\n${clipped}\n\`\`\``,
+                error: cause
+              }
+            : message
+        );
+        messagesRef.current = next;
+        return next;
+      });
+    };
+
+    let check = await runCheck();
+    if (!check || !runLive(run)) return null;
+    if (check.skipped) return 'Workspace typecheck skipped';
+    const maxHeals = 2;
+    let heals = 0;
+    while (
+      !check.ok &&
+      !check.skipped &&
+      autoReviewOn() &&
+      runLive(run) &&
+      finalVerifyHealsRef.current < maxHeals
+    ) {
+      const output = `${check.output || ''}\n${check.error || ''}`.trim();
+      // Timeouts, a missing compiler, and missing modules are not source rewrites.
+      if (check.timedOut || check.missingTsc || typesCannotResolve(output)) break;
+      finalVerifyHealsRef.current += 1;
+      heals += 1;
+      const errors = parseCompilerErrors(output);
+      const task = `Fix these TypeScript errors. Do not add features.\n\n${formatErrorsForCoder(errors, output)}`;
+      logRun({
+        kind: 'heal',
+        attempt: finalVerifyHealsRef.current,
+        max: maxHeals,
+        fingerprint: errorFingerprint(errors),
+        note: 'end-of-run workspace typecheck'
+      });
+      logNoticeNow(`Continuing — fix TypeScript errors (${finalVerifyHealsRef.current}/${maxHeals})`, run);
+      ephemeralWorkerRef.current = true;
+      await runSingleNodeTurn({
+        userText: `Continue: ${task}`,
+        fullPrompt: `NEXT STEP — fix the existing files with <edit_file>. Do not rewrite a file from scratch when a search/replace will do. Do not add a new feature.\n\n${task}`,
+        agent: coderAgent,
+        planMode: false,
+        approvedPlan: approvedPlanRef.current,
+        notice: `Continuing automatically — fix TypeScript errors (${finalVerifyHealsRef.current}/${maxHeals})`,
+        freshContext: true,
+        run
+      });
+      if (!runLive(run)) return null;
+      const again = await runCheck();
+      if (!again) return null;
+      check = again;
+    }
+    if (heals > 0) restorePlannerControl();
+    if (!runLive(run)) return null;
+    if (check.skipped) return 'Workspace typecheck skipped';
+    if (!check.ok) {
+      const output = `${check.output || ''}\n${check.error || ''}`.trim() || 'Workspace typecheck failed.';
+      if (check.timedOut || check.missingTsc) {
+        const note = check.timedOut
+          ? 'Workspace typecheck timed out.'
+          : 'TypeScript compiler is missing.';
+        showFailure(output || note);
+        return note;
+      }
+      showFailure(typesCannotResolve(output) ? annotateMissingDependencies(output) : output);
+      return 'Workspace typecheck failed';
+    }
+    return null;
   };
 
   /**
    * After a clean Reviewer pass (or user Continue), decide continue / ask / done.
-   * Does not write files — Reviewer → Planner → Coder owns fixes.
+   * The checker does not write files. A finished run may typecheck and heal.
    */
   const decideNextStepAndAdvance = async (
     depth: number,
     previousTask = '',
     parent?: ConductorRun | null
   ): Promise<void> => {
-    const entered = bindRun(parent ?? null, false);
+    const entered = bindRun(parent ?? null, false, 'continue');
     if (!entered) return;
     const run = entered.run;
+    const { logRun, hostLog } = scopeRunLog();
     try {
     if (!runLive(run)) return;
 
@@ -4538,7 +6324,7 @@ ${instruction}`,
     if (isPlanActive(plannerPlanRef.current)) {
       const step = getActiveStep(plannerPlanRef.current);
       if (step && (step.status === 'in_progress' || step.status === 'pending')) {
-        await dispatchActiveStep();
+        await dispatchActiveStep(run);
       } else if (plannerPlanRef.current?.status === 'completed') {
         setExecutingPlanNotice('Planner plan complete — ask Planner for the next feature if needed.');
       }
@@ -4547,12 +6333,12 @@ ${instruction}`,
 
     // Legacy flat queue still has work — Planner dispatches; do not invent a new feature step.
     if (hasOpenTasks(executionQueueRef.current)) {
-      await sendReviewPlanToPlanner(null, depth);
+      await sendReviewPlanToPlanner(null, depth, undefined, run);
       return;
     }
 
     const recent = messagesRef.current;
-    const target = pickCapableReviewTarget(nodesRef.current);
+    const target = roleTarget('reviewer', () => pickCapableReviewTarget(nodesRef.current));
     if (!target) return;
     const { node, model } = target;
     const touchedPaths = collectWrittenPaths(recent);
@@ -4592,7 +6378,7 @@ ${instruction}`,
       }
     }
     if (!runLive(run)) {
-      setIsStreaming(false);
+      if (runOwnsUi(run)) setIsStreaming(false);
       return;
     }
     const userContent = buildContinuationReviewPrompt({
@@ -4632,6 +6418,7 @@ ${instruction}`,
     let nextTask = '';
     let pinFix = false;
     let pinStuck: { node: EndpointNode; model: string } | undefined;
+    let stuckForceRoute = false;
     let handledLoop = false;
     try {
       const askModel = async (content: string, prior: { role: string; content: string }[]) => {
@@ -4645,22 +6432,35 @@ ${instruction}`,
           ...prior,
           { role: 'user', content }
         ];
+        const askOptions = chatOptions(node, model, 'reviewer', {
+          createIntent: false,
+          tier: contTier,
+          temperature: 0.2,
+          fallbackNumCtx: reviewerAgent.numCtx
+        });
         const body = withThink(
           {
             model,
             messages: askMsgs,
-            options: chatOptions(node, model, 'reviewer', {
-              createIntent: false,
-              tier: contTier,
-              temperature: 0.2,
-              fallbackNumCtx: reviewerAgent.numCtx
-            })
+            options: askOptions
           },
           node,
           model,
           'reviewer'
         );
-        const taken = await awaitConductorChat(
+        const taken = await takeChat(
+          {
+            phase: 'next-step',
+            role: 'reviewer',
+            nodeId: node.id,
+            nodeName: node.name,
+            model,
+            numCtx: askOptions.num_ctx,
+            estPromptTokens: estimateTurnTokens(
+              askMsgs.map(message => message.content),
+              model
+            )
+          },
           () =>
             streamChat(
               node.url,
@@ -4679,10 +6479,7 @@ ${instruction}`,
               node.type,
               node.apiKey
             ),
-          {
-            registerAbort,
-            live: () => runLive(run)
-          }
+          () => runLive(run)
         );
         if (taken.aborted) {
           return { content: '', thinking: '', aborted: true, stats: {} };
@@ -4743,21 +6540,63 @@ ${instruction}`,
           ? decision.task
           : '';
       const loopTask = stripKeepFixingPrefix(repeatTask || similarTask).trim();
-      if (loopTask) {
+      const recentWrites = latestStepWritePaths(messagesRef.current, [agentMsgId]);
+      const stuckNow =
+        !!loopTask &&
+        shouldEscalateStuck({
+          previousTask,
+          nextTask: loopTask,
+          recentWritePaths: recentWrites,
+          priorWritePaths: priorStepWritePaths(messagesRef.current, [agentMsgId])
+        });
+      if (stuckNow) {
         handledLoop = true;
         const key = stuckKey(loopTask);
         const stage: StuckStage = resolveStuckStage(stuckRef.current, key);
         let step = nextStuckStage(stage);
         stuckRef.current = { key, stage };
         const stuckPayload = `${progressForPrompt()}\n\nStuck step:\n${loopTask}`;
+        const coderRoute = latestCoderRoute(messagesRef.current, [agentMsgId]) || {
+          nodeId: node.id,
+          model
+        };
+        const sameRoute = (target?: { node: { id: string }; model: string } | null) =>
+          !!target && escalationMatchesRoute(coderRoute, { nodeId: target.node.id, model: target.model });
+        const coderPick = explicitRolePick(roleRoutesRef.current, 'coder');
+        const coderNode = coderPick ? nodesRef.current.find(item => item.id === coderPick.nodeId) : undefined;
+        const coderPickUsable = !!(
+          coderPick &&
+          coderNode?.online &&
+          getEnabledModelsForNode(coderNode).includes(coderPick.model)
+        );
+        const coderPickRoute =
+          coderPickUsable && coderNode && coderPick
+            ? { node: coderNode, model: coderPick.model }
+            : undefined;
         if (step === 'big') {
           const big = pickLargestLocalTarget(nodesRef.current);
-          if (big) {
+          const bigIsPicked =
+            !!coderPickRoute &&
+            !!big &&
+            escalationMatchesRoute(
+              { nodeId: coderPickRoute.node.id, model: coderPickRoute.model },
+              { nodeId: big.node.id, model: big.model }
+            );
+          if ((coderPickUsable && !bigIsPicked) || (big && sameRoute(big))) {
+            // Same node+model, or a different model than the Coder pick, is not a silent jump.
+            step = 'free';
+          } else if (big) {
             stuckRef.current.stage = 'big';
+            logRun({
+              kind: 'escalate',
+              text: `stuck big ${big.node.name} ${big.model}`,
+              stepId: activeStepId()
+            });
             handoff = true;
             nextTask = loopTask;
             pinFix = true;
             pinStuck = big;
+            stuckForceRoute = true;
             runTask = loopTask;
             options = [];
             display = `Stuck repeating. Retrying on ${big.node.name} · ${big.model} (${big.node.hardware?.vramGB || 0} GB) with a different approach.`;
@@ -4766,7 +6605,18 @@ ${instruction}`,
           }
         }
         if (step === 'free') {
+          const freeNode = pickFreeTierAssist(nodesRef.current, freeTierUsageFor);
+          if (freeNode && sameRoute(freeNode)) {
+            step = 'paid';
+          } else {
           stuckRef.current.stage = 'free';
+          logRun({
+            kind: 'escalate',
+            text: freeNode
+              ? `stuck free ${freeNode.node.name} ${freeNode.model}`
+              : 'stuck free',
+            stepId: activeStepId()
+          });
           let brief: string | null = null;
           try {
             brief = await requestFreeTierBrief(
@@ -4774,26 +6624,42 @@ ${instruction}`,
               stuckPayload
             );
           } catch (err: any) {
-            window.electronAPI?.writeLog?.('warn', `free-tier stuck: ${err?.message || err}`);
+            hostLog('warn', `free-tier stuck: ${err?.message || err}`);
           }
           if (brief) {
             const big = pickLargestLocalTarget(nodesRef.current);
             display = `Free-tier solution:\n\n${brief}`;
             options = [{ id: 'copy-solution', title: 'Copy solution', description: brief, action: 'copy' }];
-            if (big) {
+            const applyOn = coderPickRoute || big;
+            if (applyOn && !sameRoute(applyOn)) {
               handoff = true;
               nextTask = `Apply this solution. Do not repeat the failed approach.\n\n${brief}`;
               pinFix = true;
-              pinStuck = big;
               runTask = nextTask;
+              if (coderPickRoute) {
+                // Keep the explicit Coder pick instead of jumping to a larger local model.
+                pinStuck = coderPickRoute;
+                stuckForceRoute = true;
+              } else if (big) {
+                pinStuck = big;
+                stuckForceRoute = true;
+              }
             }
           } else {
             step = 'paid';
           }
+          }
         }
         if (step === 'paid') {
-          stuckRef.current.stage = 'paid';
           const paid = pickPaidFrontier(nodesRef.current);
+          stuckRef.current.stage = 'paid';
+          if (!(paid && sameRoute(paid))) {
+          logRun({
+            kind: 'escalate',
+            text: paid ? `stuck paid ${paid.node.name} ${paid.model}` : 'stuck paid',
+            stepId: activeStepId()
+          });
+          }
           const big = pickLargestLocalTarget(nodesRef.current);
           handoff = false;
           runTask = '';
@@ -4909,18 +6775,36 @@ ${instruction}`,
       } else if (options.length) {
         updateProgress(log => options.reduce((acc, option) => rememberAsked(acc, `${option.title}: ${option.description}`), log));
       }
+      if (runLive(run)) {
+      let finishNotice: string | null = null;
       if (!handledLoop && !runTask && (decision?.decision === 'done' || decision?.decision === 'ask' || options.length)) {
-        setExecutingPlanNotice(
-          decision?.decision === 'done' ? 'Work looks complete — optional next steps below' : 'Waiting for a choice'
-        );
+        finishNotice =
+          decision?.decision === 'done' ? 'Work looks complete — optional next steps below' : 'Waiting for a choice';
       } else if (handledLoop && options.some(o => o.action === 'paid')) {
-        setExecutingPlanNotice('Waiting for confirmation before a paid API call');
+        finishNotice = 'Waiting for confirmation before a paid API call';
+      }
+      const autoFinished =
+        !handoff &&
+        !handledLoop &&
+        !runTask &&
+        !isPlanActive(plannerPlanRef.current) &&
+        (decision?.decision === 'done' || capped);
+      if (autoFinished) {
+        const verifyNotice = await verifyTypescriptBeforeFinish(run);
+        if (!runLive(run)) finishNotice = null;
+        else if (verifyNotice) finishNotice = verifyNotice;
+      }
+      if (!runLive(run)) {
+        /* Stopped during verify — leave the status line alone. */
+      } else if (finishNotice) {
+        logNoticeNow(finishNotice, run);
       } else if (!handoff) {
         setExecutingPlanNotice(null);
       }
+      }
     } catch (err: any) {
       if (!runLive(run)) return;
-      window.electronAPI?.writeLog?.('error', `continuation check: ${err?.message || err}`);
+      hostLog('error', `continuation check: ${err?.message || err}`);
       setMessages(prev =>
         prev.map(m =>
           m.id === agentMsgId
@@ -4934,7 +6818,7 @@ ${instruction}`,
       );
       setExecutingPlanNotice(null);
     } finally {
-      if (!handoff) {
+      if (!handoff && runOwnsUi(run)) {
         setIsStreaming(false);
       }
     }
@@ -4942,9 +6826,10 @@ ${instruction}`,
     if (!handoff || !runLive(run)) return;
 
     const stuckTarget = pinStuck;
+    const running = stuckTarget;
     setExecutingPlanNotice(
-      stuckTarget
-        ? `Retrying on ${stuckTarget.node.name} — ${nextTask.slice(0, 90)}`
+      running
+        ? `Retrying on ${running.node.name} · ${running.model} — ${nextTask.slice(0, 90)}`
         : `Continuing — ${nextTask.slice(0, 110)}`
     );
     const planPrefix = approvedPlanRef.current
@@ -4961,14 +6846,14 @@ ${instruction}`,
       agent: coderAgent,
       planMode: false,
       approvedPlan: approvedPlanRef.current,
-      notice: stuckTarget
-        ? `Stuck-loop retry on ${stuckTarget.node.name} · ${stuckTarget.model}`
+      notice: running
+        ? `Stuck-loop retry on ${running.node.name} · ${running.model}`
         : pinFix
-          ? `Fixing on ${node.name} — ${nextTask.slice(0, 120)}`
+          ? `Fixing — ${nextTask.slice(0, 120)}`
           : `Continuing automatically — ${nextTask.slice(0, 140)}`,
       freshContext: true,
       run,
-      ...(stuckTarget ? { pinRoute: stuckTarget } : pinFix ? { pinRoute: { node, model } } : {})
+      ...(stuckTarget ? { pinRoute: stuckTarget, forceRoute: stuckForceRoute } : {})
     });
     if (!runLive(run)) {
       restorePlannerControl('Stopped — talk to Planner about what to do next.');
@@ -4991,13 +6876,19 @@ ${instruction}`,
     previousTask = '',
     parent?: ConductorRun | null
   ): Promise<void> => {
-    const entered = bindRun(parent ?? null, false);
+    const entered = bindRun(parent ?? null, false, 'review');
     if (!entered) return;
     const run = entered.run;
+    const { logRun } = scopeRunLog();
     try {
     if (!runLive(run)) return;
 
-    if (isPlanActive(plannerPlanRef.current)) {
+    const livePlan = plannerPlanRef.current;
+    // The review queue is mirrored into the plan panel. Its fix task is closed by the review_delta path.
+    const reviewQueueMirror =
+      !!executionQueueRef.current?.tasks.length &&
+      (livePlan?.activeStepId === 'review-fixes' || !!livePlan?.id?.startsWith('plan-review-'));
+    if (isPlanActive(livePlan) && !reviewQueueMirror) {
       await reviewActiveStep(run);
       return;
     }
@@ -5020,9 +6911,9 @@ ${instruction}`,
       );
     if (depth === 0 && !didWork) return;
 
-    const target = pickCapableReviewTarget(nodesRef.current);
+    const target = roleTarget('reviewer', () => pickCapableReviewTarget(nodesRef.current));
     if (!target) {
-      if (autoReviewRef.current) await decideNextStepAndAdvance(depth, previousTask, run);
+      if (autoReviewOn()) await decideNextStepAndAdvance(depth, previousTask, run);
       return;
     }
 
@@ -5043,13 +6934,15 @@ ${instruction}`,
       ? `Files just written/edited:\n${touchedPaths.slice(0, 12).join('\n')}`
       : 'No write/edit paths recorded — review the latest coding step from chat context.';
     setIsStreaming(true);
-    const filesBody = await buildTouchedFilesContext(workspacePath, touchedPaths, {
-      maxFiles: 8,
-      maxCharsPerFile: 5000,
-      maxTotalChars: 20000
-    });
+    const filesBody = await buildTouchedFilesContext(
+      workspacePath,
+      touchedPaths,
+      reviewPreloadCaps(
+        resolveModelFit(target.node, target.model, 'reviewer', reviewerAgent.numCtx).maxCtx
+      )
+    );
     if (!runLive(run)) {
-      setIsStreaming(false);
+      if (runOwnsUi(run)) setIsStreaming(false);
       return;
     }
 
@@ -5091,7 +6984,7 @@ Prefer the file contents above. At most two extra reads, then end with a <review
 This list will be kept by Planner — do not expect to replace it later. Do NOT write or edit files.`;
 
     setExecutingPlanNotice(
-      autoReviewRef.current
+      autoReviewOn()
         ? deltaMode
           ? `Reviewer verifying task #${activeTask!.id}…`
           : 'Reviewer checking the work…'
@@ -5124,21 +7017,34 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
         m => m.role === 'assistant' && (m.personaHandle === 'reviewer' || m.reviewPlan)
       );
     const rawBlob = `${latestReview?.display || ''}\n${latestReview?.raw || ''}`;
+    let missingReviewNoted = false;
+    const noteMissingReviewVerdict = (waiting = false) => {
+      if (missingReviewNoted) return;
+      missingReviewNoted = true;
+      logRun({
+        kind: 'verdict',
+        result: 'missing',
+        text: 'Reviewer gave no verdict'
+      });
+      setExecutingPlanNotice(
+        waiting ? MISSING_REVIEW_VERDICT_WAIT_NOTICE : MISSING_REVIEW_VERDICT_NOTICE
+      );
+    };
 
     // —— Delta path: update durable queue status; never reseed from a new full plan ——
     if (deltaMode && existingQueue && activeTask) {
       let delta = parseReviewDelta(latestReview?.raw || '');
       if (!delta) {
-        const parsedPlan =
-          latestReview?.reviewPlan ||
-          (latestReview ? parseReviewPlan(latestReview.raw || '') : null) ||
-          ({ summary: 'No structured issues found.', tasks: [] } as const);
+        const parsedPlan = latestReview ? parseReviewPlan(latestReview.raw || '') : null;
         const coerced = coerceDirtyReviewPlan(parsedPlan, rawBlob);
+        const missingClean =
+          nonPlanReviewLacksMarkup(latestReview?.raw || '') && coerced.tasks.length === 0;
+        if (missingClean) noteMissingReviewVerdict(!autoReviewOn());
         if (coerced.tasks.length === 0) {
           delta = {
             taskId: activeTask.id,
             verdict: 'completed',
-            notes: coerced.summary || 'Looks good.'
+            notes: missingClean ? 'Reviewer gave no verdict.' : coerced.summary || 'Looks good.'
           };
         } else {
           delta = {
@@ -5167,7 +7073,7 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
                   ...m,
                   reviewPlan: snap,
                   reviewSentToCoder: false,
-                  reviewNeedsContinue: !autoReviewRef.current
+                  reviewNeedsContinue: !autoReviewOn()
                 }
               : m
           );
@@ -5181,11 +7087,12 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
       const completed = after?.status === 'completed';
 
       if (failed) {
-        if (autoReviewRef.current) {
+        if (autoReviewOn()) {
           await sendReviewPlanToPlanner(
             latestReview ? { ...latestReview, reviewPlan: snap } : null,
             depth,
-            after?.failureNote
+            after?.failureNote,
+            run
           );
           return;
         }
@@ -5198,16 +7105,18 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
 
       if (completed) {
         if (hasOpenTasks(updated)) {
-          if (autoReviewRef.current) {
-            await sendReviewPlanToPlanner(null, depth);
+          if (autoReviewOn()) {
+            await sendReviewPlanToPlanner(null, depth, undefined, run);
             return;
           }
           pendingReviewResumeRef.current = { depth, previousTask };
-          setExecutingPlanNotice('Task done — Send to Planner for the next queued task');
+          if (!missingReviewNoted) {
+            setExecutingPlanNotice('Task done — Send to Planner for the next queued task');
+          }
           return;
         }
         // Queue finished
-        if (!autoReviewRef.current) {
+        if (!autoReviewOn()) {
           if (latestReview) {
             setMessages(prev => {
               const next = prev.map(m =>
@@ -5220,7 +7129,9 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
             });
           }
           pendingReviewResumeRef.current = { depth, previousTask };
-          setExecutingPlanNotice('All review tasks done — click Looks good / Continue');
+          if (!missingReviewNoted) {
+            setExecutingPlanNotice('All review tasks done — click Looks good / Continue');
+          }
           return;
         }
         await decideNextStepAndAdvance(depth, previousTask, run);
@@ -5229,11 +7140,12 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
     }
 
     // —— Seed path: first review creates the durable list once ——
-    const parsedPlan =
-      latestReview?.reviewPlan ||
-      (latestReview ? parseReviewPlan(latestReview.raw || '') : null) ||
-      ({ summary: 'No structured issues found.', tasks: [] } as const);
-    const plan = coerceDirtyReviewPlan(parsedPlan, rawBlob);
+    const parsedPlan = latestReview ? parseReviewPlan(latestReview.raw || '') : null;
+    let plan = coerceDirtyReviewPlan(parsedPlan, rawBlob);
+    if (nonPlanReviewLacksMarkup(latestReview?.raw || '') && plan.tasks.length === 0) {
+      noteMissingReviewVerdict(!autoReviewOn());
+      plan = { summary: 'Reviewer gave no verdict.', tasks: [] };
+    }
 
     if (plan.tasks.length > 0) {
       // Keep an existing unfinished queue; only seed when empty
@@ -5255,8 +7167,8 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
         ? { ...latestReview, reviewPlan: snap }
         : null;
 
-      if (autoReviewRef.current) {
-        await sendReviewPlanToPlanner(planMsg, depth);
+      if (autoReviewOn()) {
+        await sendReviewPlanToPlanner(planMsg, depth, undefined, run);
         return;
       }
       pendingReviewResumeRef.current = { depth, previousTask };
@@ -5264,7 +7176,12 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
       return;
     }
 
-    if (latestReview && (!latestReview.reviewPlan || latestReview.reviewPlan.tasks.length !== plan.tasks.length)) {
+    if (
+      latestReview &&
+      (!latestReview.reviewPlan ||
+        latestReview.reviewPlan.tasks.length !== plan.tasks.length ||
+        latestReview.reviewPlan.summary !== plan.summary)
+    ) {
       setMessages(prev => {
         const next = prev.map(m => (m.id === latestReview.id ? { ...m, reviewPlan: plan } : m));
         messagesRef.current = next;
@@ -5274,7 +7191,7 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
 
     const planMsg = latestReview ? { ...latestReview, reviewPlan: plan } : null;
 
-    if (!autoReviewRef.current) {
+    if (!autoReviewOn()) {
       if (planMsg) {
         setMessages(prev => {
           const next = prev.map(m =>
@@ -5287,7 +7204,9 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
         });
       }
       pendingReviewResumeRef.current = { depth, previousTask };
-      setExecutingPlanNotice('Review looks clean — click Looks good / Continue');
+      if (!missingReviewNoted) {
+        setExecutingPlanNotice('Review looks clean — click Looks good / Continue');
+      }
       return;
     }
 
@@ -5308,6 +7227,47 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
 
   const writesUnresolved = (tools: ToolCall[]) =>
     tools.length > 0 && tools.every(t => t.status !== 'done');
+
+  const isWriteTool = (name: string) => name === 'write_file' || name === 'edit_file';
+
+  const unresolvedWriteNotes = (tools: ToolCall[]) =>
+    nayNotesFromToolErrors(
+      tools.map(tool => {
+        const path = tool.args?.path ? ` ${tool.args.path}` : '';
+        const detail = String(tool.result || tool.status || 'pending').replace(/\s+/g, ' ').trim();
+        return `${tool.name}${path}: ${detail}`;
+      })
+    );
+
+  /** Writes from this coder turn, including tool-continuation follow-ups after the origin id. */
+  const writeToolsFromCoderOrigin = (origin: ChatMessage | undefined): ToolCall[] => {
+    if (!origin) return [];
+    const slice = messagesFromOrigin(messagesRef.current, origin.id);
+    const pool = slice.length ? slice : [origin];
+    const withOrigin = pool.some(message => message.id === origin.id) ? pool : [origin, ...pool];
+    return withOrigin.flatMap(message => (message.toolCalls || []).filter(tool => isWriteTool(tool.name)));
+  };
+
+  /** Swarm step cards carry the file result. A card that did not complete counts as an unresolved write. */
+  const writeToolsFromPipeline = (message: ChatMessage | undefined): ToolCall[] => {
+    const tools: ToolCall[] = [];
+    for (const step of message?.pipelineSteps || []) {
+      const writes = (step.toolCalls || []).filter(tool => isWriteTool(tool.name));
+      if (writes.length) {
+        tools.push(...writes);
+        continue;
+      }
+      if (step.status === 'completed') continue;
+      tools.push({
+        id: `swarm-${step.targetFile || step.nodeId}`,
+        name: 'write_file',
+        args: { path: step.targetFile || '' },
+        status: step.status === 'failed' ? 'error' : 'pending',
+        result: step.content || 'Swarm worker did not finish the file'
+      });
+    }
+    return tools;
+  };
 
   const snapshotStepFiles = async (stepId: string, rels: string[]) => {
     if (!workspacePath || !window.electronAPI?.readFile) return;
@@ -5339,12 +7299,22 @@ This list will be kept by Planner — do not expect to replace it later. Do NOT 
   };
 
   /** Dispatch the active Planner step to Coders (sequential single-node or Swarm for the step). */
-  const dispatchActiveStep = async (): Promise<void> => {
-    const entered = bindRun(null, false);
-    if (!entered) return;
+  const dispatchActiveStep = async (
+    parent?: ConductorRun | null,
+    opts?: { coderRetry?: boolean }
+  ): Promise<void> => {
+    const entered = bindRun(parent ?? null, false, 'coder');
+    if (!entered) {
+      if (parent && runOwnsUi(parent)) setPlanPaused(true);
+      return;
+    }
     const run = entered.run;
+    const { logRun } = scopeRunLog();
     try {
-    if (!runLive(run)) return;
+    if (!runLive(run)) {
+      if (runOwnsUi(run)) setPlanPaused(true);
+      return;
+    }
     let plan = plannerPlanRef.current;
     if (!plan || plan.status !== 'active') return;
 
@@ -5415,8 +7385,9 @@ ${progressForPrompt() || '(empty)'}`;
     );
 
     try {
+      let turnWrites: ToolCall[] = [];
       if (isPipelineMode && stepFiles.length > 0) {
-        await handleSendPipelineMessage(`Plan step #${step.id}: ${step.title}`, coderPrompt, {
+        const pipelineId = await handleSendPipelineMessage(`Plan step #${step.id}: ${step.title}`, coderPrompt, {
           approvedPlan: approvedPlanRef.current,
           skipUserAppend: true,
           run,
@@ -5425,8 +7396,12 @@ ${progressForPrompt() || '(empty)'}`;
             brief: formatStepForCoders(plan, step)
           }
         });
+        const pipelineMsg = pipelineId
+          ? messagesRef.current.find(message => message.id === pipelineId)
+          : undefined;
+        turnWrites = writeToolsFromPipeline(pipelineMsg);
       } else {
-        await runSingleNodeTurn({
+        const coderMsg = await runSingleNodeTurn({
           userText: `Implement plan step #${step.id}: ${step.title}`,
           fullPrompt: coderPrompt,
           agent: coderAgent,
@@ -5438,18 +7413,72 @@ ${progressForPrompt() || '(empty)'}`;
           primaryFile: stepFiles.length === 1 ? stepFiles[0] : undefined,
           run
         });
+        turnWrites = coderMsg
+          ? writeToolsFromCoderOrigin(coderMsg)
+          : [
+              {
+                id: `coder-unfinished-${step.id}`,
+                name: 'write_file',
+                args: { path: stepFiles[0] || '' },
+                status: 'error',
+                result: 'Coder turn did not finish'
+              }
+            ];
       }
+      coderTurnWritesRef.current = { stepId: String(step.id), tools: turnWrites };
 
       if (!runLive(run)) {
-        setPlanPaused(true);
-        setPlanResumePhase('coder', run.token);
-        restorePlannerControl(
-          `Paused during Coder on step #${step.id} — press Play to resume.`
-        );
+        if (runOwnsUi(run)) {
+          setPlanPaused(true);
+          setPlanResumePhase('coder', run.token);
+          restorePlannerControl(
+            `Paused during Coder on step #${step.id} — press Play to resume.`
+          );
+        }
         return;
       }
 
-      if (writesUnresolved(coderWriteTools())) {
+      const activeNow = getActiveStep(plannerPlanRef.current);
+      if (!activeNow || String(activeNow.id) !== String(step.id)) {
+        if (runOwnsUi(run)) {
+          setPlanPaused(true);
+          restorePlannerControl(
+            `Step #${step.id} was skipped or replaced while its Coder ran. Press Play for the active step.`
+          );
+        }
+        return;
+      }
+
+      if (writesUnresolved(turnWrites)) {
+        if (fullAutoRef.current && runLive(run)) {
+          if (!opts?.coderRetry && takeCoderRedispatchOnce(String(step.id))) {
+            setPlanPaused(false);
+            setExecutingPlanNotice(`Full auto: retrying Coder on step #${step.id}…`);
+            await dispatchActiveStep(run, { coderRetry: true });
+            if (!runLive(run)) {
+              giveBackCoderRedispatch(String(step.id));
+              if (runOwnsUi(run)) setPlanPaused(true);
+            }
+            return;
+          }
+          setPlanPaused(false);
+          logRun({
+            kind: 'info',
+            stepId: String(step.id),
+            text: 'Full auto: Nay because coder writes failed'
+          });
+          await applyStepVerdictAndContinue(
+            null,
+            {
+              stepId: String(step.id),
+              stepTitle: step.title,
+              result: 'nay',
+              notes: unresolvedWriteNotes(turnWrites)
+            },
+            run
+          );
+          return;
+        }
         setPlanResumePhase('coder', run.token);
         setPlanPaused(true);
         restorePlannerControl(
@@ -5468,9 +7497,11 @@ ${progressForPrompt() || '(empty)'}`;
       if (!runLive(run)) return;
       await reviewActiveStep(run);
     } catch (err: any) {
-      setPlanPaused(true);
-      setPlanResumePhase('coder', run.token);
-      restorePlannerControl(`Coder step failed: ${err?.message || err}`);
+      if (runOwnsUi(run)) {
+        setPlanPaused(true);
+        setPlanResumePhase('coder', run.token);
+        restorePlannerControl(`Coder step failed: ${err?.message || err}`);
+      }
       throw err;
     }
     } finally {
@@ -5480,6 +7511,7 @@ ${progressForPrompt() || '(empty)'}`;
 
   /** Reviewer Yay/Nay on the active Planner step. `parent` is the conductor run that owns this review. */
   const reviewActiveStep = async (parent?: ConductorRun | null): Promise<void> => {
+    const { logRun } = scopeRunLog();
     if (parent && !runLive(parent)) return;
     if (!parent && stopRequestedRef.current) return;
     const plan = plannerPlanRef.current;
@@ -5492,7 +7524,7 @@ ${progressForPrompt() || '(empty)'}`;
     }
     setPlanResumePhase('review');
 
-    const target = pickCapableReviewTarget(nodesRef.current);
+    const target = roleTarget('reviewer', () => pickCapableReviewTarget(nodesRef.current));
     if (!target) {
       setExecutingPlanNotice('No reviewer-capable node online for step verdict.');
       return;
@@ -5504,19 +7536,22 @@ ${progressForPrompt() || '(empty)'}`;
     const filesHint = reviewPaths.length
       ? `Files to verify:\n${reviewPaths.slice(0, 24).join('\n')}`
       : 'Review from chat context and the step task list.';
-    beginActivity('review', `Reviewer on step #${step.id}`, step.title);
+    const reviewFrame = beginActivity('review', `Reviewer on step #${step.id}`, step.title);
     const reviewFit = resolveModelFit(target.node, target.model, 'reviewer', reviewerAgent.numCtx);
     setIsStreaming(true);
     const filesBody = await buildTouchedFilesContext(
       workspacePath,
       reviewPaths,
-      reviewFit.tier === 'tight'
-        ? reviewFit.caps
-        : { maxFiles: 16, maxCharsPerFile: 10000, maxTotalChars: 64000 }
+      reviewPreloadCaps(
+        reviewFit.maxCtx,
+        reviewFit.tier === 'tight' ? reviewFit.caps.maxFiles : 16
+      )
     );
     if ((parent && !runLive(parent)) || (!parent && stopRequestedRef.current)) {
-      setIsStreaming(false);
-      endActivity();
+      if (!parent || runOwnsUi(parent)) {
+        setIsStreaming(false);
+        endActivity(reviewFrame);
+      }
       return;
     }
 
@@ -5549,7 +7584,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     onSelectAgent(reviewerAgent.id);
     onConversationPatch?.({ agentId: reviewerAgent.id });
     setExecutingPlanNotice(
-      autoReviewRef.current
+      autoReviewOn()
         ? `Reviewer Yay/Nay on step #${step.id}…`
         : `Reviewer checking step #${step.id} — waiting for your approval`
     );
@@ -5567,32 +7602,164 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       ...(parent ? { run: parent } : {})
     });
 
-    if ((parent && !runLive(parent)) || (!parent && stopRequestedRef.current)) {
-      endActivity();
-      setPlanPaused(true);
-      setPlanResumePhase('review');
-      restorePlannerControl(
-        `Paused during Review on step #${step.id} — press Play to resume.`
-      );
+    if (parent ? !runLive(parent) : stopRequestedRef.current) {
+      if (!parent || runOwnsUi(parent)) endActivity(reviewFrame);
+      if (!parent || runOwnsUi(parent)) {
+        setPlanPaused(true);
+        setPlanResumePhase('review');
+        restorePlannerControl(
+          `Paused during Review on step #${step.id} — press Play to resume.`
+        );
+      }
       return;
     }
-    endActivity();
+    endActivity(reviewFrame);
 
-    const latest =
-      reviewMsg ||
-      [...messagesRef.current].reverse().find(
-        m => m.role === 'assistant' && (m.stepVerdict || m.personaHandle === 'reviewer')
-      );
+    const located = reviewMsg ? messagesFromOrigin(messagesRef.current, reviewMsg.id) : [];
+    const pool =
+      reviewMsg && !located.some(message => message.id === reviewMsg.id)
+        ? [...located, reviewMsg]
+        : located.length
+          ? located
+          : reviewMsg
+            ? [reviewMsg]
+            : [];
+    const explicit = pickExplicitStepVerdict(pool, step.id);
+    const host = explicit?.message || newestReviewerMessage(pool) || reviewMsg;
+    const loose = explicit ? null : parseStepVerdict(host?.raw || '', { allowMissing: true });
+    const looseFits =
+      !!loose &&
+      (loose.result === 'yay' || loose.result === 'nay') &&
+      (!loose.stepId || String(loose.stepId) === String(step.id));
+    const parsedVerdict = explicit
+      ? explicit.parsed
+      : looseFits && loose
+        ? { stepId: String(step.id), result: loose.result, notes: loose.notes }
+        : {
+            stepId: String(step.id),
+            result: 'missing' as const,
+            notes: loose?.notes || 'Missing <step_verdict> markup. Ask for an explicit yay or nay.'
+          };
 
-    const parsedVerdict = latest?.stepVerdict
-      ? {
-          stepId: latest.stepVerdict.stepId,
-          result: latest.stepVerdict.result as 'yay' | 'nay' | 'missing',
-          notes: latest.stepVerdict.notes
-        }
-      : parseStepVerdict(latest?.raw || '', { allowMissing: true });
+    const acceptVerdict = async (
+      message: ChatMessage | undefined,
+      verdict: { stepId: string; result: 'yay' | 'nay'; notes: string }
+    ) => {
+      const packed = {
+        stepId: String(step.id),
+        stepTitle: step.title,
+        result: verdict.result,
+        notes: verdict.notes
+      };
+      const withVerdict = message
+        ? {
+            ...message,
+            stepVerdict: packed,
+            stepVerdictNeedsConfirm: !autoReviewOn(),
+            stepVerdictApplied: false
+          }
+        : null;
+      if (message && withVerdict) {
+        setMessages(prev => {
+          const next = prev.map(m => (m.id === message.id ? withVerdict : m));
+          messagesRef.current = next;
+          return next;
+        });
+      }
+      if (!autoReviewOn()) {
+        setPlanResumePhase('verdict');
+        setPlanPaused(true);
+        restorePlannerControl(
+          packed.result === 'yay'
+            ? `Step #${step.id} Yay — Accept on the card or press Play to continue`
+            : `Step #${step.id} Nay — Accept on the card or press Play to send fixes to Coder`
+        );
+        return;
+      }
+      if (!parent || !runLive(parent)) {
+        if (!parent || runOwnsUi(parent)) setPlanPaused(true);
+        return;
+      }
+      setPlanPaused(false);
+      await applyStepVerdictAndContinue(withVerdict, packed, parent);
+      if (!runLive(parent)) {
+        if (runOwnsUi(parent)) setPlanPaused(true);
+        return;
+      }
+      restorePlannerControl();
+    };
+
+    const nayFromReviewer = async (message: ChatMessage | undefined) => {
+      logRun({
+        kind: 'info',
+        stepId: String(step.id),
+        text: 'Full auto: Nay from reviewer prose'
+      });
+      await acceptVerdict(message, {
+        stepId: String(step.id),
+        result: 'nay',
+        notes: nayNotesFromReviewerProse(`${message?.display || ''}\n${message?.raw || ''}`)
+      });
+    };
 
     if (!parsedVerdict || parsedVerdict.result === 'missing') {
+      if (fullAutoRef.current && parent && runLive(parent)) {
+        if (verdictReaskAllowed(String(step.id))) {
+          setPlanPaused(false);
+          setExecutingPlanNotice(
+            `Full auto: asking the reviewer again for a Pass or Fail on step #${step.id}…`
+          );
+          const again = await runSingleNodeTurn({
+            userText: VERDICT_REASK_PROMPT,
+            fullPrompt: VERDICT_REASK_PROMPT,
+            agent: reviewerAgent,
+            reviewMode: true,
+            stepVerdictMode: true,
+            skipUserAppend: true,
+            notice: `Reviewer re-ask — step #${step.id}`,
+            logPhase: 'verdict-reask',
+            pinRoute: target,
+            freshContext: true,
+            run: parent
+          });
+          if (!runLive(parent)) {
+            if (runOwnsUi(parent)) {
+              setPlanPaused(true);
+              setPlanResumePhase('review');
+              restorePlannerControl(
+                `Paused during Review on step #${step.id} — press Play to resume.`
+              );
+            }
+            return;
+          }
+          markVerdictReasked(String(step.id));
+          const againLocated = again ? messagesFromOrigin(messagesRef.current, again.id) : [];
+          const againPool =
+            again && !againLocated.some(message => message.id === again.id)
+              ? [...againLocated, again]
+              : againLocated.length
+                ? againLocated
+                : again
+                  ? [again]
+                  : pool;
+          const againExplicit = pickExplicitStepVerdict(againPool, step.id);
+          if (againExplicit) {
+            await acceptVerdict(againExplicit.message, againExplicit.parsed);
+            return;
+          }
+          await nayFromReviewer(newestReviewerMessage(againPool) || again || host);
+          return;
+        }
+        await nayFromReviewer(host);
+        return;
+      }
+
+      logRun({
+        kind: 'verdict',
+        result: 'missing',
+        text: parsedVerdict?.notes || '',
+        stepId: String(step.id)
+      });
       const planNow = plannerPlanRef.current;
       if (planNow) {
         const held = transition(planNow, {
@@ -5604,10 +7771,10 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
         await commitPlannerPlan(held.plan, parent?.token);
       }
       if ((parent && !runLive(parent)) || (!parent && stopRequestedRef.current)) return;
-      if (latest) {
+      if (host) {
         setMessages(prev => {
           const next = prev.map(m =>
-            m.id === latest.id
+            m.id === host.id
               ? {
                   ...m,
                   display:
@@ -5627,52 +7794,14 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       return;
     }
 
-    const verdict: { stepId: string; result: 'yay' | 'nay'; notes: string } = {
-      stepId: parsedVerdict.stepId,
-      result: parsedVerdict.result === 'nay' ? 'nay' : 'yay',
-      notes: parsedVerdict.notes
-    };
-    const packed = {
-      stepId: verdict.stepId || step.id,
-      stepTitle: step.title,
-      result: verdict.result,
-      notes: verdict.notes
-    };
-
-    if (latest) {
-      setMessages(prev => {
-        const next = prev.map(m =>
-          m.id === latest.id
-            ? {
-                ...m,
-                stepVerdict: packed,
-                stepVerdictNeedsConfirm: !autoReviewRef.current,
-                stepVerdictApplied: false
-              }
-            : m
-        );
-        messagesRef.current = next;
-        return next;
-      });
-    }
-
-    if (!autoReviewRef.current) {
-      setPlanResumePhase('verdict');
-      setPlanPaused(true);
-      restorePlannerControl(
-        packed.result === 'yay'
-          ? `Step #${step.id} Yay — Accept on the card or press Play to continue`
-          : `Step #${step.id} Nay — Accept on the card or press Play to send fixes to Coder`
-      );
+    if (parsedVerdict.result !== 'yay' && parsedVerdict.result !== 'nay') {
       return;
     }
-
-    if (parent && !runLive(parent)) return;
-    await applyStepVerdictAndContinue(
-      latest ? { ...latest, stepVerdict: packed } : null,
-      packed
-    );
-    restorePlannerControl();
+    await acceptVerdict(explicit?.message || host, {
+      stepId: String(step.id),
+      result: parsedVerdict.result,
+      notes: parsedVerdict.notes
+    });
   };
 
   /** Collect distinct Reviewer Nay notes for a step from chat history. */
@@ -5715,8 +7844,15 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
    * After Nay rework cap: Planner appends focused fix steps, then Coder continues.
    * Preserves later pending steps (does not use appendPlannerPlan).
    */
-  const escalateStepToPlannerFixes = async (stepId: string): Promise<void> => {
-    if (stopRequestedRef.current) return;
+  const escalateStepToPlannerFixes = async (
+    stepId: string,
+    parent?: ConductorRun | null
+  ): Promise<void> => {
+    if (parent && !runLive(parent)) {
+      if (runOwnsUi(parent)) setPlanPaused(true);
+      return;
+    }
+    if (!parent && stopRequestedRef.current) return;
     let plan = plannerPlanRef.current;
     if (!plan) return;
     const stuck =
@@ -5737,6 +7873,14 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     const escalations = plan.escalationCount || 0;
     // Cap, or step is already a Fix pass → compiler heal (no redundant Fix: steps).
     if (stuck.blockerKind === 'review' && plan.lastVerifyOk) {
+      if (fullAutoRef.current && parent && runLive(parent)) {
+        await deferFailedStepAndContinue(
+          String(stuck.id),
+          `Step #${stuck.id} failed review. Verify is green, so the step stays failed and is kept as debt.`,
+          parent
+        );
+        return;
+      }
       setPlanPaused(true);
       restorePlannerControl(
         `Step #${stuck.id} failed review. Verify is green, so the step stays failed — Retry it or send fixes.`
@@ -5761,26 +7905,32 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
         activeStepId: stuck.id,
         updatedAt: Date.now()
       });
+      logRun({
+        kind: 'info',
+        stepId: String(stuck.id),
+        text: 'Escalate redirected to compiler heal'
+      });
       await healBlockedPlan();
       return;
     }
 
     setPlanPaused(false);
-    beginActivity(
+    logRun({
+      kind: 'escalate',
+      stepId: String(stuck.id),
+      text: `Step #${stuck.id} after ${reworkCount} Nays — Planner fix steps`
+    });
+    const escalationFrame = beginActivity(
       'escalate',
       `Escalating step #${stuck.id}`,
       `${reworkCount} Nays → Planner fix steps`
     );
-    const escalationFrame = activityStackRef.current[activityStackRef.current.length - 1];
     const escalationConversationId = conversationIdRef.current;
     const escalationRun = runRef.current;
     /** A Send after Stop clears the stop flag; that newer run now owns the plan controls. */
     const newerRunHolds = () => heldRef.current && runRef.current !== escalationRun;
     /** Stop clears the stack, and a newer run may have pushed its own frame since. */
-    const endEscalationActivity = () => {
-      const stack = activityStackRef.current;
-      if (stack[stack.length - 1] === escalationFrame) endActivity();
-    };
+    const endEscalationActivity = () => endActivity(escalationFrame);
     setExecutingPlanNotice(
       `Step #${stuck.id} hit ${reworkCount} Nays — Planner appending fix steps…`
     );
@@ -5805,7 +7955,8 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       lockPlanMode: true,
       skipUserAppend: true,
       notice: `Planner escalating step #${stuck.id} after ${reworkCount} Nays`,
-      freshContext: true
+      freshContext: true,
+      ...(parent ? { run: parent } : {})
     });
 
     if (
@@ -5887,7 +8038,8 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
         ? `Planner appended fix steps — starting #${next.id}: ${next.title}…`
         : 'Planner appended fix steps — continuing…'
     );
-    await dispatchActiveStep();
+    await dispatchActiveStep(parent);
+    if (parent && !runLive(parent) && runOwnsUi(parent)) setPlanPaused(true);
   };
 
   /** Blank index.html or unwired Tailwind is a failed web build even when tsc exits 0. */
@@ -5965,8 +8117,21 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     output: string;
     fingerprint: string;
   }> => {
+    const finishVerify = (result: { ok: boolean; output: string; fingerprint: string }) => {
+      if (result.fingerprint !== 'aborted' && result.output !== 'Stopped.') {
+        const stepId = activeStepId();
+        logRun({
+          kind: 'verify',
+          ok: result.ok,
+          fingerprint: result.fingerprint,
+          output: result.output,
+          ...(stepId ? { stepId } : {})
+        });
+      }
+      return result;
+    };
     if (typeof token === 'number' && !runIsCurrent(token)) {
-      return { ok: false, output: 'Stopped.', fingerprint: 'aborted' };
+      return finishVerify({ ok: false, output: 'Stopped.', fingerprint: 'aborted' });
     }
     const brain = projectBrainRef.current;
     const stack =
@@ -5996,15 +8161,15 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
           token
         );
       }
-      return { ok: false, output: failure.output, fingerprint: failure.fingerprint };
+      return finishVerify({ ok: false, output: failure.output, fingerprint: failure.fingerprint });
     }
-    beginActivity('verify', 'Project verify');
+    const verifyFrame = beginActivity('verify', 'Project verify');
     try {
       const out = typescriptVerifyUsesCompiler(begun.command)
         ? await runTypescriptVerify()
         : await executeTrackedCommand(begun.command);
       if (typeof token === 'number' && !runIsCurrent(token)) {
-        return { ok: false, output: 'Stopped.', fingerprint: 'aborted' };
+        return finishVerify({ ok: false, output: 'Stopped.', fingerprint: 'aborted' });
       }
       const visual = verifyOutputFailed(out) ? '' : await readWebEntryBlocker();
       const combined = visual ? `${out || ''}\n${visual}` : out || '';
@@ -6029,7 +8194,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
           token
         );
       }
-      return { ok: !failed, output: combined, fingerprint };
+      return finishVerify({ ok: !failed, output: combined, fingerprint });
     } catch (err: any) {
       const msg = err?.message || String(err);
       commitProjectBrain({
@@ -6037,20 +8202,47 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
         lastVerifyOk: false,
         lastVerifyNote: msg.slice(0, 800)
       });
-      return { ok: false, output: msg, fingerprint: 'err' };
+      return finishVerify({ ok: false, output: msg, fingerprint: 'err' });
     } finally {
-      endActivity();
+      endActivity(verifyFrame);
     }
   };
 
   /** Compiler/build must pass before a step can Yay. */
-  const verifyBeforeYay = async (): Promise<{ ok: boolean; output: string }> => {
-    const r = await runProjectVerify();
-    return { ok: r.ok, output: r.output };
+  const verifyBeforeYay = async (
+    parent?: ConductorRun | null
+  ): Promise<{ ok: boolean; output: string }> => {
+    const entered = bindRun(parent ?? null, false, 'verify');
+    if (!entered) return { ok: false, output: 'Stopped.' };
+    const run = entered.run;
+    try {
+      if (!runLive(run)) return { ok: false, output: 'Stopped.' };
+      const checked = await runProjectVerify(run.token);
+      if (!runLive(run)) return { ok: false, output: 'Stopped.' };
+      return { ok: checked.ok, output: checked.output };
+    } finally {
+      leaveConductorRun(entered.owned, run.token);
+    }
   };
 
   /** Advance the stuck step after heal verify passes (no Reviewer round-trip). */
-  const advanceAfterHealVerify = async (stepId: string, fingerprint: string, note: string) => {
+  const advanceAfterHealVerify = async (
+    stepId: string,
+    fingerprint: string,
+    note: string,
+    parent?: ConductorRun | null
+  ) => {
+    const entered = bindRun(parent ?? null, false, 'heal');
+    if (!entered) {
+      if (parent && runOwnsUi(parent)) setPlanPaused(true);
+      return;
+    }
+    const run = entered.run;
+    try {
+    if (!runLive(run)) {
+      if (runOwnsUi(run)) setPlanPaused(true);
+      return;
+    }
     let plan = plannerPlanRef.current;
     if (!plan) return;
     if (!canHealAdvanceOnGreenVerify(plan, stepId)) {
@@ -6061,7 +8253,19 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
         stepId,
         note
       });
-      await commitPlannerPlan(held.plan);
+      await commitPlannerPlan(held.plan, run.token);
+      if (!runLive(run)) {
+        if (runOwnsUi(run)) setPlanPaused(true);
+        return;
+      }
+      if (fullAutoRef.current) {
+        await deferFailedStepAndContinue(
+          stepId,
+          'Verify passed, but this step failed review. Kept as debt and continued.',
+          run
+        );
+        return;
+      }
       setPlanPaused(true);
       restorePlannerControl(
         'Verify passed, but this step failed review. It stays failed — Retry the step or send fixes.'
@@ -6075,8 +8279,20 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       stepId,
       note
     });
-    await commitPlannerPlan(moved.plan);
+    await commitPlannerPlan(moved.plan, run.token);
+    if (!runLive(run)) {
+      if (runOwnsUi(run)) setPlanPaused(true);
+      return;
+    }
     if (moved.effect !== 'verify-advanced') {
+      if (fullAutoRef.current) {
+        await deferFailedStepAndContinue(
+          stepId,
+          'Verify passed, but this step was not advanced. Kept as debt and continued.',
+          run
+        );
+        return;
+      }
       setPlanPaused(true);
       restorePlannerControl('Verify passed, but this step was not advanced.');
       return;
@@ -6084,15 +8300,20 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     plan = moved.plan;
     if (plan.resumePhase === 'final-review' || plan.status === 'completed') {
       setPlanPaused(false);
-      await finishVerifiedPlanRef.current(plan);
+      await finishVerifiedPlanRef.current(plan, run);
+      if (!runLive(run) && runOwnsUi(run)) setPlanPaused(true);
       return;
     }
     const next = getActiveStep(plan);
     if (next) {
       setExecutingPlanNotice(`Heal: verify OK — starting step #${next.id}: ${next.title}`);
-      await dispatchActiveStep();
+      await dispatchActiveStep(run);
+      if (!runLive(run) && runOwnsUi(run)) setPlanPaused(true);
     } else {
       restorePlannerControl('Heal: verify passed — plan complete.');
+    }
+    } finally {
+      leaveConductorRun(entered.owned, run.token);
     }
   };
 
@@ -6100,11 +8321,35 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
    * Heal budget spent: record compiler debt and keep going on the next pending step.
    * Does not set blockedReason. User Stop is the halt.
    */
-  const deferFailedStepAndContinue = async (stepId: string, note: string) => {
+  const deferFailedStepAndContinue = async (
+    stepId: string,
+    note: string,
+    parent?: ConductorRun | null
+  ) => {
+    const entered = bindRun(parent ?? null, false, 'defer');
+    if (!entered) {
+      if (parent && runOwnsUi(parent)) setPlanPaused(true);
+      return;
+    }
+    const run = entered.run;
+    try {
+    if (!runLive(run)) {
+      if (runOwnsUi(run)) setPlanPaused(true);
+      return;
+    }
+    logRun({
+      kind: 'info',
+      stepId: String(stepId),
+      text: `Deferred step: ${note}`
+    });
     let plan = plannerPlanRef.current;
     if (!plan) return;
     plan = continuePastFailedStep(plan, stepId, note);
-    commitPlannerPlan(plan);
+    await commitPlannerPlan(plan, run.token);
+    if (!runLive(run)) {
+      if (runOwnsUi(run)) setPlanPaused(true);
+      return;
+    }
     const debtTitle = note.replace(/\s+/g, ' ').slice(0, 280);
     const todo = [
       ...projectBrainRef.current.todo.filter(t => t.id !== `debt-${stepId}`),
@@ -6122,7 +8367,11 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     setExecutingPlanNotice(
       `Step #${stepId} kept as debt — continuing step #${next.id}: ${next.title}`
     );
-    await dispatchActiveStep();
+    await dispatchActiveStep(run);
+    if (!runLive(run) && runOwnsUi(run)) setPlanPaused(true);
+    } finally {
+      leaveConductorRun(entered.owned, run.token);
+    }
   };
 
   /**
@@ -6134,9 +8383,20 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       ?.frontierHealBriefUsed;
 
   const healBlockedPlan = async (): Promise<void> => {
-    const entered = bindRun(null, false);
+    const entered = bindRun(null, false, 'heal');
     if (!entered) return;
     const run = entered.run;
+    const { logRun, hostLog } = scopeRunLog();
+    const noteHeal = (note: string, stepId: string, attempt?: number, fingerprint?: string) => {
+      logRun({
+        kind: 'heal',
+        stepId,
+        ...(attempt != null ? { attempt } : {}),
+        max: MAX_HEAL_ATTEMPTS,
+        ...(fingerprint ? { fingerprint } : {}),
+        note
+      });
+    };
     try {
     if (!runLive(run)) return;
     let plan = plannerPlanRef.current;
@@ -6153,9 +8413,16 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
 
     const attempts = plan.healAttempts || 0;
     if (attempts >= MAX_HEAL_ATTEMPTS) {
+      noteHeal(
+        `budget spent — deferred`,
+        String(stuck.id),
+        attempts,
+        plan.lastErrorFingerprint
+      );
       await deferFailedStepAndContinue(
         String(stuck.id),
-        `Heal budget used (${attempts}) on step #${stuck.id}. ${(stuck.reviewNote || plan.blockedReason || '').slice(0, 500)}`
+        `Heal budget used (${attempts}) on step #${stuck.id}. ${(stuck.reviewNote || plan.blockedReason || '').slice(0, 500)}`,
+        run
       );
       return;
     }
@@ -6174,7 +8441,7 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
       run.token
     );
     if (!runLive(run)) return;
-    beginActivity(
+    const healFrame = beginActivity(
       'heal',
       `Heal step #${stuck.id}`,
       `attempt ${attempts + 1}/${MAX_HEAL_ATTEMPTS}`
@@ -6186,17 +8453,21 @@ After reviewing the files above, emit <step_verdict> immediately. Do not re-read
     try {
       let verify = await runProjectVerify(run.token);
       if (!runLive(run)) {
-        setPlanPaused(true);
-        endActivity();
-        restorePlannerControl('Paused during Heal verify — press Heal and continue to retry.');
+        endActivity(healFrame);
+        if (runOwnsUi(run)) {
+          setPlanPaused(true);
+          restorePlannerControl('Paused during Heal verify — press Heal and continue to retry.');
+        }
         return;
       }
       if (verify.ok) {
-        endActivity();
+        endActivity(healFrame);
+        noteHeal('verify passed — advancing', String(stuck.id), attempts + 1, verify.fingerprint);
         await advanceAfterHealVerify(
           String(stuck.id),
           verify.fingerprint,
-          'Heal: stack verify passed — advancing.'
+          'Heal: stack verify passed — advancing.',
+          run
         );
         return;
       }
@@ -6270,9 +8541,11 @@ ${progressForPrompt() || '(empty)'}`;
       const fingerprintBeforeLocal = fingerprint;
       await snapshotStepFiles(String(stuck.id), allowedFiles);
       if (!runLive(run)) {
-        setPlanPaused(true);
-        endActivity();
-        restorePlannerControl('Paused during Heal — press Play to resume.');
+        endActivity(healFrame);
+        if (runOwnsUi(run)) {
+          setPlanPaused(true);
+          restorePlannerControl('Paused during Heal — press Play to resume.');
+        }
         return;
       }
       // Skip another local coder if this fingerprint already survived a prior heal attempt.
@@ -6280,7 +8553,9 @@ ${progressForPrompt() || '(empty)'}`;
 
       if (!skipLocal) {
         const blankPage = /TS9001|TS9002/.test(verify.output || '');
-        const frontierFix = blankPage ? pickFinalSourceReviewTarget(nodesRef.current) : undefined;
+        const coderLocked = !!explicitRolePick(roleRoutesRef.current, 'coder');
+        const frontierFix =
+          coderLocked || !blankPage ? undefined : pickFinalSourceReviewTarget(nodesRef.current);
         const frontierPin =
           frontierFix && isFrontierNode(frontierFix.node) ? frontierFix : undefined;
         await runHealCoder(
@@ -6293,18 +8568,22 @@ ${progressForPrompt() || '(empty)'}`;
           frontierPin
         );
         if (!runLive(run)) {
-          setPlanPaused(true);
-          endActivity();
-          restorePlannerControl('Paused during Heal Coder — press Heal and continue to retry.');
+          endActivity(healFrame);
+          if (runOwnsUi(run)) {
+            setPlanPaused(true);
+            restorePlannerControl('Paused during Heal Coder — press Heal and continue to retry.');
+          }
           return;
         }
         verify = await runProjectVerify(run.token);
         if (verify.ok) {
-          endActivity();
+          endActivity(healFrame);
+          noteHeal('local coder fixed verify', String(stuck.id), attempts + 1, verify.fingerprint);
           await advanceAfterHealVerify(
             String(stuck.id),
             verify.fingerprint,
-            'Heal: local Coder fixed verify — advancing.'
+            'Heal: local Coder fixed verify — advancing.',
+            run
           );
           return;
         }
@@ -6321,11 +8600,6 @@ ${progressForPrompt() || '(empty)'}`;
       const unchanged = !verifyFingerprintChanged(fingerprintBeforeLocal, fingerprint);
       const briefAlreadyUsed = frontierBriefUsed(plannerPlanRef.current);
       if (unchanged && !briefAlreadyUsed && runLive(run)) {
-        const marked = {
-          ...(plannerPlanRef.current || plan),
-          frontierHealBriefUsed: true
-        } as PlannerPlan;
-        await commitPlannerPlan(marked, run.token);
         const stuckPayload = `${errorBlock}\n\nFingerprint: ${fingerprint}\nStep: #${stuck.id} ${stuck.title}`;
         let brief: string | null = null;
         try {
@@ -6335,84 +8609,142 @@ ${progressForPrompt() || '(empty)'}`;
             run
           );
         } catch (err: any) {
-          window.electronAPI?.writeLog?.('warn', `heal frontier: ${err?.message || err}`);
+          hostLog('warn', `heal frontier: ${err?.message || err}`);
         }
-        const big = pickLargestLocalTarget(nodesRef.current);
-        if (brief && big && runLive(run)) {
+        if (!runLive(run)) {
+          endActivity(healFrame);
+          if (runOwnsUi(run)) {
+            setPlanPaused(true);
+            restorePlannerControl('Paused during Heal — press Heal and continue to retry.');
+          }
+          return;
+        }
+        const big = roleTarget('coder', () => pickLargestLocalTarget(nodesRef.current));
+        let briefApplied = false;
+        if (brief?.trim() && big) {
+          briefApplied = true;
+          await commitPlannerPlan(
+            {
+              ...(plannerPlanRef.current || plan),
+              frontierHealBriefUsed: true
+            } as PlannerPlan,
+            run.token
+          );
+          if (!runLive(run)) {
+            endActivity(healFrame);
+            if (runOwnsUi(run)) setPlanPaused(true);
+            return;
+          }
           await runHealCoder(
             `### Frontier heal brief\nApply this solution. Do not repeat the failed approach.\n\n${brief}`,
             `Heal: applying the one frontier brief on ${big.node.name} · ${big.model}…`,
             big
           );
           if (!runLive(run)) {
-            setPlanPaused(true);
-            endActivity();
+            endActivity(healFrame);
+            if (runOwnsUi(run)) setPlanPaused(true);
             return;
           }
           verify = await runProjectVerify(run.token);
           if (verify.ok) {
-            endActivity();
+            endActivity(healFrame);
+            noteHeal('frontier brief cleared verify', String(stuck.id), attempts + 1, verify.fingerprint);
             await advanceAfterHealVerify(
               String(stuck.id),
               verify.fingerprint,
-              'Heal: frontier brief cleared verify — advancing.'
+              'Heal: frontier brief cleared verify — advancing.',
+              run
             );
             return;
           }
+          if (!runLive(run)) {
+            endActivity(healFrame);
+            if (runOwnsUi(run)) setPlanPaused(true);
+            return;
+          }
         }
-        endActivity();
-        setPlanPaused(true);
-        restorePlannerControl(
-          'Heal stopped: the error fingerprint did not change. This plan already used its frontier brief.'
-        );
+        endActivity(healFrame);
+        const unchangedAfterBrief = briefApplied
+          ? 'Heal stopped: the error fingerprint did not change. This plan already used its frontier brief.'
+          : brief?.trim()
+            ? 'Heal stopped: a frontier brief arrived, but no local coder is available to apply it. The brief is still unused.'
+            : 'Heal stopped: the error fingerprint did not change and no frontier brief was available. The brief is still unused.';
+        noteHeal(unchangedAfterBrief, String(stuck.id), attempts + 1, fingerprint);
+        if (fullAutoRef.current && runLive(run)) {
+          await deferFailedStepAndContinue(String(stuck.id), unchangedAfterBrief, run);
+          return;
+        }
+        if (runOwnsUi(run)) {
+          setPlanPaused(true);
+          restorePlannerControl(unchangedAfterBrief);
+        }
         return;
       }
       if (unchanged) {
-        endActivity();
-        setPlanPaused(true);
-        restorePlannerControl(
-          briefAlreadyUsed
-            ? 'Heal stopped: the error fingerprint is unchanged and the frontier brief was already used.'
-            : 'Heal stopped: the error fingerprint did not change after the local Coder.'
-        );
+        endActivity(healFrame);
+        const unchangedNote = briefAlreadyUsed
+          ? 'Heal stopped: the error fingerprint is unchanged and the frontier brief was already used.'
+          : 'Heal stopped: the error fingerprint did not change after the local Coder.';
+        noteHeal(unchangedNote, String(stuck.id), attempts + 1, fingerprint);
+        if (fullAutoRef.current && runLive(run)) {
+          await deferFailedStepAndContinue(String(stuck.id), unchangedNote, run);
+          return;
+        }
+        if (runOwnsUi(run)) {
+          setPlanPaused(true);
+          restorePlannerControl(unchangedNote);
+        }
         return;
       }
 
       const snippet = (verify.output || '').slice(-700);
       const used = plannerPlanRef.current?.healAttempts || attempts + 1;
-      endActivity();
+      endActivity(healFrame);
       if (used >= MAX_HEAL_ATTEMPTS || !runLive(run)) {
         if (!runLive(run)) {
-          setPlanPaused(true);
+          if (runOwnsUi(run)) setPlanPaused(true);
           return;
         }
+        noteHeal(
+          `failed after ${used} attempts`,
+          String(stuck.id),
+          used,
+          verify.fingerprint
+        );
         await deferFailedStepAndContinue(
           String(stuck.id),
-          `Heal failed on step #${stuck.id} after ${used} attempts.\n${snippet}`
+          `Heal failed on step #${stuck.id} after ${used} attempts.\n${snippet}`,
+          run
         );
         return;
       }
       setExecutingPlanNotice(
         `Heal attempt ${used}/${MAX_HEAL_ATTEMPTS} changed the errors on step #${stuck.id} — retrying…`
       );
+      noteHeal('errors changed — retrying heal', String(stuck.id), used, fingerprint);
       await healBlockedPlan();
     } catch (err: any) {
-      endActivity();
+      endActivity(healFrame);
       const msg = String(err?.message || err);
       if (/no workspace|workspace (path|required)|no local model|no model online/i.test(msg)) {
         const reason = `Heal paused: ${msg}`;
+        noteHeal(reason, String(stuck.id), attempts + 1);
         commitPlannerPlan({
           ...(plannerPlanRef.current || plan),
           blockedReason: reason,
           updatedAt: Date.now()
         });
-        setPlanPaused(true);
-        restorePlannerControl(reason);
+        if (runOwnsUi(run)) {
+          setPlanPaused(true);
+          restorePlannerControl(reason);
+        }
         return;
       }
+      noteHeal(`error: ${msg.slice(0, 300)}`, String(stuck.id), attempts + 1);
       await deferFailedStepAndContinue(
         String(stuck.id),
-        `Heal error on step #${stuck.id}: ${msg.slice(0, 500)}`
+        `Heal error on step #${stuck.id}: ${msg.slice(0, 500)}`,
+        run
       );
     }
     } finally {
@@ -6426,15 +8758,16 @@ ${progressForPrompt() || '(empty)'}`;
    * Electron packaging runs after this returns (finishVerifiedPlan).
    */
   const reviewFinishedSource = async (
-    plan: PlannerPlan
+    plan: PlannerPlan,
+    parent?: ConductorRun | null
   ): Promise<{ ran: boolean; passed: boolean; notes: string }> => {
     const skipped = { ran: false, passed: false, notes: '' };
     if (!plan.steps.length || plan.steps.some(s => s.status !== 'completed')) return skipped;
     if (finalReviewPlanIdRef.current === plan.id) return skipped;
+    if (parent && !runLive(parent)) return skipped;
     finalReviewPlanIdRef.current = plan.id;
-    if (stopRequestedRef.current) return skipped;
 
-    const target = pickFinalSourceReviewTarget(nodesRef.current);
+    const target = roleTarget('reviewer', () => pickFinalSourceReviewTarget(nodesRef.current));
     if (!target || !workspacePath) {
       const notes = 'All plan steps complete — no model online for the final source review.';
       restorePlannerControl(notes);
@@ -6444,7 +8777,7 @@ ${progressForPrompt() || '(empty)'}`;
     const caps = frontier
       ? { maxFiles: 80, maxCharsPerFile: 14000, maxTotalChars: 180000 }
       : { maxFiles: 24, maxCharsPerFile: 8000, maxTotalChars: 48000 };
-    beginActivity('project-review', 'Final source review', `${target.node.name} · ${target.model}`);
+    const reviewSourceFrame = beginActivity('project-review', 'Final source review', `${target.node.name} · ${target.model}`);
     setExecutingPlanNotice(
       frontier
         ? `Checklist done — reviewing the source folder on ${target.node.name} · ${target.model}…`
@@ -6452,7 +8785,15 @@ ${progressForPrompt() || '(empty)'}`;
     );
     try {
       const files = await listSourceFolderFiles(workspacePath);
+      if (parent && !runLive(parent)) {
+        finalReviewPlanIdRef.current = null;
+        return skipped;
+      }
       const filesBody = await buildTouchedFilesContext(workspacePath, files, caps);
+      if (parent && !runLive(parent)) {
+        finalReviewPlanIdRef.current = null;
+        return skipped;
+      }
       const rest = files.slice(caps.maxFiles);
       const steps = plan.steps.map(s => `- #${s.id} ${s.title}`).join('\n');
       const prompt = `The planner checklist is finished. Review the source folder against what the plan asked for. Do not edit files.
@@ -6481,11 +8822,13 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
         skipUserAppend: true,
         notice: `Final source review · ${target.model}`,
         pinRoute: target,
-        freshContext: true
+        freshContext: true,
+        ...(parent ? { run: parent } : {})
       });
-      if (stopRequestedRef.current) {
-        endActivity();
-        restorePlannerControl('Paused during the final source review.');
+      if (parent && !runLive(parent)) {
+        endActivity(reviewSourceFrame);
+        finalReviewPlanIdRef.current = null;
+        if (runOwnsUi(parent)) restorePlannerControl('Paused during the final source review.');
         return { ran: false, passed: false, notes: 'Paused during the final source review.' };
       }
       const parsed = parseFinalReview(`${msg?.raw || ''}\n${msg?.display || ''}`);
@@ -6505,16 +8848,16 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
         lastVerifyNote: notes.slice(0, 800) || projectBrainRef.current.lastVerifyNote,
         lastVerifyOk: passed
       });
-      endActivity();
+      endActivity(reviewSourceFrame);
       const notice = passed
         ? `Final source review passed on ${target.node.name} · ${target.model}.`
         : `Final source review found gaps on ${target.node.name}. ${notes.slice(0, 280)}`;
       restorePlannerControl(notice);
       return { ran: true, passed, notes: notice };
     } catch (err: any) {
-      endActivity();
+      endActivity(reviewSourceFrame);
       const notice = `Final source review failed: ${err?.message || err}`;
-      restorePlannerControl(notice);
+      if (!parent || runOwnsUi(parent)) restorePlannerControl(notice);
       return { ran: true, passed: false, notes: notice };
     }
   };
@@ -6572,8 +8915,12 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
    * script when delivery is Electron or package.json packs with electron-builder.
    * Does not run Studio's release script, and does not claim an exe on failure.
    */
-  const packageElectronDist = async (plan: PlannerPlan): Promise<string | null> => {
-    if (!workspacePath || stopRequestedRef.current) return null;
+  const packageElectronDist = async (
+    plan: PlannerPlan,
+    parent?: ConductorRun | null
+  ): Promise<string | null> => {
+    if (!workspacePath) return null;
+    if (parent ? !runLive(parent) : stopRequestedRef.current) return null;
     if (!plan.steps.length || plan.steps.some(s => s.status !== 'completed')) return null;
     const delivery = plan.delivery || projectBrainRef.current.delivery || null;
     const pkg = await readWorkspacePackage();
@@ -6597,6 +8944,7 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
     try {
       if (window.electronAPI?.getTerminalBuffer) {
         const snap = await window.electronAPI.getTerminalBuffer({ maxChars: 4000 });
+        if (parent && !runLive(parent)) return null;
         if (terminalLooksLikeRunningDist(snap?.content || '', !!snap?.running)) {
           return 'Electron dist is already running — did not start another build.';
         }
@@ -6607,8 +8955,10 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
       const output = await executeTrackedCommand(decision.command, {
         timeoutSec: ELECTRON_DIST_TIMEOUT_SEC
       });
+      if (parent && !runLive(parent)) return null;
       const failed = distCommandFailed(output);
       const listed = failed ? [] : await listPackagedExes(electronOutputDirs(pkg));
+      if (parent && !runLive(parent)) return null;
       const summary = summarizeElectronDist({
         ok: !failed,
         scriptName: decision.scriptName,
@@ -6629,18 +8979,22 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
   };
 
   /** Final source review, then the Electron installer when verify already passed. */
-  const finishVerifiedPlan = async (plan: PlannerPlan) => {
+  const finishVerifiedPlan = async (plan: PlannerPlan, parent?: ConductorRun | null) => {
+    if (parent && !runLive(parent)) return;
     if (!planReadyForRelease(plan)) {
-      restorePlannerControl(
-        'Plan is not ready to release — unfinished, failed, or abandoned steps stay off the final review and Electron dist.'
-      );
+      if (!parent || runOwnsUi(parent)) {
+        restorePlannerControl(
+          'Plan is not ready to release — unfinished, failed, or abandoned steps stay off the final review and Electron dist.'
+        );
+      }
       return;
     }
     const shipping = markPlanFinalReview(plan);
-    await commitPlannerPlan(shipping);
-    const review = await reviewFinishedSource(shipping);
-    if (stopRequestedRef.current) return;
-    const distNote = await packageElectronDist(shipping);
+    await commitPlannerPlan(shipping, parent?.token);
+    if (parent && !runLive(parent)) return;
+    const review = await reviewFinishedSource(shipping, parent);
+    if (parent && !runLive(parent)) return;
+    const distNote = await packageElectronDist(shipping, parent);
     if (!distNote) return;
     const prefix =
       review.ran && review.passed
@@ -6655,39 +9009,93 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
   /** Apply Yay/Nay to durable plan, then next step or rework / escalate. */
   const applyStepVerdictAndContinue = async (
     verdictMsg: ChatMessage | null,
-    packed?: { stepId: string; stepTitle: string; result: 'yay' | 'nay'; notes: string }
+    packed?: { stepId: string; stepTitle: string; result: 'yay' | 'nay'; notes: string },
+    parent?: ConductorRun | null
   ): Promise<void> => {
     const v = packed || verdictMsg?.stepVerdict;
     if (!v) return;
     if (verdictMsg?.stepVerdictApplied) return;
+    const entered = bindRun(parent ?? null, false, 'verdict');
+    if (!entered) {
+      if (parent && runOwnsUi(parent)) setPlanPaused(true);
+      return;
+    }
+    const run = entered.run;
+    const { logRun } = scopeRunLog();
+    try {
+    if (!runLive(run)) {
+      if (runOwnsUi(run)) setPlanPaused(true);
+      return;
+    }
 
     let plan = plannerPlanRef.current;
     if (!plan) return;
 
     let result = v.result;
     let notes = v.notes;
-    if (result === 'yay') {
-      if (writesUnresolved(coderWriteTools())) {
-        setPlanResumePhase('coder');
+    const stepId = String(v.stepId || plan.activeStepId || '');
+    const captured = coderTurnWritesRef.current;
+    const turnWrites = captured && captured.stepId === stepId ? captured.tools : coderWriteTools();
+    if (result === 'yay' && writesUnresolved(turnWrites)) {
+      if (fullAutoRef.current && runLive(run)) {
+        if (takeCoderRedispatchOnce(stepId)) {
+          setPlanPaused(false);
+          setPlanResumePhase('coder', run.token);
+          setExecutingPlanNotice(`Full auto: retrying Coder on step #${stepId}…`);
+          await dispatchActiveStep(run, { coderRetry: true });
+          if (!runLive(run)) {
+            giveBackCoderRedispatch(stepId);
+            if (runOwnsUi(run)) setPlanPaused(true);
+          }
+          return;
+        }
+        result = 'nay';
+        notes = unresolvedWriteNotes(turnWrites);
+        logRun({
+          kind: 'info',
+          stepId,
+          text: 'Full auto: Nay because coder writes failed'
+        });
+      } else {
+        setPlanResumePhase('coder', run.token);
         setPlanPaused(true);
         restorePlannerControl(
           'Writes for this step failed or are still pending. Press Play to run the Coder again before accepting Pass.'
         );
         return;
       }
-      const gate = await verifyBeforeYay();
+    }
+    if (result === 'yay') {
+      const gate = await verifyBeforeYay(run);
+      if (!runLive(run) || gate.output === 'Stopped.') {
+        if (runOwnsUi(run)) setPlanPaused(true);
+        setPlanResumePhase('verdict', run.token);
+        return;
+      }
       if (!gate.ok) {
         result = 'nay';
         notes = `Verify failed — step cannot Yay.\n${(gate.output || '').slice(0, 1600)}`;
       }
     }
+    logRun({
+      kind: 'verdict',
+      result,
+      text: v.result === 'yay' && result === 'nay' && notes.startsWith('Verify failed')
+        ? 'yay->nay (verify failed)'
+        : notes,
+      stepId
+    });
 
     plan = applyStepVerdict(plan, {
-      stepId: v.stepId,
+      stepId,
       result,
       notes
     });
-    commitPlannerPlan(plan);
+    await commitPlannerPlan(plan, run.token);
+    if (!runLive(run)) {
+      if (runOwnsUi(run)) setPlanPaused(true);
+      return;
+    }
 
     if (verdictMsg) {
       setMessages(prev => {
@@ -6704,12 +9112,13 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
     if (plan.status === 'completed') {
       stepReworkCountRef.current = {};
       setPlanPaused(false);
-      await finishVerifiedPlan(plan);
+      await finishVerifiedPlan(plan, run);
+      if (!runLive(run) && runOwnsUi(run)) setPlanPaused(true);
       return;
     }
 
     if (result === 'nay') {
-      const sid = String(v.stepId || '');
+      const sid = stepId;
       const stuck = plan.steps.find(s => String(s.id) === sid);
       const nextCount = effectiveStepReworkCount(sid, stuck?.reworkCount);
       if (nextCount > MAX_STEP_REWORKS) {
@@ -6718,41 +9127,60 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
           stepLooksLikeFixStep(stuck?.title || '') ||
           notesLookLikeVerifyFailure(notes || stuck?.reviewNote || '')
         ) {
-          commitPlannerPlan({
-            ...plan,
-            blockedReason: `Heal needed on step #${sid} after ${nextCount} Nays (compiler/verify).`,
-            resumePhase: 'coder',
-            activeStepId: stuck?.id || plan.activeStepId,
-            updatedAt: Date.now()
-          });
+          await commitPlannerPlan(
+            {
+              ...plan,
+              blockedReason: `Heal needed on step #${sid} after ${nextCount} Nays (compiler/verify).`,
+              resumePhase: 'coder',
+              activeStepId: stuck?.id || plan.activeStepId,
+              updatedAt: Date.now()
+            },
+            run.token
+          );
+          if (!runLive(run)) {
+            if (runOwnsUi(run)) setPlanPaused(true);
+            return;
+          }
           await healBlockedPlan();
           return;
         }
-        await escalateStepToPlannerFixes(sid);
+        await escalateStepToPlannerFixes(sid, run);
         return;
       }
       setExecutingPlanNotice(
         `Reworking step #${sid} from Reviewer Nay (${nextCount}/${MAX_STEP_REWORKS})…`
       );
-      await dispatchActiveStep();
+      await dispatchActiveStep(run);
+      if (!runLive(run) && runOwnsUi(run)) setPlanPaused(true);
       return;
     }
 
     // Yay — clear heal counter so later steps get a fresh heal budget
     if (plannerPlanRef.current) {
-      commitPlannerPlan({
-        ...plannerPlanRef.current,
-        healAttempts: 0,
-        blockedReason: undefined,
-        updatedAt: Date.now()
-      });
+      await commitPlannerPlan(
+        {
+          ...plannerPlanRef.current,
+          healAttempts: 0,
+          blockedReason: undefined,
+          updatedAt: Date.now()
+        },
+        run.token
+      );
+    }
+    if (!runLive(run)) {
+      if (runOwnsUi(run)) setPlanPaused(true);
+      return;
     }
     const next = getActiveStep(plannerPlanRef.current || plan);
     if (next) {
       setExecutingPlanNotice(`Step Yay — starting step #${next.id}: ${next.title}`);
-      await dispatchActiveStep();
+      await dispatchActiveStep(run);
+      if (!runLive(run) && runOwnsUi(run)) setPlanPaused(true);
     } else {
       restorePlannerControl('Planner plan complete — ask Planner what to build next.');
+    }
+    } finally {
+      leaveConductorRun(entered.owned, run.token);
     }
   };
 
@@ -6761,8 +9189,14 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
     option: PlanOption,
     planMsg: ChatMessage,
     confirmationText: string,
-    attachedImages: string[] = []
-  ) => {
+    attachedImages: string[] = [],
+    parent?: ConductorRun | null
+  ): Promise<void> => {
+    const entered = bindRun(parent ?? null, !parent, 'plan');
+    if (!entered) return;
+    const run = entered.run;
+    try {
+    if (!runLive(run)) return;
     const original = findPlanOriginalRequest(messagesRef.current, planMsg);
     const approved = buildApprovedPlan(planMsg, option, original);
     approvedPlanRef.current = approved;
@@ -6787,7 +9221,11 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
 
     const confirmDisplay = confirmationText.trim() || `Option ${option.id}: ${option.title}`;
     updateProgress(log => noteUserTurn(log, `${option.title}. ${option.description}`));
-    fitContext(modelMaxCtx(selectedNode, activeTargetModel), activeTargetModel);
+    const lockRoute = resolveRoute(`Lock execution plan for option ${option.id}`, plannerAgent);
+    fitContext(
+      modelMaxCtx(lockRoute?.routedNode, lockRoute?.routedModel || ''),
+      lockRoute?.routedModel || ''
+    );
     const userConfirm: ChatMessage = {
       id: `msg-${Date.now()}`,
       role: 'user',
@@ -6808,7 +9246,6 @@ End with <final_review><result>pass</result> or <result>issues</result> and <not
     });
 
     resetAgentLoopBudget();
-    stopRequestedRef.current = false;
 
     const lockPrompt = `${formatApprovedPlanContext(approved)}
 
@@ -6827,10 +9264,11 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       agent: plannerAgent,
       lockPlanMode: true,
       skipUserAppend: true,
-      notice: `Planner writing steps for Option ${option.id}`
+      notice: `Planner writing steps for Option ${option.id}`,
+      run
     });
 
-    if (stopRequestedRef.current) return;
+    if (!runLive(run)) return;
 
     const raw = lockMsg?.raw || '';
     let parsed = parseExecutionPlan(raw);
@@ -6867,12 +9305,96 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       plan = { ...plan, delivery: approved.delivery, updatedAt: Date.now() };
     }
     plan = activateNextStep(plan);
-    commitPlannerPlan(plan);
+    fullAutoGateRef.current = null;
+    await commitPlannerPlan(plan, run.token);
+    if (!runLive(run)) return;
     setExecutingPlanNotice(
       `Plan locked (${plan.steps.length} steps) — dispatching next step…`
     );
 
-    await dispatchActiveStep();
+    await dispatchActiveStep(run);
+    } finally {
+      leaveConductorRun(entered.owned, run.token);
+    }
+  };
+
+  /**
+   * When a planner proposal turn finishes: run a click that arrived while the run was held,
+   * otherwise let Full auto pick. A selection already on the live messages blocks auto-pick.
+   */
+  const maybeFullAutoPickPlan = async (run: ConductorRun, origin?: ChatMessage) => {
+    if (!runLive(run)) {
+      releaseStashedPlanChoice();
+      return;
+    }
+    const originId = origin?.id;
+    const turn = originId ? messagesFromOrigin(messagesRef.current, originId) : [];
+    const stashed = stashedPlanChoiceRef.current;
+    const stashInTurn =
+      !!stashed &&
+      (stashed.messageId === originId || turn.some(message => message.id === stashed.messageId));
+    if (stashInTurn && stashed) {
+      const message =
+        messagesRef.current.find(item => item.id === stashed.messageId) ||
+        (origin?.id === stashed.messageId ? origin : undefined);
+      if (!message || !runLive(run)) {
+        releaseStashedPlanChoice();
+        return;
+      }
+      stashedPlanChoiceRef.current = null;
+      logRun({ kind: 'info', text: stashed.confirmation });
+      setExecutingPlanNotice(stashed.confirmation);
+      await executeChosenPlan(stashed.option, message, stashed.confirmation, [], run);
+      return;
+    }
+    const liveOrigin = originId
+      ? messagesRef.current.find(message => message.id === originId) || origin
+      : origin;
+    // Option ids repeat across proposals (1, 2, 3), so only move a click onto another card
+    // when its own card is gone (a retry replaced it) or Full auto would pick anyway.
+    const mayRetarget =
+      !!stashed &&
+      (fullAutoRef.current || !messagesRef.current.some(message => message.id === stashed.messageId));
+    const matched =
+      stashed && mayRetarget && liveOrigin?.planOptions
+        ? liveOrigin.planOptions.find(
+            option => option.id === stashed.option.id || option.title === stashed.option.title
+          )
+        : undefined;
+    if (stashed && matched && liveOrigin && !liveOrigin.selectedPlanOptionId && runLive(run)) {
+      stashedPlanChoiceRef.current = null;
+      const confirmation = stashed.confirmation;
+      logRun({ kind: 'info', text: confirmation });
+      setExecutingPlanNotice(confirmation);
+      const previousId = stashed.messageId;
+      setMessages(prev => {
+        const next = prev.map(message => {
+          if (message.id === previousId && previousId !== liveOrigin.id) {
+            return { ...message, selectedPlanOptionId: undefined };
+          }
+          if (message.id === liveOrigin.id) {
+            return { ...message, selectedPlanOptionId: matched.id };
+          }
+          return message;
+        });
+        messagesRef.current = next;
+        return next;
+      });
+      await executeChosenPlan(matched, { ...liveOrigin, selectedPlanOptionId: matched.id }, confirmation, [], run);
+      return;
+    }
+    if (stashed) releaseStashedPlanChoice();
+    if (!fullAutoRef.current || !runLive(run)) return;
+    if (turn.some(message => !!message.selectedPlanOptionId)) return;
+    const pending = pendingPlanChoice(messagesRef.current, originId);
+    if (!pending?.planOptions || pending.planOptions.length < 2) return;
+    const request = findPlanOriginalRequest(messagesRef.current, pending);
+    const option = chooseFullAutoPlanOption(pending.planOptions, request);
+    if (!option || !runLive(run)) return;
+    const notice = fullAutoPickNotice(option);
+    logRun({ kind: 'user', action: 'auto', text: notice });
+    setExecutingPlanNotice(notice);
+    await executeChosenPlan(option, pending, notice, [], run);
   };
 
   /** User chose "Retry differently" after the stuck ladder — one more local attempt, new approach. */
@@ -6884,10 +9406,14 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       setExecutingPlanNotice('No local model online to retry.');
       return;
     }
+    const entered = bindRun(null, true, 'retry');
+    if (!entered) return;
+    logRun({ kind: 'user', action: 'retry', text: cleaned.slice(0, 300) });
+    const run = entered.run;
+    try {
     stuckRef.current = { key: stuckKey(cleaned), stage: 'big' };
     setExecutingPlanNotice(`Retrying differently on ${big.node.name} · ${big.model}`);
     resetAgentLoopBudget();
-    stopRequestedRef.current = false;
     await runSingleNodeTurn({
       userText: `Retry differently: ${cleaned}`,
       fullPrompt: `You already repeated this step without finishing it. Do NOT repeat the same approach.\n\nEither:\n1) Implement a concrete different fix with <edit_file> / <write_file>, or\n2) Stop and state what is blocking in one short sentence.\n\nStuck step:\n${cleaned}`,
@@ -6896,14 +9422,24 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       reviewMode: false,
       approvedPlan: approvedPlanRef.current,
       notice: `Stuck retry (different approach) on ${big.node.name} · ${big.model}`,
-      pinRoute: big
+      pinRoute: big,
+      forceRoute: true,
+      run
     });
-    if (!stopRequestedRef.current) await reviewAndAdvance(0, cleaned);
+    if (runLive(run)) await reviewAndAdvance(0, cleaned, run);
+    } finally {
+      leaveConductorRun(entered.owned, run.token);
+    }
   };
 
   const confirmPaidAssist = async (task: string) => {
     const paid = pickPaidFrontier(nodesRef.current);
     if (!paid || !task.trim()) return;
+    const entered = bindRun(null, true, 'assist');
+    if (!entered) return;
+    const run = entered.run;
+    const { hostLog } = scopeRunLog();
+    try {
     setIsStreaming(true);
     setExecutingPlanNotice(`Asking ${paid.node.name} · ${paid.model}…`);
     let brief: string | null = null;
@@ -6912,14 +9448,16 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         paid,
         'The local models are repeating this step and not fixing it. Give one short solution. Do not rewrite the file.',
         `${progressForPrompt()}\n\nStuck step:\n${task}`,
-        false
+        false,
+        run
       );
     } catch (err: any) {
-      window.electronAPI?.writeLog?.('warn', `paid stuck: ${err?.message || err}`);
+      hostLog('warn', `paid stuck: ${err?.message || err}`);
     }
-    if (!brief || stopRequestedRef.current) {
+    if (!runLive(run)) return;
+    if (!brief) {
       setIsStreaming(false);
-      setExecutingPlanNotice(brief ? null : 'The paid API did not return a solution.');
+      setExecutingPlanNotice('The paid API did not return a solution.');
       return;
     }
     const stamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -6940,10 +9478,10 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         planOptions: [{ id: 'copy-paid', title: 'Copy solution', description: brief, action: 'copy' }]
       }
     ]);
-    const big = pickLargestLocalTarget(nodesRef.current);
+    const big = roleTarget('coder', () => pickLargestLocalTarget(nodesRef.current));
     if (!big) {
       setIsStreaming(false);
-      setExecutingPlanNotice('Paid solution is in the chat. No local model is online to apply it.');
+      setExecutingPlanNotice('Paid solution is in the chat. No model is online to apply it.');
       return;
     }
     ephemeralWorkerRef.current = true;
@@ -6955,54 +9493,82 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       approvedPlan: approvedPlanRef.current,
       notice: `Applying the paid solution on ${big.node.name} · ${big.model}`,
       pinRoute: big,
-      freshContext: true
+      forceRoute: true,
+      freshContext: true,
+      run
     });
-    if (!stopRequestedRef.current) await reviewAndAdvance(0, brief);
-    restorePlannerControl();
+    if (runLive(run)) await reviewAndAdvance(0, brief, run);
+    if (runIsCurrent(run.token) || !heldRef.current) restorePlannerControl();
+    } finally {
+      if (runIsCurrent(run.token) || !heldRef.current) setIsStreaming(false);
+      leaveConductorRun(entered.owned, run.token);
+    }
   };
 
   const handleSelectPlanOption = (option: PlanOption, planMsg: ChatMessage) => {
+    logRun({ kind: 'info', text: `Plan option ${option.id}: ${option.title}` });
     if (option.action === 'copy') {
       void navigator.clipboard.writeText(option.description);
       return;
     }
-    if (isStreaming || planMsg.selectedPlanOptionId) return;
-    if (option.action === 'paid') {
-      setMessages(prev =>
-        prev.map(m => (m.id === planMsg.id ? { ...m, selectedPlanOptionId: option.id } : m))
-      );
-      void confirmPaidAssist(option.description);
-      return;
-    }
-    if (option.action === 'retry-local') {
-      setMessages(prev =>
-        prev.map(m => (m.id === planMsg.id ? { ...m, selectedPlanOptionId: option.id } : m))
-      );
-      void retryStuckLocally(option.description);
-      return;
-    }
-    if (option.action === 'stop') {
-      setMessages(prev =>
-        prev.map(m => (m.id === planMsg.id ? { ...m, selectedPlanOptionId: option.id } : m))
-      );
+    const livePlan = messagesRef.current.find(message => message.id === planMsg.id) || planMsg;
+    if (livePlan.selectedPlanOptionId) return;
+    const markSelected = () => {
+      setMessages(prev => {
+        const next = prev.map(message =>
+          message.id === planMsg.id ? { ...message, selectedPlanOptionId: option.id } : message
+        );
+        messagesRef.current = next;
+        return next;
+      });
+    };
+    if (option.action === 'paid' || option.action === 'retry-local' || option.action === 'stop') {
+      if (isStreaming || heldRef.current) return;
+      markSelected();
+      if (option.action === 'paid') {
+        void confirmPaidAssist(option.description);
+        return;
+      }
+      if (option.action === 'retry-local') {
+        void retryStuckLocally(option.description);
+        return;
+      }
       stuckRef.current = { key: '', stage: 'none' };
       setExecutingPlanNotice(null);
       return;
     }
-    void executeChosenPlan(option, planMsg, `Option ${option.id}: ${option.title}`);
+    const confirmation = `Option ${option.id}: ${option.title}`;
+    if (isStreaming || heldRef.current) {
+      markSelected();
+      stashedPlanChoiceRef.current = {
+        messageId: planMsg.id,
+        option,
+        confirmation
+      };
+      logRun({ kind: 'info', text: confirmation });
+      return;
+    }
+    void executeChosenPlan(option, livePlan, confirmation);
   };
 
-  const handleSendMessage = async (e?: React.FormEvent, overrideText?: string) => {
+  const handleSendMessage = async (
+    e?: React.FormEvent,
+    overrideText?: string,
+    userAction: 'send' | 'retry' = 'send'
+  ) => {
     if (e) e.preventDefault();
     const hasImages = !overrideText && pendingImages.length > 0;
     const typed = (overrideText ?? input).trim();
     if ((!typed && !hasImages) || isStreaming || heldRef.current) return;
     setAssistError(null);
 
-    const sendTier = activeTargetModel
+    const sendRoute = resolveRoute(typed || 'Look at this screenshot', currentAgent);
+    const sendNode = sendRoute?.routedNode;
+    const sendModel = sendRoute?.routedModel || '';
+    const sendTier = sendModel
       ? resolveModelFit(
-          selectedNode,
-          activeTargetModel,
+          sendNode,
+          sendModel,
           roleForDynamicCtx(currentAgent.handle),
           currentAgent.numCtx
         ).tier
@@ -7021,10 +9587,11 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       commitProjectBrain({ ...projectBrainRef.current, brief: userText.slice(0, 1200) });
     }
     updateProgress(log => noteUserTurn(log, userText));
-    fitContext(modelMaxCtx(selectedNode, activeTargetModel), activeTargetModel);
+    fitContext(modelMaxCtx(sendNode, sendModel), sendModel);
     resetAgentLoopBudget();
-    const enteredSend = bindRun(null, true);
+    const enteredSend = bindRun(null, true, userAction);
     if (!enteredSend) return;
+    logRun({ kind: 'user', action: userAction, text: userText.slice(0, 300) });
     try {
     stuckRef.current = { key: '', stage: 'none' };
     ephemeralWorkerRef.current = false;
@@ -7062,7 +9629,18 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
     if (pendingPlan?.planOptions?.length) {
       const matched = matchPlanOption(userText, pendingPlan.planOptions);
       if (matched) {
-        return await executeChosenPlan(matched, pendingPlan, userText, attachedImages);
+        if (
+          matched.action === 'paid' ||
+          matched.action === 'retry-local' ||
+          matched.action === 'stop' ||
+          matched.action === 'copy'
+        ) {
+          // Stuck-ladder cards are not plans. The click handler binds its own run.
+          leaveConductorRun(enteredSend.owned, enteredSend.run.token);
+          handleSelectPlanOption(matched, pendingPlan);
+          return;
+        }
+        return await executeChosenPlan(matched, pendingPlan, userText, attachedImages, enteredSend.run);
       }
     }
 
@@ -7152,7 +9730,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         run: enteredSend.run
       });
     }
-    if (runLive(enteredSend.run) && autoReviewRef.current) {
+    if (runLive(enteredSend.run) && autoReviewOn()) {
       await reviewAndAdvance(0, '', enteredSend.run);
     }
     } finally {
@@ -7161,10 +9739,9 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
   };
 
   const handleStop = () => {
-    stopConductor();
     pendingReviewResumeRef.current = null;
     ephemeralWorkerRef.current = false;
-    setIsStreaming(false);
+    releaseStashedPlanChoice();
     if (isPlanActive(plannerPlanRef.current)) {
       setPlanPaused(true);
       // Keep existing checkpoint; only stamp coder if nothing was saved yet.
@@ -7183,6 +9760,8 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       setPlanPaused(false);
       setExecutingPlanNotice(null);
     }
+    stopConductor();
+    setIsStreaming(false);
   };
 
   /** True when escalate would only re-set blockedReason (Resume dead-loop). */
@@ -7211,11 +9790,12 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         return;
       }
       finalReviewPlanIdRef.current = null;
-      const ship = bindRun(null, true);
+      const ship = bindRun(null, true, 'play');
       if (!ship) return;
+      logRun({ kind: 'user', action: 'play', text: 'final-review' });
       try {
         setPlanPaused(false);
-        await finishVerifiedPlan(activePlan);
+        await finishVerifiedPlan(activePlan, ship.run);
       } finally {
         leaveConductorRun(ship.owned, ship.run.token);
       }
@@ -7226,8 +9806,9 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       setExecutingPlanNotice('No active plan to continue.');
       return;
     }
-    const ship = bindRun(null, true);
+    const ship = bindRun(null, true, 'play');
     if (!ship) return;
+    logRun({ kind: 'user', action: 'play' });
     const plan = activePlan;
     setPlanPaused(false);
     resetAgentLoopBudget();
@@ -7294,7 +9875,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         setExecutingPlanNotice(
           `Resuming — applying ${verdictMsg.stepVerdict.result === 'yay' ? 'Yay' : 'Nay'} then continuing…`
         );
-        await applyStepVerdictAndContinue(verdictMsg);
+        await applyStepVerdictAndContinue(verdictMsg, undefined, ship.run);
         return;
       }
       phase = 'review';
@@ -7310,7 +9891,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         await healBlockedPlan();
         return;
       }
-      await escalateStepToPlannerFixes(String(step.id));
+      await escalateStepToPlannerFixes(String(step.id), ship.run);
       return;
     }
 
@@ -7340,18 +9921,27 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       setExecutingPlanNotice('Resuming — finishing pending workspace actions…');
       setIsStreaming(true);
       let tools = lastCoderMsg.toolCalls || [];
-      if (autoApplyWritesRef.current) {
+      if (autoApplyOn()) {
         tools = await autoApplyWritableTools(tools, toolDepsRef.current);
-        tools = await runAuxTools(tools, toolDepsRef.current);
-        const cmdPass = await runCommandTools(tools, toolDepsRef.current);
-        tools = cmdPass.tools;
+        if (runLive(ship.run)) {
+          tools = await runAuxTools(tools, toolDepsRef.current);
+          if (runLive(ship.run)) {
+            const cmdPass = await runCommandTools(tools, toolDepsRef.current);
+            tools = cmdPass.tools;
+          }
+        }
         updateProgress(log => noteSavedFiles(log, tools, savedFileFingerprints()));
         noteAppliedWrites(tools);
       }
       const updatedMsg = { ...lastCoderMsg, toolCalls: tools };
       if (!runLive(ship.run)) {
-        setIsStreaming(false);
-        setPlanPaused(true);
+        const saved = messagesRef.current.map(m => (m.id === lastCoderMsg.id ? updatedMsg : m));
+        messagesRef.current = saved;
+        setMessages(saved);
+        if (runOwnsUi(ship.run)) {
+          setIsStreaming(false);
+          setPlanPaused(true);
+        }
         return;
       }
       setMessages(prev => {
@@ -7360,30 +9950,41 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         return next;
       });
       setIsStreaming(false);
-      if (stopRequestedRef.current) {
-        setPlanPaused(true);
+      if (!runLive(ship.run)) {
+        if (runOwnsUi(ship.run)) {
+          setPlanPaused(true);
+          setPlanResumePhase('coder', ship.run.token);
+        }
         return;
       }
       if (shouldContinueFromTools(tools, continueDecisionOpts())) {
         await continueWithToolResults(updatedMsg, {
           createIntent: true,
           freshContext: true,
-          role: 'coder'
+          role: 'coder',
+          run: ship.run
         });
       }
-      if (stopRequestedRef.current) {
-        setPlanPaused(true);
-        setPlanResumePhase('coder');
+      if (!runLive(ship.run)) {
+        if (runOwnsUi(ship.run)) {
+          setPlanPaused(true);
+          setPlanResumePhase('coder', ship.run.token);
+        }
         return;
       }
-      if (writesUnresolved(coderWriteTools())) {
+      if (writesUnresolved(writeToolsFromCoderOrigin(updatedMsg))) {
         setExecutingPlanNotice('Resuming Coder — previous writes did not succeed.');
-        await dispatchActiveStep();
+        await dispatchActiveStep(ship.run);
         return;
       }
       if (step) {
         const p = plannerPlanRef.current;
-        if (p) await commitPlannerPlan({ ...p, resumePhase: 'review', updatedAt: Date.now() });
+        if (p) {
+          await commitPlannerPlan(
+            { ...p, resumePhase: 'review', updatedAt: Date.now() },
+            ship.run.token
+          );
+        }
       }
       setExecutingPlanNotice(
         step ? `Resuming Review on step #${step.id}…` : 'Resuming Review…'
@@ -7395,7 +9996,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
     const wroteSomething = (lastCoderMsg?.toolCalls || []).some(
       t =>
         (t.name === 'write_file' || t.name === 'edit_file') &&
-        (t.status === 'done' || autoApplyWritesRef.current)
+        (t.status === 'done' || autoApplyOn())
     );
     const tasksAlreadyDone =
       !!step &&
@@ -7408,7 +10009,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
           ? `Resuming Coder on step #${step.id} — writes did not succeed.`
           : 'Resuming Coder — writes did not succeed.'
       );
-      await dispatchActiveStep();
+      await dispatchActiveStep(ship.run);
       return;
     }
 
@@ -7416,9 +10017,9 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
       if (step) {
         const p = plannerPlanRef.current;
         if (p && p.resumePhase !== 'review') {
-          await commitPlannerPlan({ ...p, resumePhase: 'review', updatedAt: Date.now() });
+          await commitPlannerPlan({ ...p, resumePhase: 'review', updatedAt: Date.now() }, ship.run.token);
         } else {
-          setPlanResumePhase('review');
+          setPlanResumePhase('review', ship.run.token);
         }
       } else {
         setPlanResumePhase('review');
@@ -7437,7 +10038,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         ? `Resuming Coder on step #${step.id}: ${step.title}…`
         : 'Resuming Coder…'
     );
-    await dispatchActiveStep();
+    await dispatchActiveStep(ship.run);
     } finally {
       leaveConductorRun(ship.owned, ship.run.token);
     }
@@ -7445,26 +10046,50 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
 
   const handleApplyAllTools = async (msg: ChatMessage) => {
     if (!msg.toolCalls || msg.toolCalls.length === 0) return;
-    setIsStreaming(true);
-    resetAgentLoopBudget();
-
-    const updated: ToolCall[] = [];
-    for (const tool of msg.toolCalls) {
-      if (tool.status === 'done' || tool.status === 'error') {
-        updated.push(tool);
-        continue;
+    await runAsUser('apply', async run => {
+      setIsStreaming(true);
+      resetAgentLoopBudget();
+      try {
+        const updated: ToolCall[] = [];
+        const original = msg.toolCalls || [];
+        const keepFinished = (rest: ToolCall[]) => {
+          if (!updated.length) return;
+          const partial: ChatMessage = { ...msg, toolCalls: [...updated, ...rest] };
+          const saved = messagesRef.current.map(m => (m.id === msg.id ? partial : m));
+          messagesRef.current = saved;
+          setMessages(saved);
+          updateProgress(log => noteSavedFiles(log, updated, savedFileFingerprints()));
+        };
+        for (let i = 0; i < original.length; i += 1) {
+          const tool = original[i];
+          if (!runLive(run)) {
+            keepFinished(original.slice(i));
+            return;
+          }
+          if (tool.status === 'done' || tool.status === 'error') {
+            updated.push(tool);
+            continue;
+          }
+          updated.push(await executeTool(tool, toolDepsRef.current));
+        }
+        if (!runLive(run)) {
+          keepFinished([]);
+          return;
+        }
+        updateProgress(log => noteSavedFiles(log, updated, savedFileFingerprints()));
+        const nextMsg: ChatMessage = { ...msg, toolCalls: updated };
+        setMessages(prev => {
+          const next = prev.map(m => (m.id === msg.id ? nextMsg : m));
+          messagesRef.current = next;
+          return next;
+        });
+        if (shouldContinueFromTools(updated, continueDecisionOpts())) {
+          await continueWithToolResults(nextMsg, { createIntent: true, run });
+        }
+      } finally {
+        if (runOwnsUi(run)) setIsStreaming(false);
       }
-      updated.push(await executeTool(tool, toolDepsRef.current));
-    }
-
-    updateProgress(log => noteSavedFiles(log, updated, savedFileFingerprints()));
-    const nextMsg: ChatMessage = { ...msg, toolCalls: updated };
-    setMessages(prev => prev.map(m => (m.id === msg.id ? nextMsg : m)));
-    setIsStreaming(false);
-
-    if (shouldContinueFromTools(updated, continueDecisionOpts())) {
-      await continueWithToolResults(nextMsg, { createIntent: true });
-    }
+    });
   };
 
   const latestAssistant = [...messages].reverse().find(m => m.role === 'assistant');
@@ -7533,9 +10158,10 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
   const controlColWidthRef = useRef(controlWidth);
   const [nodeWorkColWidth, setNodeWorkColWidth] = useState(nodeWorkWidth);
   const nodeWorkColWidthRef = useRef(nodeWorkWidth);
-  const nodeWorkCollapsedRef = useRef(false);
-  const [resizingControl, setResizingControl] = useState(false);
-  const [resizingNodeWork, setResizingNodeWork] = useState(false);
+  const controlPaneRef = useRef<HTMLDivElement>(null);
+  const nodePaneRef = useRef<HTMLDivElement>(null);
+  const paneWidthRef = useRef(0);
+  const nodeBasisRef = useRef(nodeWorkWidth);
   useEffect(() => {
     setControlColWidth(controlWidth);
     controlColWidthRef.current = controlWidth;
@@ -7544,73 +10170,121 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
     setNodeWorkColWidth(nodeWorkWidth);
     nodeWorkColWidthRef.current = nodeWorkWidth;
   }, [nodeWorkWidth]);
-  useEffect(() => {
-    if (!resizingControl) return;
-    const onMove = (e: MouseEvent) => {
-      const el = document.getElementById('agent-conductor-root');
-      if (!el) return;
-      const rect = el.getBoundingClientRect();
-      const nodeW = nodeWorkCollapsedRef.current ? NODE_WORK_RAIL : nodeWorkColWidthRef.current;
-      const max = rect.width - nodeW - MESSAGE_COLUMN_MIN - 8;
-      const next = Math.max(200, Math.min(560, max, rect.right - e.clientX - nodeW - 4));
-      controlColWidthRef.current = next;
-      setControlColWidth(next);
-    };
-    const onUp = () => {
-      setResizingControl(false);
-      onControlWidthChange?.(controlColWidthRef.current);
-    };
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
-    return () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
-  }, [resizingControl, onControlWidthChange]);
-  useEffect(() => {
-    if (!resizingNodeWork) return;
-    const onMove = (e: MouseEvent) => {
-      const el = document.getElementById('agent-conductor-root');
-      if (!el) return;
-      const rect = el.getBoundingClientRect();
-      const max = rect.width - controlColWidthRef.current - MESSAGE_COLUMN_MIN - 8;
-      const next = Math.max(200, Math.min(480, max, rect.right - e.clientX));
-      nodeWorkColWidthRef.current = next;
-      setNodeWorkColWidth(next);
-    };
-    const onUp = () => {
-      setResizingNodeWork(false);
-      onNodeWorkWidthChange?.(nodeWorkColWidthRef.current);
-    };
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
-    return () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
-  }, [resizingNodeWork, onNodeWorkWidthChange]);
 
   const { collapsed: nodeWorkCollapsed, toggle: toggleNodeWork } = useNodeWorkCollapse(
     nodeWorkSteps.length > 0
   );
-  nodeWorkCollapsedRef.current = nodeWorkCollapsed;
   const tailMessage = messages[messages.length - 1];
   const scrollSignature = `${messages.length}:${tailMessage?.id || ''}:${tailMessage?.display?.length || 0}:${tailMessage?.raw?.length || 0}:${tailMessage?.toolCalls?.length || 0}:${isStreaming ? 1 : 0}`;
   const transcriptScroll = useStickToBottom(scrollSignature);
   const [paneWidth, setPaneWidth] = useState(0);
-  useEffect(() => {
+  useLayoutEffect(() => {
     const el = document.getElementById('agent-conductor-root');
-    if (!el || typeof ResizeObserver === 'undefined') return;
+    if (!el) return;
     const publish = () => setPaneWidth(el.clientWidth);
+    publish();
+    if (typeof ResizeObserver === 'undefined') return;
     const obs = new ResizeObserver(publish);
     obs.observe(el);
-    publish();
     return () => obs.disconnect();
   }, []);
+  paneWidthRef.current = paneWidth;
+
+  const limitsFor = (
+    pane: number,
+    control: number,
+    node: number,
+    collapsed: boolean,
+    nodeForControl = node
+  ) => {
+    if (fill || pane <= 0) {
+      const shownNode = collapsed ? NODE_WORK_RAIL : Math.min(Math.max(0, node), NODE_WORK_MIN);
+      const shownControl = Math.min(Math.max(0, control), CONTROL_MIN);
+      return {
+        shownControl,
+        shownNode,
+        controlMin: Math.min(CONTROL_MIN, shownControl),
+        controlMax: CONTROL_MAX,
+        nodeMin: collapsed ? NODE_WORK_RAIL : Math.min(NODE_WORK_MIN, shownNode),
+        nodeMax: collapsed ? NODE_WORK_RAIL : NODE_WORK_MAX,
+        transcriptMin: TRANSCRIPT_MIN
+      };
+    }
+    return fitInnerColumns(pane, control, node, collapsed, nodeForControl);
+  };
+
+  const commitControlWidth = (next: number) => {
+    controlColWidthRef.current = next;
+    setControlColWidth(next);
+    onControlWidthChange?.(next);
+  };
+  const commitNodeWorkWidth = (next: number) => {
+    nodeWorkColWidthRef.current = next;
+    setNodeWorkColWidth(next);
+    onNodeWorkWidthChange?.(next);
+  };
+
+  const controlDrag = usePaneDrag({
+    axis: 'x',
+    valueSide: 'after',
+    disabled: fill,
+    getMin: () =>
+      limitsFor(
+        paneWidthRef.current,
+        controlColWidthRef.current,
+        nodeBasisRef.current,
+        nodeWorkCollapsed,
+        nodeBasisRef.current
+      ).controlMin,
+    getMax: () =>
+      limitsFor(
+        paneWidthRef.current,
+        controlColWidthRef.current,
+        nodeBasisRef.current,
+        nodeWorkCollapsed,
+        nodeBasisRef.current
+      ).controlMax,
+    getValue: () => controlColWidthRef.current,
+    getPane: () => controlPaneRef.current,
+    onPreview: next => {
+      controlColWidthRef.current = next;
+      setControlColWidth(next);
+    },
+    onCommit: commitControlWidth
+  });
+  const nodeDrag = usePaneDrag({
+    axis: 'x',
+    valueSide: 'after',
+    disabled: fill || nodeWorkCollapsed,
+    getMin: () =>
+      limitsFor(
+        paneWidthRef.current,
+        controlColWidthRef.current,
+        nodeWorkColWidthRef.current,
+        nodeWorkCollapsed,
+        nodeBasisRef.current
+      ).nodeMin,
+    getMax: () =>
+      limitsFor(
+        paneWidthRef.current,
+        controlColWidthRef.current,
+        nodeWorkColWidthRef.current,
+        nodeWorkCollapsed,
+        nodeBasisRef.current
+      ).nodeMax,
+    getValue: () => nodeWorkColWidthRef.current,
+    getPane: () => nodePaneRef.current,
+    onPreview: next => {
+      nodeWorkColWidthRef.current = next;
+      setNodeWorkColWidth(next);
+    },
+    onCommit: commitNodeWorkWidth
+  });
+
   const retryMessage = useStableCallback((_messageId: string) => {
     const last = [...messagesRef.current].reverse().find(m => m.role === 'user');
     const text = (last?.raw || last?.display || '').trim();
-    if (text) void handleSendMessage(undefined, text);
+    if (text) void handleSendMessage(undefined, text, 'retry');
   });
   const selectPlan = useStableCallback((messageId: string, option: PlanOption) => {
     const msg = messagesRef.current.find(m => m.id === messageId);
@@ -7626,7 +10300,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
   });
   const applyVerdict = useStableCallback((messageId: string) => {
     const msg = messagesRef.current.find(m => m.id === messageId);
-    if (msg) void applyStepVerdictAndContinue(msg);
+    if (msg) void runAsUser('verdict', run => applyStepVerdictAndContinue(msg, undefined, run));
   });
   const applyAllTools = useStableCallback((messageId: string) => {
     const msg = messagesRef.current.find(m => m.id === messageId);
@@ -7643,21 +10317,38 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
   );
   const contextUsed = sampledAssistant?.stats?.promptTokens || meterSnap?.promptTokens;
   const contextPinned = activeTargetMaxCtx || meterSnap?.pinnedCtx || sampledAssistant?.stats?.numCtx || 0;
-  let shownControl = controlColWidth;
-  let shownNodeWork = nodeWorkCollapsed ? NODE_WORK_RAIL : nodeWorkColWidth;
-  if (!fill && paneWidth > 0) {
-    const splits = 8;
-    const reservedNode = nodeWorkCollapsed ? NODE_WORK_RAIL : 200;
-    const maxControl = Math.max(200, paneWidth - reservedNode - MESSAGE_COLUMN_MIN - splits);
-    shownControl = Math.min(controlColWidth, Math.min(560, maxControl));
-    const maxNode = Math.max(200, paneWidth - shownControl - MESSAGE_COLUMN_MIN - splits);
-    shownNodeWork = nodeWorkCollapsed
-      ? NODE_WORK_RAIL
-      : Math.min(nodeWorkColWidth, Math.min(480, maxNode));
-  }
+  if (!nodeDrag.dragging) nodeBasisRef.current = nodeWorkColWidth;
+  const liveColumns = limitsFor(
+    paneWidth,
+    controlColWidth,
+    nodeWorkColWidth,
+    nodeWorkCollapsed,
+    nodeBasisRef.current
+  );
+  const shownControl = liveColumns.shownControl;
+  const shownNodeWork = liveColumns.shownNode;
+  const controlMin = liveColumns.controlMin;
+  const controlMax = liveColumns.controlMax;
+  const nodeMin = liveColumns.nodeMin;
+  const nodeMax = liveColumns.nodeMax;
+  const chromeReportRef = useRef({ control: -1, node: -1 });
+  const onChromeWidthsChangeRef = useRef(onChromeWidthsChange);
+  onChromeWidthsChangeRef.current = onChromeWidthsChange;
+  useLayoutEffect(() => {
+    if (fill || paneWidth <= 0) return;
+    if (
+      chromeReportRef.current.control === shownControl &&
+      chromeReportRef.current.node === shownNodeWork
+    ) {
+      return;
+    }
+    chromeReportRef.current = { control: shownControl, node: shownNodeWork };
+    onChromeWidthsChangeRef.current?.(shownControl, shownNodeWork);
+  }, [fill, paneWidth, shownControl, shownNodeWork]);
 
   const nodeWorkColumn = (
     <div
+      ref={nodePaneRef}
       style={fill ? undefined : { width: shownNodeWork }}
       className={`flex flex-col min-h-0 ${
         fill ? 'w-full border-t border-[#27272a]' : 'shrink-0'
@@ -7678,6 +10369,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
 
   const conductorColumn = (
       <div
+        ref={controlPaneRef}
         style={fill ? undefined : { width: shownControl }}
         className={`flex flex-col min-h-0 bg-[#121215] ${
           fill ? 'w-full h-full' : 'shrink-0 min-w-0 border-l border-[#27272a]'
@@ -7767,34 +10459,46 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
             <PlannerPlanPanel
               plan={plannerPlanView}
               isBusy={showStreamingUi}
-              isPaused={planPaused || (!showStreamingUi && isPlanActive(plannerPlanView))}
+              isPaused={
+                planPaused ||
+                (!showStreamingUi &&
+                  isPlanActive(plannerPlanView) &&
+                  !!plannerPlanView?.resumePhase &&
+                  !heldRef.current)
+              }
               onPause={handleStop}
               onResume={() => void resumeActivePlan()}
               onSkipStep={stepId => {
                 const plan = plannerPlanRef.current;
                 if (!plan) return;
+                logRun({ kind: 'user', action: 'skip', stepId: String(stepId) });
                 void commitPlannerPlan(skipStep(plan, stepId, 'Skipped.'));
               }}
               onEditStepTask={(stepId, taskId, text) => {
                 const plan = plannerPlanRef.current;
                 if (!plan) return;
+                logRun({ kind: 'user', action: 'edit', stepId: String(stepId), text: text.slice(0, 300) });
                 void commitPlannerPlan(editStepTask(plan, stepId, taskId, { title: text }));
               }}
               onRetryStep={stepId => {
                 const plan = plannerPlanRef.current;
                 if (!plan) return;
+                logRun({ kind: 'user', action: 'retry', stepId: String(stepId) });
                 const next = retryFailedStep(plan, stepId);
                 if (next === plan) return;
-                void (async () => {
-                  await commitPlannerPlan(next);
-                  if (!isStreaming && !heldRef.current) await dispatchActiveStep();
-                })();
+                void runAsUser('retry', async run => {
+                  await commitPlannerPlan(next, run.token);
+                  if (!runLive(run)) return;
+                  await dispatchActiveStep(run);
+                });
               }}
               onUndoStep={stepId => {
+                logRun({ kind: 'user', action: 'undo', stepId: String(stepId) });
                 void (async () => {
                   const snap = stepSnapshotsRef.current.get(String(stepId));
                   const plan = plannerPlanRef.current;
                   if (!plan) return;
+                  const undoConversationId = conversationIdRef.current;
                   if (!snap?.length) {
                     setExecutingPlanNotice(`No pre-coder snapshot for step #${stepId}.`);
                     return;
@@ -7802,6 +10506,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                   for (const file of snap) {
                     await onApplyFileWrite(file.path, file.content);
                   }
+                  if (conversationIdRef.current !== undoConversationId) return;
                   await commitPlannerPlan({
                     ...plan,
                     status: 'active',
@@ -7825,6 +10530,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                       };
                     })
                   });
+                  if (conversationIdRef.current !== undoConversationId) return;
                   setPlanPaused(true);
                   setExecutingPlanNotice(
                     `Restored the pre-coder files for step #${stepId} and marked it pending.`
@@ -7840,109 +10546,205 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
         </div>
 
         <div className="p-2.5 border-t border-[#27272a] space-y-2 shrink-0 text-[10px] overflow-y-auto max-h-[45%]">
-          <div className="grid grid-cols-1 gap-2">
-            <div className="flex flex-col space-y-1">
-              <span className="text-zinc-500 font-medium flex items-center space-x-1">
-                {isFrontier ? <Cloud className="w-3 h-3 text-sky-400 shrink-0" /> : <Cpu className="w-3 h-3 text-emerald-400 shrink-0" />}
-                <span>Computer</span>
-                <HelpTip title="Computer" align="right">
-                  <p>The machine that answers. Turn on “Choose a computer for me” under Automation if you want Studio to pick.</p>
-                </HelpTip>
-              </span>
-              <select
-                value={nodes.some(n => n.id === targetNodeId) ? targetNodeId : ''}
-                onChange={(e) => {
-                  const newNodeId = e.target.value;
-                  setTargetNodeId(newNodeId);
-                  setAutoSelectEndpoint(false);
-                  const nextNode = nodes.find(n => n.id === newNodeId);
-                  if (nextNode) {
-                    setTargetModel(
-                      pickBestModelForComplexity(nextNode, 'heavy') || getPreferredModelForNode(nextNode)
-                    );
-                  }
-                }}
-                disabled={nodes.length === 0}
-                className="bg-[#1c1c24] border border-[#2a2a36] text-zinc-200 rounded px-2 py-1 outline-none text-[11px] truncate disabled:opacity-50"
-              >
-                {nodes.length === 0 ? (
-                  <option value="">No endpoints — open Hardware & Models</option>
-                ) : (
-                  nodes.map(n => (
-                    <option key={n.id} value={n.id} disabled={!n.online}>
-                      {n.name}
-                      {n.specialty && SPECIALTY_META[n.specialty]
-                        ? ` [${SPECIALTY_META[n.specialty].shortLabel}]`
-                        : ''}{' '}
-                      {n.online ? `(${n.latency}ms)` : '(Offline)'}
-                    </option>
-                  ))
-                )}
-              </select>
-            </div>
-            <div className="flex flex-col space-y-1">
-              <span className="text-zinc-500 font-medium flex items-center justify-between">
-                <span>Model</span>
-                <span className="flex items-center gap-1.5 font-mono text-[9px]">
-                  {activeTargetMaxCtx > 0 && (
-                    <span
-                      className="text-sky-400/90"
-                      title="Studio max context for this model (Hardware & Models → Models). Worker prompts are shaped to this ceiling."
+          <div className="flex flex-col space-y-1.5">
+            <span className="text-zinc-500 font-medium flex items-center space-x-1">
+              <Cpu className="w-3 h-3 text-emerald-400 shrink-0" />
+              <span>Models</span>
+              <HelpTip title="Planner, Coder, and Reviewer" align="right">
+                <p>
+                  Each role can use its own computer and model. Auto keeps the usual routing. Choose a
+                  computer for me, and Cloud, still apply to roles left on Auto. Swarm still sends different
+                  files to every GPU.
+                </p>
+                <p>
+                  Context is that model&apos;s max window. Changing it reloads the model, so it waits until
+                  the run finishes.
+                </p>
+              </HelpTip>
+            </span>
+            {(['planner', 'coder', 'reviewer'] as const).map(role => {
+              const label = role === 'planner' ? 'Planner' : role === 'coder' ? 'Coder' : 'Reviewer';
+              const pick = explicitRolePick(roleRoutes, role);
+              const resolved = resolvedRole(role);
+              const usable = resolved?.source === 'pick';
+              const fallbackReason = pick && resolved?.fallbackReason ? resolved.fallbackReason : undefined;
+              const runningNode = resolved?.node;
+              const runningModel = resolved?.model || '';
+              const node = pick ? nodes.find(item => item.id === pick.nodeId) : runningNode;
+              const model = pick?.model || runningModel;
+              const explicit = !!pick;
+              const enabledModels = node ? getEnabledModelsForNode(node) : [];
+              const modelOptions =
+                explicit && model && !enabledModels.includes(model) ? [model, ...enabledModels] : enabledModels;
+              const personaCtx =
+                role === 'planner' ? plannerAgent.numCtx : role === 'reviewer' ? reviewerAgent.numCtx : coderAgent.numCtx;
+              const pinned =
+                runningNode && runningModel ? pinnedNumCtx(runningNode, runningModel, personaCtx) : 0;
+              const info = node?.models?.find(item => item.name === model);
+              const runningInfo = runningNode?.models?.find(item => item.name === runningModel);
+              const choice =
+                usable && runningModel
+                  ? modelContextSelect(runningModel, runningInfo, pinned)
+                  : undefined;
+              const thinkInfo =
+                info ||
+                (node?.modelMeta?.[model]
+                  ? {
+                      name: model,
+                      capabilities: node.modelMeta[model].capabilities,
+                      thinking: node.modelMeta[model].thinking
+                    }
+                  : undefined);
+              const supportsThink = !!model && modelSupportsThinking(thinkInfo);
+              const thinkPref = node?.modelPrefs?.[model]?.think;
+              const thinkOn =
+                thinkPref === true ||
+                thinkPref === 'true' ||
+                (typeof thinkPref === 'string' && thinkPref !== 'false');
+              const ctxTitle = isStreaming
+                ? 'Changing context reloads the model. Wait until this run finishes.'
+                : fallbackReason
+                  ? `${fallbackReason}. This pick will not run, so context cannot be changed.`
+                  : usable
+                    ? 'Max context for this model on this computer.'
+                    : runningModel
+                      ? `Auto right now: ${runningNode?.name || 'Auto'} / ${runningModel}`
+                      : 'Auto has no model online.';
+              const selectClass =
+                'bg-[#1c1c24] border border-[#2a2a36] text-zinc-200 rounded px-1 py-0.5 outline-none text-[10px] truncate disabled:opacity-50 min-w-0 w-full';
+              return (
+                <div key={role} className="space-y-0.5">
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="text-[9px] uppercase tracking-wide text-zinc-500 flex items-center gap-1">
+                      {node && isFrontierNode(node) ? (
+                        <Cloud className="w-2.5 h-2.5 text-sky-400" />
+                      ) : null}
+                      {label}
+                    </span>
+                    {supportsThink && onToggleModelThinking && node && model && (
+                      <button
+                        type="button"
+                        onClick={() => onToggleModelThinking(node.id, model, !thinkOn)}
+                        className={`shrink-0 flex items-center gap-0.5 px-1 py-0.5 rounded border text-[9px] font-medium ${
+                          thinkOn
+                            ? 'bg-violet-600/25 border-violet-500/40 text-violet-200'
+                            : 'bg-[#18181d] border-[#2a2a34] text-zinc-400'
+                        }`}
+                        title="Thinking: on is slower and more careful"
+                        aria-pressed={thinkOn}
+                      >
+                        <Brain className={`w-2.5 h-2.5 ${thinkOn ? 'text-violet-300' : 'text-zinc-500'}`} />
+                        <span>{thinkingToggleLabel(thinkOn)}</span>
+                      </button>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.15fr)_3.25rem] gap-1">
+                    <select
+                      aria-label={`${label} computer`}
+                      value={explicit ? pick.nodeId : ''}
+                      disabled={nodes.length === 0}
+                      onChange={e => {
+                        const nodeId = e.target.value;
+                        if (!nodeId) {
+                          const next = { ...roleRoutesRef.current };
+                          delete next[role];
+                          commitRoleRoutes(next);
+                          return;
+                        }
+                        const nextNode = nodes.find(item => item.id === nodeId);
+                        const nextModel = nextNode
+                          ? getPreferredModelForNode(nextNode) ||
+                            pickBestModelForComplexity(nextNode, 'heavy') ||
+                            ''
+                          : '';
+                        if (!nextNode || !nextModel) {
+                          setExecutingPlanNotice(`${nextNode?.name || 'That computer'} has no enabled model.`);
+                          return;
+                        }
+                        commitRoleRoutes({
+                          ...roleRoutesRef.current,
+                          [role]: { nodeId, model: nextModel }
+                        });
+                      }}
+                      className={selectClass}
                     >
-                      {activeTargetMaxCtx.toLocaleString()} ctx
-                    </span>
+                      <option value="">Auto</option>
+                      {pick && !nodes.some(item => item.id === pick.nodeId) && (
+                        <option value={pick.nodeId}>{pick.nodeId} (missing)</option>
+                      )}
+                      {nodes.map(item => (
+                        <option key={item.id} value={item.id} disabled={!item.online}>
+                          {item.name}
+                          {item.online ? '' : ' (offline)'}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      aria-label={`${label} model`}
+                      value={explicit ? model : ''}
+                      disabled={!explicit || modelOptions.length === 0}
+                      title={explicit ? model : ctxTitle}
+                      onChange={e => {
+                        const nextModel = e.target.value;
+                        if (!nextModel || !pick) {
+                          const next = { ...roleRoutesRef.current };
+                          delete next[role];
+                          commitRoleRoutes(next);
+                          return;
+                        }
+                        commitRoleRoutes({
+                          ...roleRoutesRef.current,
+                          [role]: { nodeId: pick.nodeId, model: nextModel }
+                        });
+                      }}
+                      className={selectClass}
+                    >
+                      {!explicit ? (
+                        <option value="">{runningModel ? `Auto · ${runningModel}` : 'Auto'}</option>
+                      ) : modelOptions.length === 0 ? (
+                        <option value={model}>{model || 'No models'}</option>
+                      ) : (
+                        <>
+                          <option value="">Auto (computer + model)</option>
+                          {modelOptions.map(item => (
+                            <option key={item} value={item}>
+                              {item}
+                            </option>
+                          ))}
+                        </>
+                      )}
+                    </select>
+                    <select
+                      aria-label={`${label} context`}
+                      value={usable && choice ? choice.value : pinned || 'none'}
+                      disabled={!usable || isStreaming || !choice}
+                      title={ctxTitle}
+                      onChange={e => {
+                        if (!usable || !runningNode || !runningModel) return;
+                        writeModelNumCtx(runningNode.id, runningModel, parseInt(e.target.value, 10));
+                      }}
+                      className={`${selectClass} font-mono`}
+                    >
+                      {usable && choice ? (
+                        choice.options.map(size => (
+                          <option key={size} value={size}>
+                            {formatCtxLabel(size)}
+                          </option>
+                        ))
+                      ) : (
+                        <option value={pinned || 'none'}>{pinned ? formatCtxLabel(pinned) : '—'}</option>
+                      )}
+                    </select>
+                  </div>
+                  {fallbackReason && (
+                    <p className="text-[9px] leading-snug text-amber-400/90" title={fallbackReason}>
+                      {fallbackReason}
+                      {runningModel ? ` — using ${runningNode?.name || 'Auto'} / ${runningModel}` : ''}
+                    </p>
                   )}
-                  {benchmarkStat && (
-                    <span className="text-amber-400 flex items-center space-x-0.5">
-                      <Zap className="w-2.5 h-2.5" />
-                      <span>{benchmarkStat.evalTokPerSec} t/s</span>
-                    </span>
-                  )}
-                </span>
-              </span>
-              <select
-                value={activeTargetModel}
-                onChange={(e) => {
-                  const newModel = e.target.value;
-                  if (!newModel) return;
-                  setTargetModel(newModel);
-                  if (selectedNode) onSelectNodeModel?.(selectedNode.id, newModel);
-                }}
-                disabled={effectiveModels.length === 0}
-                className="bg-[#1c1c24] border border-[#2a2a36] text-zinc-200 rounded px-2 py-1 outline-none text-[11px] truncate disabled:opacity-50"
-              >
-                {effectiveModels.length === 0 ? (
-                  <option value="">
-                    {!selectedNode
-                      ? 'Add an endpoint in Hardware & Models'
-                      : selectedNode.online
-                        ? 'No models installed — pull in Hardware & Models'
-                        : 'Node offline / no models'}
-                  </option>
-                ) : (
-                  effectiveModels.map(m => (
-                    <option key={m} value={m}>
-                      {m}
-                    </option>
-                  ))
-                )}
-              </select>
-              {selectedSupportsThink && onToggleModelThinking && selectedNode && activeTargetModel && (
-                <button
-                  type="button"
-                  onClick={() => onToggleModelThinking(selectedNode.id, activeTargetModel, !selectedThinkOn)}
-                  className={`w-full flex items-center justify-center space-x-1.5 px-2 py-1 rounded border text-[10px] font-medium transition ${
-                    selectedThinkOn
-                      ? 'bg-violet-600/25 border-violet-500/40 text-violet-200'
-                      : 'bg-[#18181d] border-[#2a2a34] text-zinc-400 hover:text-zinc-200'
-                  }`}
-                  title="Qwen3-style thinking: ON = deeper/slower, OFF = faster direct answers"
-                >
-                  <Brain className={`w-3 h-3 ${selectedThinkOn ? 'text-violet-300' : 'text-zinc-500'}`} />
-                  <span>{thinkingToggleLabel(!!selectedThinkOn)}</span>
-                </button>
-              )}
-            </div>
+                </div>
+              );
+            })}
           </div>
 
           <AutomationDrawer
@@ -7975,6 +10777,12 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
               autoReviewRef.current = next;
               setAutoReview(next);
               onConductorPrefsChange?.({ autoReview: next });
+            }}
+            fullAuto={fullAuto}
+            onFullAuto={next => {
+              fullAutoRef.current = next;
+              setFullAuto(next);
+              onConductorPrefsChange?.({ fullAuto: next });
             }}
           />
 
@@ -8011,13 +10819,12 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
                 setAutoConfigMode('confirm');
               }}
               onSelectNode={nodeId => {
-                setTargetNodeId(nodeId);
-                const nextNode = nodesRef.current.find(n => n.id === nodeId);
-                if (nextNode) {
-                  setTargetModel(
-                    pickBestModelForComplexity(nextNode, 'heavy') || getPreferredModelForNode(nextNode)
-                  );
-                }
+                const nextNode = nodesRef.current.find(item => item.id === nodeId);
+                if (!nextNode) return;
+                const model =
+                  pickBestModelForComplexity(nextNode, 'heavy') || getPreferredModelForNode(nextNode);
+                if (!model) return;
+                commitRoleRoutes({ ...roleRoutesRef.current, coder: { nodeId, model } });
               }}
             />
           )}
@@ -8028,13 +10835,12 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
   return (
     <div
       id="agent-conductor-root"
-      style={fill ? undefined : { width }}
       className={`h-full bg-[#161619] border-l border-[#27272a] flex min-w-0 relative ${
-        fill ? 'w-full flex-col select-text' : 'flex-row select-none shrink-0'
+        fill ? 'w-full flex-col select-text' : 'flex-1 flex-row select-none min-w-0'
       }`}
     >
       {/* Left — Conversation */}
-      <div className={`flex-1 flex flex-col min-h-0 overflow-hidden ${fill ? 'min-w-0' : 'min-w-[320px]'}`}>
+      <div className={`flex-1 flex flex-col min-h-0 overflow-hidden ${fill || liveColumns.transcriptMin < TRANSCRIPT_MIN ? 'min-w-0' : 'min-w-[320px]'}`}>
       <div className="p-3 border-b border-[#27272a] bg-[#121215] flex flex-col space-y-2 shrink-0">
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center space-x-1.5 text-xs font-bold text-zinc-200 min-w-0">
@@ -8118,9 +10924,74 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
               )}
             </div>
 
+            {!isWebConsoleClient() && (
+            <div className="relative" ref={runLogMenuRef}>
+              <button
+                type="button"
+                onClick={() => {
+                  setHistoryOpen(false);
+                  setRunLogOpen(open => !open);
+                }}
+                className={`flex items-center space-x-1 px-1.5 py-1 rounded text-[11px] font-medium border border-transparent transition ${
+                  runLogOpen
+                    ? 'bg-sky-600/20 text-sky-100 border-sky-500/30'
+                    : 'text-zinc-300 hover:text-white hover:bg-[#202026] hover:border-[#2a2a36]'
+                }`}
+                title="Copy this Conductor's run log"
+                aria-expanded={runLogOpen}
+                aria-label="Run log"
+              >
+                <ScrollText className="w-3.5 h-3.5 text-sky-300" />
+                <span>Log</span>
+                {runLogFailures > 0 && (
+                  <span className="min-w-[1rem] rounded-full bg-rose-500/90 px-1 text-[9px] font-semibold leading-4 text-white">
+                    {runLogFailures > 99 ? '99+' : runLogFailures}
+                  </span>
+                )}
+              </button>
+              {runLogOpen && (
+                <div className="absolute right-0 top-full mt-1 z-40 w-44 bg-[#1a1a20] border border-[#2e2e3a] rounded-lg shadow-xl py-1">
+                  <button
+                    type="button"
+                    onClick={copyRunLog}
+                    className="w-full text-left px-2.5 py-1.5 text-[11px] text-zinc-200 hover:bg-[#252530]"
+                  >
+                    {runLogCopyState === 'copied'
+                      ? 'Copied'
+                      : runLogCopyState === 'failed'
+                        ? 'Copy failed'
+                        : 'Copy run log'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void openRunLogFile()}
+                    disabled={!workspacePath || !conversation?.id}
+                    className="w-full text-left px-2.5 py-1.5 text-[11px] text-zinc-200 hover:bg-[#252530] disabled:opacity-40 disabled:hover:bg-transparent"
+                  >
+                    Open log file
+                  </button>
+                  <button
+                    type="button"
+                    onClick={clearRunLog}
+                    className="w-full text-left px-2.5 py-1.5 text-[11px] text-zinc-200 hover:bg-[#252530]"
+                  >
+                    Clear log
+                  </button>
+                  {runLogSaveError && (
+                    <div className="px-2.5 py-1 text-[10px] text-rose-300" title={runLogSaveError}>
+                      Save failed
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+            )}
             <button
               type="button"
-              onClick={() => fitContext(modelMaxCtx(selectedNode, activeTargetModel), true, activeTargetModel)}
+              onClick={() => {
+                logRun({ kind: 'user', action: 'compact' });
+                fitContext(modelMaxCtx(selectedNode, activeTargetModel), true, activeTargetModel);
+              }}
               disabled={isStreaming || messages.length < 6}
               className="flex items-center space-x-1 px-1.5 py-1 rounded text-[11px] font-medium text-zinc-300 hover:text-white hover:bg-[#202026] border border-transparent hover:border-[#2a2a36] transition disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-zinc-300"
               title="Compact this chat. The work log keeps the finished steps and the next step."
@@ -8513,31 +11384,30 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
             orientation="vertical"
             label="Resize conductor column"
             value={shownControl}
-            min={200}
-            max={560}
-            active={resizingControl}
-            onDragStart={() => setResizingControl(true)}
+            min={Math.min(controlMin, shownControl)}
+            max={Math.max(shownControl, controlMax)}
+            valueSide="after"
+            resetValue={CONTROL_DEFAULT}
+            active={controlDrag.dragging}
+            onPointerDown={controlDrag.onPointerDown}
             onChange={next => {
               controlColWidthRef.current = next;
               setControlColWidth(next);
             }}
-            onCommit={next => {
-              controlColWidthRef.current = next;
-              setControlColWidth(next);
-              onControlWidthChange?.(next);
-            }}
+            onCommit={commitControlWidth}
           />
           {conductorColumn}
           <SplitHandle
             orientation="vertical"
             label="Resize node work column"
             value={shownNodeWork}
-            min={nodeWorkCollapsed ? NODE_WORK_RAIL : 200}
-            max={nodeWorkCollapsed ? NODE_WORK_RAIL : 480}
-            active={resizingNodeWork}
-            onDragStart={() => {
-              if (!nodeWorkCollapsed) setResizingNodeWork(true);
-            }}
+            min={nodeWorkCollapsed ? NODE_WORK_RAIL : Math.min(nodeMin, shownNodeWork)}
+            max={nodeWorkCollapsed ? NODE_WORK_RAIL : Math.max(shownNodeWork, nodeMax)}
+            valueSide="after"
+            resetValue={NODE_WORK_DEFAULT}
+            disabled={nodeWorkCollapsed}
+            active={nodeDrag.dragging}
+            onPointerDown={nodeDrag.onPointerDown}
             onChange={next => {
               if (nodeWorkCollapsed) return;
               nodeWorkColWidthRef.current = next;
@@ -8545,9 +11415,7 @@ Break this into ordered <execution_plan> steps with concrete coder tasks. Do not
             }}
             onCommit={next => {
               if (nodeWorkCollapsed) return;
-              nodeWorkColWidthRef.current = next;
-              setNodeWorkColWidth(next);
-              onNodeWorkWidthChange?.(next);
+              commitNodeWorkWidth(next);
             }}
           />
           {nodeWorkColumn}

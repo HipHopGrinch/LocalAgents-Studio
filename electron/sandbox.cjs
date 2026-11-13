@@ -71,6 +71,16 @@ function resolveJailedPath(root, target, opts = {}) {
       return full;
     } catch (err) {
       if (err && (err.code === 'ENOENT' || err.code === 'ENOTDIR')) {
+        let danglingLink = false;
+        try {
+          const st = fsImpl.lstatSync(cursor);
+          danglingLink = !!st && typeof st.isSymbolicLink === 'function' && st.isSymbolicLink();
+        } catch (lerr) {
+          if (!lerr || (lerr.code !== 'ENOENT' && lerr.code !== 'ENOTDIR')) {
+            throw new Error('Path is outside the open workspace');
+          }
+        }
+        if (danglingLink) throw new Error('Refusing to use a symlink or junction');
         const parent = path.dirname(cursor);
         if (parent === cursor) throw new Error('Path is outside the open workspace');
         missing.push(path.basename(cursor));
@@ -84,19 +94,16 @@ function resolveJailedPath(root, target, opts = {}) {
 }
 
 const DESTRUCTIVE_CMD =
-  /\brm\s+-rf\b|\bformat\s+[a-z]:|\bdiskpart\b|\bmkfs\b|\bdd\s+if=|\bshutdown\b|\breboot\b|\bgit\s+push\b[^\n]*(--force|\s-f\b)|\bgit\s+reset\b[^\n]*--hard|\bgit\s+clean\b[^\n]*-[a-z]*f|\bgit\s+checkout\s+--\s+\./i;
+  /\brm\s+-rf\b|\bformat\s+[a-z]:|\bformat-volume\b|\bclear-disk\b|\binitialize-disk\b|\bremove-partition\b|\bdiskpart\b|\bmkfs\b|\bdd\s+if=|\bshutdown\b|\breboot\b|\bgit(?:\.exe)?\b[^\n;&|]*?\bpush\b[^\n]*(--force|\s-f\b)|\bgit(?:\.exe)?\b[^\n;&|]*?\breset\b[^\n]*--hard|\bgit(?:\.exe)?\b[^\n;&|]*?\bclean\b[^\n]*-[a-z]*f|\bgit(?:\.exe)?\b[^\n;&|]*?\bcheckout\b[^\n]*\s--\s+\./i;
+
+/** `rm`, `del`, `rd`, `erase`, `rmdir`, `ri` and `remove-item` are one group in PowerShell. */
+const RECURSIVE_DELETE =
+  /(?<![\w.\\/-])(?<!\bgit )(?:remove-item|rmdir|erase|del|rd|rm|ri)(?![\w-])[^;&|]*?(?:\s-r(?:ec\w*|e)?(?![\w-])|\s\/s(?!\w))/i;
 
 /** PowerShell / cmd destructive deletes with flags in any order. Mirrors the renderer denylist. */
 function isDestructiveDelete(cmd) {
   const c = String(cmd || '').replace(/\s+/g, ' ');
-  if (/\b(remove-item|ri)\b/i.test(c) && /(-\s*recurse|\s-r\b)/i.test(c) && /(-\s*force|\s-fo\b)/i.test(c)) {
-    return true;
-  }
-  if (/\b(del|erase|rd|rmdir)\b/i.test(c) && /\/s\b/i.test(c) && /\/[fq]\b/i.test(c)) {
-    return true;
-  }
-  if (/\bdel\s+\/s\b/i.test(c) || /\brmdir\s+\/s\b/i.test(c)) return true;
-  return false;
+  return RECURSIVE_DELETE.test(c);
 }
 
 /**
@@ -145,6 +152,7 @@ function isIndirectShellWrapper(cmd) {
 function isLinkCreate(cmd) {
   const c = normalizeForDeny(cmd);
   if (/\bmklink\b/i.test(c)) return true;
+  if (/\bfsutil(?:\.exe)?\b[^;&|]*\bhardlink\b/i.test(c)) return true;
   if (
     /\b(?:new-item|ni)\b/i.test(c) &&
     /-\s*itemtype\b/i.test(c) &&
@@ -196,7 +204,12 @@ function recheckJailedLeaf(root, resolvedPath, opts = {}) {
   let parentReal;
   try {
     parentReal = fsImpl.realpathSync(parent);
-  } catch {
+  } catch (err) {
+    // A new folder (e.g. src/types/) does not exist until the caller mkdirs it.
+    // Validate the nearest existing ancestor instead; callers recheck after mkdir.
+    if (err && (err.code === 'ENOENT' || err.code === 'ENOTDIR')) {
+      return resolveJailedPath(root, resolvedPath, { fsImpl });
+    }
     throw new Error('Path is outside the open workspace');
   }
   if (!relativeToRoot(rootReal, parentReal).inside) {
@@ -215,6 +228,9 @@ function recheckJailedLeaf(root, resolvedPath, opts = {}) {
   }
   if (typeof lst.isSymbolicLink === 'function' && lst.isSymbolicLink()) {
     throw new Error('Refusing to use a symlink or junction');
+  }
+  if (typeof lst.isFile === 'function' && lst.isFile() && lst.nlink > 1) {
+    throw new Error('Refusing to use a hardlink: the file has more than one link');
   }
   let realLeaf;
   try {

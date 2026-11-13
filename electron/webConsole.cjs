@@ -218,6 +218,7 @@ function webRpcDenial(channel, args) {
     name === 'terminal:execute' ||
     name === 'terminal:kill' ||
     name === 'terminal:getBuffer' ||
+    name === 'terminal:clearBuffer' ||
     name === 'git:run' ||
     name === 'mcp:call' ||
     name === 'workspace:installDeps' ||
@@ -446,19 +447,22 @@ async function handleApi(req, res) {
       }
       const ip = String(req.socket?.remoteAddress || 'unknown');
       const now = Date.now();
-      let attempt = loginAttempts.get(ip) || { count: 0, lockedUntil: 0 };
+      let attempt = loginAttempts.get(ip);
+      if (!attempt) {
+        attempt = { count: 0, lockedUntil: 0 };
+        loginAttempts.set(ip, attempt);
+      }
       if (attempt.lockedUntil > now) {
         const waitSec = Math.ceil((attempt.lockedUntil - now) / 1000);
         return sendJson(res, 429, { error: `Too many attempts. Retry in ${waitSec}s` });
       }
+      attempt.count += 1;
+      if (attempt.count >= 5) {
+        const lockMs = Math.min(60_000 * 2 ** Math.min(attempt.count - 5, 4), 15 * 60_000);
+        attempt.lockedUntil = now + lockMs;
+      }
       const ok = await verifyPassword(password, config.passwordHash, config.passwordSalt);
       if (!ok) {
-        attempt.count += 1;
-        if (attempt.count >= 5) {
-          const lockMs = Math.min(60_000 * 2 ** Math.min(attempt.count - 5, 4), 15 * 60_000);
-          attempt.lockedUntil = now + lockMs;
-        }
-        loginAttempts.set(ip, attempt);
         return sendJson(res, 401, { error: 'Invalid password' });
       }
       loginAttempts.delete(ip);

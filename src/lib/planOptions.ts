@@ -94,6 +94,11 @@ const CLEAN_REVIEW =
 const DIRTY_REVIEW =
   /\b(bug|bugs|issue|issues|inconsist|missing|broken|incorrect|failing|error|errors|should fix|need to fix|problem|problems|does not|doesn't|wrong)\b/i;
 
+/** "not ok", "do not approve", "no good", "isn't done": a positive word under a negation. */
+const NEGATED_POSITIVE_SRC =
+  String.raw`\b(?:not|no|never|cannot|can'?t|won'?t|(?:do|does|did|is|are|was|were|should|would)n'?t)\s+(?:(?:yet|really|quite|fully|be|been|look|looks|looking|a|the)\s+)?(?:yay|yes|pass|passed|go|approve|approved|ok|okay|good|complete|completed|done|success|correct)\b`;
+const NEGATED_POSITIVE = new RegExp(NEGATED_POSITIVE_SRC, 'i');
+
 /** After user picks an architecture option — Planner locks ordered steps + tasks. */
 export const EXECUTION_PLAN_LOCK_PROTOCOL = `## Planner lock execution plan (MANDATORY)
 
@@ -306,12 +311,16 @@ export function parseStepVerdict(
     .trim();
   const notes = [summary, notesInner].filter(Boolean).join(' — ') || body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
   const blob = `${resultRaw} ${notes}`.toLowerCase();
-  const yay = /\b(yay|yes|pass|passed|go|approve|approved|ok|good|complete|completed)\b/.test(
-    resultRaw || blob
-  );
-  const nay = /\b(nay|no|fail|failed|reject|rejected|no-?go|incomplete|wrong|missing|broken|incorrect)\b/.test(
-    resultRaw || blob
-  );
+  const verdictText = resultRaw || blob;
+  const negated = NEGATED_POSITIVE.test(verdictText);
+  const yay =
+    !negated && /\b(yay|yes|pass|passed|go|approve|approved|ok|okay|good|complete|completed)\b/.test(verdictText);
+  const nay =
+    negated ||
+    (resultRaw
+      ? /\b(nay|no|fail\w*|reject\w*|no-?go|incomplete|wrong|missing|broken|incorrect)\b/
+      : /\b(nay|fail\w*|reject\w*|no-?go|incomplete|wrong|missing|broken|incorrect)\b/
+    ).test(verdictText);
   if (!yay && !nay) {
     if (DIRTY_REVIEW.test(notes) && !CLEAN_REVIEW.test(notes)) {
       return { stepId, result: 'nay', notes: notes || 'Needs refining.' };
@@ -334,8 +343,8 @@ export function parseStepVerdict(
   }
   return {
     stepId,
-    result: nay && !yay ? 'nay' : yay ? 'yay' : 'nay',
-    notes: notes || (nay && !yay ? 'Needs refining.' : 'Step looks good.')
+    result: nay ? 'nay' : 'yay',
+    notes: notes || (nay ? 'Needs refining.' : 'Step looks good.')
   };
 }
 
@@ -354,11 +363,30 @@ export function stripStepVerdictMarkup(text: string): string {
     .trim();
 }
 
-/** Parse \`<review_plan>\` from a reviewer reply. Empty tasks = clean review. */
+/**
+ * Last closed tag, or a trailing unclosed one after it.
+ * Local models often emit the open tag and never the close.
+ */
+function lastOrTrailingTag(text: string, tag: string): { attrs: string; body: string } | null {
+  const closedRe = new RegExp(`<${tag}\\b([^>]*)>([\\s\\S]*?)<\\/${tag}\\s*>`, 'gi');
+  let picked: { attrs: string; body: string } | null = null;
+  let end = 0;
+  for (let match = closedRe.exec(text); match; match = closedRe.exec(text)) {
+    picked = { attrs: match[1] || '', body: match[2] || '' };
+    end = match.index + match[0].length;
+  }
+  const trailing = new RegExp(`<${tag}\\b([^>]*)>([\\s\\S]*)$`, 'i').exec(text.slice(end));
+  if (trailing && new RegExp(`<${tag}\\b`, 'i').test(trailing[0])) {
+    return { attrs: trailing[1] || '', body: trailing[2] || '' };
+  }
+  return picked;
+}
+
+/** Parse `<review_plan>` from a reviewer reply. Empty tasks = clean review. A trailing unclosed tag counts. */
 export function parseReviewPlan(raw: string): ReviewFixPlan | null {
   const text = (raw || '').replace(/<think>[\s\S]*?<\/think>/gi, '');
-  const block = text.match(/<review_plan>([\s\S]*?)<\/review_plan>/i)?.[1];
-  if (!block) return null;
+  const block = lastOrTrailingTag(text, 'review_plan')?.body;
+  if (!block || !block.trim()) return null;
   const summary =
     block.match(/<summary>([\s\S]*?)<\/summary>/i)?.[1]?.replace(/\s+/g, ' ').trim() ||
     'Fix the issues found in review.';
@@ -388,25 +416,30 @@ export function parseReviewDelta(raw: string): {
   notes: string;
 } | null {
   const text = (raw || '').replace(/<think>[\s\S]*?<\/think>/gi, '');
-  const m = text.match(/<review_delta\b([^>]*)>([\s\S]*?)<\/review_delta>/i);
-  if (!m) return null;
-  const attrs = m[1] || '';
-  const body = m[2] || '';
+  const tag = lastOrTrailingTag(text, 'review_delta');
+  if (!tag || !tag.body.trim()) return null;
+  const attrs = tag.attrs || '';
+  const body = tag.body || '';
   const taskId =
     /(?:^|\s)task_id\s*=\s*"([^"]*)"/i.exec(attrs)?.[1]?.trim() ||
     body.match(/<task_id>([\s\S]*?)<\/task_id>/i)?.[1]?.trim() ||
     '';
   const verdictRaw = (
-    body.match(/<verdict>([\s\S]*?)<\/verdict>/i)?.[1] || ''
+    body.match(/<verdict>([\s\S]*?)<\/verdict>/i)?.[1] ||
+    body.match(/<verdict>([\s\S]*?)(?=<notes\b|$)/i)?.[1] ||
+    ''
   )
     .toLowerCase()
     .trim();
   const notes = (
     body.match(/<notes>([\s\S]*?)<\/notes>/i)?.[1] ||
+    body.match(/<notes>([\s\S]*)$/i)?.[1] ||
     body.replace(/<\/?verdict>[\s\S]*?<\/verdict>/gi, '').replace(/\s+/g, ' ').trim()
   ).trim();
-  const completed = /\b(complete|completed|pass|passed|done|ok|success)\b/.test(verdictRaw);
-  const failed = /\b(fail|failed|incomplete|wrong|broken)\b/.test(verdictRaw);
+  const negatedVerdict = NEGATED_POSITIVE.test(verdictRaw);
+  const completed =
+    !negatedVerdict && /\b(complete|completed|pass|passed|done|ok|okay|success)\b/.test(verdictRaw);
+  const failed = negatedVerdict || /\b(fail\w*|incomplete|wrong|broken|reject\w*)\b/.test(verdictRaw);
   if (!completed && !failed) {
     if (DIRTY_REVIEW.test(notes) && !CLEAN_REVIEW.test(notes)) {
       return { taskId, verdict: 'failed', notes: notes || 'Reviewer marked failure.' };
@@ -418,8 +451,8 @@ export function parseReviewDelta(raw: string): {
   }
   return {
     taskId,
-    verdict: failed && !completed ? 'failed' : 'completed',
-    notes: notes || (failed && !completed ? 'Not done correctly.' : 'Completed.')
+    verdict: failed ? 'failed' : 'completed',
+    notes: notes || (failed ? 'Not done correctly.' : 'Completed.')
   };
 }
 

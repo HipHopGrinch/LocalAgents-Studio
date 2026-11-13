@@ -57,11 +57,16 @@ function pickTextFile(): Promise<string | null> {
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = '.enc,.json,application/json,text/plain';
+    const finish = (value: string | null) => {
+      input.remove();
+      resolve(value);
+    };
     input.onchange = async () => {
       const file = input.files?.[0];
-      if (!file) return resolve(null);
-      resolve(await file.text());
+      if (!file) return finish(null);
+      finish(await file.text());
     };
+    input.addEventListener('cancel', () => finish(null));
     input.click();
   });
 }

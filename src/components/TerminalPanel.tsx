@@ -1,5 +1,13 @@
 import React, { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { Terminal as TerminalIcon, Play, Square, Trash2, X } from 'lucide-react';
+import { SplitHandle } from './ui/SplitHandle';
+import { usePaneDrag } from '../hooks/usePaneDrag';
+import {
+  TERMINAL_DEFAULT,
+  TERMINAL_MIN,
+  renderedTerminalHeight,
+  terminalMaxHeight
+} from '../lib/paneLayout';
 
 interface TerminalPanelProps {
   isOpen: boolean;
@@ -7,25 +15,23 @@ interface TerminalPanelProps {
   workspacePath: string;
   /** Full-height pane (mobile web console). */
   fill?: boolean;
+  /** Bump to restore the default height from Reset pane sizes. */
+  resetNonce?: number;
 }
 
 const HEIGHT_KEY = 'la.terminal.height';
 const MAX_CHUNKS = 2000;
-const MIN_HEIGHT = 120;
+/** Survives unmount so hiding the editor does not apply the same reset twice. */
+let appliedTerminalReset = 0;
 
 function readStoredHeight(): number {
   try {
     const n = Number(localStorage.getItem(HEIGHT_KEY));
-    if (Number.isFinite(n) && n >= MIN_HEIGHT) return n;
+    if (Number.isFinite(n) && n >= TERMINAL_MIN) return n;
   } catch {
     /* private mode / blocked storage */
   }
-  return 256;
-}
-
-function clampHeight(n: number): number {
-  const max = Math.max(160, Math.min(720, window.innerHeight - 160));
-  return Math.round(Math.min(max, Math.max(MIN_HEIGHT, n)));
+  return TERMINAL_DEFAULT;
 }
 
 function persistHeight(n: number) {
@@ -58,16 +64,34 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   isOpen,
   onClose,
   workspacePath,
-  fill = false
+  fill = false,
+  resetNonce = 0
 }) => {
   const [output, setOutput] = useState<string[]>([]);
   const [command, setCommand] = useState('');
   const [isRunning, setIsRunning] = useState(false);
-  const [height, setHeight] = useState(() => clampHeight(readStoredHeight()));
-  const heightRef = useRef(height);
+  const [storedHeight, setStoredHeight] = useState(readStoredHeight);
+  const [previewHeight, setPreviewHeight] = useState<number | null>(null);
+  const [columnHeight, setColumnHeight] = useState(() =>
+    typeof window !== 'undefined' ? window.innerHeight : 920
+  );
+  const rootRef = useRef<HTMLDivElement>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
-  heightRef.current = height;
+  const columnHeightRef = useRef(columnHeight);
+  columnHeightRef.current = columnHeight;
+  const storedHeightRef = useRef(storedHeight);
+  storedHeightRef.current = storedHeight;
+  const height = previewHeight ?? renderedTerminalHeight(storedHeight, columnHeight);
+  const heightMax = terminalMaxHeight(columnHeight);
+
+  useEffect(() => {
+    if (!resetNonce || resetNonce === appliedTerminalReset) return;
+    appliedTerminalReset = resetNonce;
+    setStoredHeight(TERMINAL_DEFAULT);
+    setPreviewHeight(null);
+    persistHeight(TERMINAL_DEFAULT);
+  }, [resetNonce]);
 
   useEffect(() => {
     if (!window.electronAPI) return;
@@ -117,32 +141,40 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
     el.scrollTop = el.scrollHeight;
   }, [output, isOpen]);
 
-  const startResize = (e: React.PointerEvent) => {
-    if (fill) return;
-    e.preventDefault();
-    const startY = e.clientY;
-    const startH = heightRef.current;
-    const move = (ev: PointerEvent) => {
-      setHeight(clampHeight(startH - (ev.clientY - startY)));
-    };
-    const up = (ev: PointerEvent) => {
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
-      const next = clampHeight(startH - (ev.clientY - startY));
-      setHeight(next);
-      persistHeight(next);
-    };
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
+  useEffect(() => {
+    if (!isOpen || fill) return;
+    const parent = rootRef.current?.parentElement;
+    if (!parent || typeof ResizeObserver === 'undefined') return;
+    const publish = () => setColumnHeight(parent.clientHeight);
+    const obs = new ResizeObserver(publish);
+    obs.observe(parent);
+    publish();
+    return () => obs.disconnect();
+  }, [isOpen, fill]);
+
+  const commitHeight = (next: number) => {
+    setPreviewHeight(null);
+    setStoredHeight(next);
+    persistHeight(next);
   };
 
-  const bumpHeight = (delta: number) => {
-    setHeight(prev => {
-      const next = clampHeight(prev + delta);
-      persistHeight(next);
-      return next;
-    });
-  };
+  const heightDrag = usePaneDrag({
+    axis: 'y',
+    valueSide: 'after',
+    disabled: fill,
+    getMin: () => Math.min(TERMINAL_MIN, renderedTerminalHeight(storedHeightRef.current, columnHeightRef.current)),
+    getMax: () =>
+      Math.max(
+        terminalMaxHeight(columnHeightRef.current),
+        renderedTerminalHeight(storedHeightRef.current, columnHeightRef.current)
+      ),
+    getValue: () => storedHeightRef.current,
+    getPane: () => rootRef.current,
+    onPreview: next => {
+      setPreviewHeight(next === storedHeightRef.current ? null : next);
+    },
+    onCommit: commitHeight
+  });
 
   if (!isOpen) return null;
 
@@ -165,7 +197,6 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
 
   const handleKill = async () => {
     await window.electronAPI.killCommand();
-    setIsRunning(false);
   };
 
   const handleClear = async () => {
@@ -175,31 +206,25 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
 
   return (
     <div
+      ref={rootRef}
       style={fill ? undefined : { height }}
       className={`${
         fill ? 'h-full' : 'shrink-0'
       } bg-[var(--surface-1)] border-[var(--border)] flex flex-col font-mono text-xs select-text`}
     >
       {!fill && (
-        <div
-          role="separator"
-          aria-orientation="horizontal"
-          aria-label="Resize terminal"
-          aria-valuemin={MIN_HEIGHT}
-          aria-valuemax={720}
-          aria-valuenow={height}
-          tabIndex={0}
-          onPointerDown={startResize}
-          onKeyDown={e => {
-            if (e.key === 'ArrowUp') {
-              e.preventDefault();
-              bumpHeight(24);
-            } else if (e.key === 'ArrowDown') {
-              e.preventDefault();
-              bumpHeight(-24);
-            }
-          }}
-          className="h-1.5 shrink-0 cursor-row-resize border-t border-[var(--border)] bg-[#18181c] hover:bg-indigo-500/80 focus-visible:bg-indigo-500 outline-none"
+        <SplitHandle
+          orientation="horizontal"
+          label="Resize terminal"
+          value={height}
+          min={Math.min(TERMINAL_MIN, height)}
+          max={Math.max(height, heightMax)}
+          valueSide="after"
+          resetValue={TERMINAL_DEFAULT}
+          active={heightDrag.dragging}
+          onPointerDown={heightDrag.onPointerDown}
+          onChange={setPreviewHeight}
+          onCommit={commitHeight}
         />
       )}
 

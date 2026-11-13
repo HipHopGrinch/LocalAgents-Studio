@@ -122,4 +122,11 @@ const noChange = recommendQuantVariant(
 );
 assert.equal(noChange, null);
 
+// B-22: dense sizes must not resolve to the 30B MoE row or a different gemma3 size
+assert.notEqual(findCatalogModel('qwen3:32b')?.tag, 'qwen3:30b');
+assert.notEqual(findCatalogModel('qwen3:4b')?.tag, 'qwen3:30b');
+assert.notEqual(findCatalogModel('qwen3:1.7b')?.tag, 'qwen3:30b');
+assert.notEqual(findCatalogModel('gemma3:4b')?.tag, 'gemma3:12b');
+assert.equal(findCatalogModel('qwen3:30b-a3b-q4_K_M')?.tag, 'qwen3:30b');
+
 console.log('recommender.selftest ok');

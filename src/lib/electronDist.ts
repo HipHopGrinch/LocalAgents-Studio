@@ -185,7 +185,7 @@ export function summarizeElectronDist(opts: {
   return `Electron installer ready: ${exes.slice(0, 4).join(', ')}`;
 }
 
-/** Last echoed terminal prompt is an in-flight pack, so a second dist must not start. */
+/** The latest package-manager command (or its script echoes) is an in-flight pack, so a second dist must not start. */
 export function terminalLooksLikeRunningDist(content: string, running: boolean): boolean {
   if (!running) return false;
   const lines = (content || '')
@@ -193,12 +193,18 @@ export function terminalLooksLikeRunningDist(content: string, running: boolean):
     .map(l => l.trim())
     .filter(Boolean);
   const prompts = lines.filter(l => l.startsWith('>'));
-  const last = prompts.length ? prompts[prompts.length - 1] : '';
-  if (!last) return false;
-  return (
-    /CSC_IDENTITY_AUTO_DISCOVERY/i.test(last) ||
-    /npm\s+run\s+["']?(dist|pack)\b/i.test(last) ||
-    /\belectron-builder\b/i.test(last)
+  let start = prompts.length - 1;
+  for (let i = prompts.length - 1; i >= 0; i--) {
+    if (/(?:^>|[;&|])\s*(?:npm|npx|pnpm|yarn)(?:\.cmd)?\s/i.test(prompts[i])) {
+      start = i;
+      break;
+    }
+  }
+  return prompts.slice(Math.max(0, start)).some(
+    prompt =>
+      /CSC_IDENTITY_AUTO_DISCOVERY/i.test(prompt) ||
+      /npm\s+run\s+["']?(?:dist(?::[\w.-]+)?|pack(?:age)?)\b/i.test(prompt) ||
+      /\belectron-builder\b/i.test(prompt)
   );
 }
 

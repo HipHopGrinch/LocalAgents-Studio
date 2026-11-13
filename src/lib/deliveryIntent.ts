@@ -21,6 +21,15 @@ export function isDeliveryStack(value: string): value is DeliveryStack {
   return (STACKS as string[]).includes(value);
 }
 
+const NEGATION = "(?:not|no|without|never|avoid|instead of|rather than|don't use|do not use)";
+
+function stripNegated(text: string, words: string): string {
+  return text.replace(
+    new RegExp(`\\b${NEGATION}\\s+(?:(?:a|an|the|any|native|windows)\\s+)*(?:${words})(?:\\s+(?:winforms|wpf|program|app|application|project))*`, 'g'),
+    ' '
+  );
+}
+
 /**
  * Infer how the user wants the result delivered.
  * Website language without React/TypeScript means a browser-openable static site.
@@ -32,11 +41,15 @@ export function inferDeliveryStack(text: string): DeliveryStack {
   if (/\b(python|tkinter|django|flask|fastapi|\.py\b)\b/.test(t)) return 'python';
   if (/\belectron\b/.test(t)) return 'node';
   // Native Windows before generic "typescript" default
+  const nativeText = stripNegated(t, 'c#|csharp|c\\+\\+|cpp|win32|winforms|wpf|msvc|native\\s+windows');
+  const namesWebStack = /\b(react|next\.js|nextjs|typescript)\b|\.tsx\b/.test(
+    stripNegated(t, 'react|next\\.js|nextjs|typescript')
+  );
   if (
-    /\b(c\+\+|cpp|win32|gdi|msvc|cl\.exe|resource\.h|\.rc\b)\b/.test(t) ||
-    (/\b(native\s+windows|natively\s+running\s+windows|windows\s+application|\.exe)\b/.test(t) &&
-      !/\b(electron|react|html|webpage|website)\b/.test(t)) ||
-    /\b(winforms|wpf|c#|csharp)\b/.test(t)
+    /\b(c\+\+|cpp|win32|gdi|msvc|cl\.exe|resource\.h|\.rc\b)\b/.test(nativeText) ||
+    (/\b(native\s+windows|natively\s+running\s+windows|windows\s+application|\.exe)\b/.test(nativeText) &&
+      !/\b(electron|react|html|webpage|website)\b/.test(nativeText)) ||
+    (!namesWebStack && /\b(winforms|wpf|csharp)\b|(^|[^a-z0-9])c#/.test(nativeText))
   ) {
     return 'native-win32';
   }
@@ -68,7 +81,7 @@ export function stackFromFilePaths(paths: string[]): DeliveryStack | null {
         p.endsWith('.rc') ||
         p.endsWith('.cs') ||
         p.endsWith('resource.h') ||
-        /(^|\/)build\.bat$/.test(p)
+        /(^|\/)build\.bat$/.test(p.replace(/\\/g, '/'))
     )
   ) {
     return 'native-win32';

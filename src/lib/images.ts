@@ -106,6 +106,9 @@ export function modelSupportsVision(
   const caps = live?.capabilities || node?.modelMeta?.[modelName]?.capabilities || [];
   if (caps.includes('vision')) return true;
 
+  const lowered = modelName.toLowerCase();
+  if (/(?:^|\/)gemma3:(?:1b|270m)(?![a-z0-9.])/.test(lowered)) return false;
+
   const catalog = MODEL_CATALOG.find(m => {
     const a = m.tag.toLowerCase();
     const b = modelName.toLowerCase();
@@ -113,6 +116,5 @@ export function modelSupportsVision(
   });
   if (catalog?.caps.includes('vision')) return true;
 
-  const n = modelName.toLowerCase();
-  return /gemma4|gemma3|llava|moondream|minicpm-v|qwen2\.5-vl|qwen3-vl|llama3\.2-vision|vision/.test(n);
+  return /gemma4|gemma3|llava|moondream|minicpm-v|qwen2\.5-vl|qwen3-vl|(?:^|[^a-z0-9])vision(?![a-z0-9])/.test(lowered);
 }

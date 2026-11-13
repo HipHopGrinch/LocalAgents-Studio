@@ -42,6 +42,16 @@ assert.equal(ranked[0], 'src/keep/TaskTarget.ts');
 assert.ok(ranked.length <= 8);
 assert.ok(!ranked.some(f => f.includes('node_modules') || f.includes('junk/')));
 
+const appMap: RepoMap = {
+  files: ['src/App.tsx', 'src/styles.css', 'src/button.tsx'],
+  symbols: [{ file: 'src/App.tsx', name: 'App' }],
+  builtAt: 60
+};
+assert.deepEqual(relevantFilesForTask(appMap, 'apply the padding change', 8), []);
+assert.deepEqual(relevantFilesForTask(appMap, 'the application looks happy', 8), []);
+assert.equal(relevantFilesForTask(appMap, 'fix the App layout', 8)[0], 'src/App.tsx');
+assert.equal(relevantFilesForTask(appMap, 'edit src/App.tsx please', 8)[0], 'src/App.tsx');
+
 const tight = formatRepoMap(map, 'tight', 'update TaskTarget');
 assert.match(tight, /src\/keep\/TaskTarget\.ts/);
 assert.match(tight, /TaskTarget/);

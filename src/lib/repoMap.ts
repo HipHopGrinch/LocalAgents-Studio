@@ -159,6 +159,11 @@ export async function buildRepoMap(root: string): Promise<RepoMap> {
   return { files, symbols, builtAt: Date.now() };
 }
 
+function hasWord(text: string, word: string): boolean {
+  const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^a-z0-9])${escaped}($|[^a-z0-9])`).test(text);
+}
+
 function taskTokens(taskText: string): string[] {
   return (taskText || '').toLowerCase().match(/[a-z0-9_./-]{3,}/g) || [];
 }
@@ -177,8 +182,8 @@ export function relevantFilesForTask(map: RepoMap | null, taskText: string, limi
     const lower = file.toLowerCase().replace(/\\/g, '/');
     const base = lower.split('/').pop() || lower;
     const stem = base.replace(/\.[a-z0-9]+$/, '');
-    if (base.length > 2 && lowerTask.includes(base)) score += 10;
-    if (stem.length > 2 && (tokens.has(stem) || lowerTask.includes(stem))) score += 6;
+    if (base.length > 2 && hasWord(lowerTask, base)) score += 10;
+    if (stem.length > 2 && (tokens.has(stem) || hasWord(lowerTask, stem))) score += 6;
     for (const tok of tokens) {
       if (tok.length >= 4 && tok !== base && tok !== stem && lower.includes(tok)) score += 2;
     }
@@ -186,7 +191,7 @@ export function relevantFilesForTask(map: RepoMap | null, taskText: string, limi
       if (sym.file.replace(/\\/g, '/') !== file.replace(/\\/g, '/')) continue;
       const name = sym.name.toLowerCase();
       if (name.length < 2) continue;
-      if (tokens.has(name) || lowerTask.includes(name)) score += 5;
+      if (tokens.has(name) || hasWord(lowerTask, name)) score += 5;
     }
     return { file, score };
   });

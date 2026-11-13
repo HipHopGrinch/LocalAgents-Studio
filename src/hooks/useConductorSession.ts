@@ -133,6 +133,8 @@ export async function awaitConductorChat(
   opts: {
     registerAbort: (abort: () => void) => void;
     live: () => boolean;
+    /** Same-node stream retry is about to run. Must not throw. */
+    onStreamRetry?: (error: unknown) => void;
   }
 ): Promise<{ aborted: true } | { aborted: false; result: ChatResult; handle: ChatHandle }> {
   const once = async (
@@ -148,6 +150,11 @@ export async function awaitConductorChat(
       return { aborted: false, result, handle };
     } catch (err) {
       if (allowRetry && isRetriableStreamError(err) && opts.live()) {
+        try {
+          opts.onStreamRetry?.(err);
+        } catch {
+          /* retry logging must not replace the retry */
+        }
         return once(false);
       }
       throw err;

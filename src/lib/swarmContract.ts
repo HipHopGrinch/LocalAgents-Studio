@@ -948,7 +948,7 @@ The workspace, installs, and terminal live on the Dev PC where LocalAgents Studi
     ? `
 ### CLUSTER WORKER ROSTER (Distribute tasks across these GPUs in parallel waves!)
 ${onlineWorkers.map(n => {
-  const totalVram = n.hardware?.vramGB ?? 16;
+  const totalVram = (n.hardware?.vramGB ?? 0) > 0 ? n.hardware!.vramGB : 16;
   const reserve = n.hardware?.reserveVramGB ?? 1;
   const usable = Math.max(1, +(totalVram - reserve).toFixed(1));
   const enabled = getEnabledModelsForNode(n);
@@ -1529,8 +1529,9 @@ export function groupTscErrorsByFile(
     if (m) {
       let file = m[1].trim().replace(/\\/g, '/');
       const absLower = file.toLowerCase();
-      if (absLower.startsWith(rootNorm.replace(/\\/g, '/'))) {
-        file = file.slice(workspaceRoot.length).replace(/^[\\/]+/, '');
+      const rootLower = rootNorm.replace(/\\/g, '/');
+      if (absLower === rootLower || absLower.startsWith(`${rootLower}/`)) {
+        file = file.slice(rootLower.length).replace(/^[\\/]+/, '');
       }
       // Also handle paths already relative
       file = file.replace(/\\/g, '/');

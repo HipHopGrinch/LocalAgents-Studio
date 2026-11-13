@@ -113,13 +113,67 @@ try {
   assert.ok(agentCommandBlockReason('ni -ItemType Junction link C:\\outside'));
   assert.ok(agentCommandBlockReason('cmd /c mklink /D link C:\\outside'));
   assert.ok(agentCommandBlockReason('mklink /J link C:\\outside'));
+  assert.ok(agentCommandBlockReason('fsutil hardlink create C:\\ws\\x.txt C:\\secret.txt'));
+  assert.ok(agentCommandBlockReason('fsutil.exe hardlink create x y'));
+  assert.equal(agentCommandBlockReason('fsutil file layout x.txt'), null);
+
+  // Destructive-command policy (shared with src/lib/agentLoop.ts).
+  for (const cmd of [
+    'rm -Recurse -Force .\\src',
+    'del -Recurse -Force .\\src',
+    'Remove-Item -Recurse .\\src',
+    'rd /s /q src',
+    'rmdir -r src',
+    'erase -Recurse x',
+    'ri -r x',
+    'git.exe reset --hard',
+    'git -C . reset --hard',
+    'git -c core.x=y reset --hard HEAD~1',
+    'git checkout HEAD -- .',
+    'git checkout main -- .',
+    'git checkout -- .',
+    'Format-Volume -DriveLetter C -Force',
+    'Clear-Disk -Number 1',
+    'Initialize-Disk 1',
+    'Remove-Partition -DriveLetter D',
+    'git.exe -C . push --force origin main',
+    'git clean -fd',
+    'format C:',
+    'rm -rf node_modules'
+  ]) {
+    assert.ok(agentCommandBlockReason(cmd), `expected block: ${cmd}`);
+  }
+  for (const cmd of [
+    'Remove-Item .\\dist\\old.js',
+    'rm .\\tmp.txt',
+    'git status',
+    'git checkout -b feature',
+    'git checkout src/app.ts',
+    'npm run format',
+    'git reset src/app.ts',
+    'git rm -r --cached node_modules',
+    'git -C . status'
+  ]) {
+    assert.equal(agentCommandBlockReason(cmd), null, `expected allow: ${cmd}`);
+  }
 
   const stable = recheckJailedLeaf(root, path.join(root, 'ok.txt'));
   assert.ok(pathsEqual(stable, fs.realpathSync(path.join(root, 'ok.txt'))));
   const missingLeaf = recheckJailedLeaf(root, path.join(root, 'sub', 'brand-new.txt'));
   assert.ok(missingLeaf.toLowerCase().endsWith('brand-new.txt'));
+  // Folders that do not exist yet (a fresh project writing src/types/contract.ts).
+  const missingDirs = recheckJailedLeaf(root, path.join(root, 'src', 'types', 'contract.ts'));
+  assert.ok(pathsEqual(missingDirs, path.join(fs.realpathSync(root), 'src', 'types', 'contract.ts')));
+  assert.throws(
+    () => recheckJailedLeaf(root, path.join(root, '..', path.basename(outside), 'new', 'x.txt')),
+    /outside/
+  );
   if (fs.existsSync(linkPath)) {
     assert.throws(() => recheckJailedLeaf(root, linkPath), /symlink or junction|outside/);
+    assert.throws(
+      () => recheckJailedLeaf(root, path.join(linkPath, 'new-dir', 'x.txt')),
+      /symlink or junction|outside/
+    );
   }
   try {
     const linkFile = path.join(root, 'link.txt');
@@ -128,6 +182,33 @@ try {
   } catch (err) {
     if (err && (err.code === 'EPERM' || err.code === 'ENOTSUP' || err.code === 'EACCES')) {
       console.log('skip file symlink test:', err.message);
+    } else {
+      throw err;
+    }
+  }
+
+  try {
+    const hard = path.join(root, 'hard.txt');
+    fs.linkSync(path.join(outside, 'secret.txt'), hard);
+    assert.throws(() => recheckJailedLeaf(root, hard), /hardlink/);
+    fs.unlinkSync(hard);
+  } catch (err) {
+    if (err && (err.code === 'EPERM' || err.code === 'ENOTSUP' || err.code === 'EACCES' || err.code === 'EXDEV')) {
+      console.log('skip hardlink test:', err.message);
+    } else {
+      throw err;
+    }
+  }
+  const dangling = path.join(root, 'dang');
+  const gone = path.join(outside, 'not-yet');
+  try {
+    fs.symlinkSync(gone, dangling, process.platform === 'win32' ? 'junction' : 'dir');
+    assert.throws(() => resolveJailedPath(root, path.join('dang', 'sub', 'x.txt')), /symlink or junction|outside/);
+    assert.throws(() => recheckJailedLeaf(root, path.join(dangling, 'sub', 'x.txt')), /symlink or junction|outside/);
+    fs.unlinkSync(dangling);
+  } catch (err) {
+    if (err && (err.code === 'EPERM' || err.code === 'ENOTSUP' || err.code === 'EACCES')) {
+      console.log('skip dangling link test:', err.message);
     } else {
       throw err;
     }

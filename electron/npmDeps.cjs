@@ -33,18 +33,14 @@ function sanitizeDepMap(deps) {
     const name = rewriteDepName(rawName);
     let ver = String(rawVer || '').trim() || '*';
     if (name !== rawName) {
-      if (name === '@react-three/fiber' && /^[\^~]?8\./.test(ver)) {
-        // Unscoped package never had v8; keep ^8 on the scoped package.
-        ver = ver;
-      } else if (ALIAS_DEFAULT_VERSION[name] && (ver === '*' || !ver)) {
+      if (Object.prototype.hasOwnProperty.call(out, name)) {
+        changed.push(`${rawName}@${rawVer} → ${name}@${out[name]}`);
+        continue;
+      }
+      if (ALIAS_DEFAULT_VERSION[name] && (ver === '*' || !ver)) {
         ver = ALIAS_DEFAULT_VERSION[name];
-      } else if (ALIAS_DEFAULT_VERSION[name] && name === '@react-three/fiber' && /^[\^~]?8\./.test(String(rawVer))) {
-        ver = String(rawVer);
       }
       changed.push(`${rawName}@${rawVer} → ${name}@${ver}`);
-    }
-    if (out[name] && name !== rawName) {
-      // Prefer the rewritten entry; drop duplicate old key collision
     }
     out[name] = ver;
   }

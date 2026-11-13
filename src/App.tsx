@@ -24,15 +24,18 @@ import {
   LiveSessionNode,
   LiveConductorState
 } from './types';
+import { DEFAULT_SETTINGS, mergeSettings } from './config/defaults';
+import { usePaneDrag } from './hooks/usePaneDrag';
 import {
-  DEFAULT_SETTINGS,
-  MAX_CHAT_WIDTH,
-  MAX_EXPLORER_WIDTH,
-  mergeSettings,
-  MIN_CHAT_WIDTH,
-  MIN_EXPLORER_WIDTH
-} from './config/defaults';
+  EDITOR_DEFAULT,
+  EDITOR_MIN,
+  EXPLORER_DEFAULT,
+  EXPLORER_MIN,
+  PANE_RESET,
+  resolveDesktopPaneLayout
+} from './lib/paneLayout';
 import { bumpFreeTierUsage } from './lib/freeTierAssist';
+import { normalizeRoleRoutes, sameRoleRoutes } from './lib/roleRoutes';
 import { settingsNodesFromLiveSnapshot } from './lib/settingsNodes';
 import { normalizeClusterNodes } from './lib/tools';
 import { clampWritePath } from './lib/writePath';
@@ -193,6 +196,40 @@ function isTextEditingTarget(target: EventTarget | null): boolean {
   return !!target.closest('[contenteditable="true"], .monaco-editor, .xterm');
 }
 
+/** Resolve dot segments and unify separators so one file always has one tab path. */
+function canonicalTabPath(p: string, sep: string): string {
+  const raw = p.replace(/\\/g, '/');
+  const parts: string[] = [];
+  for (const seg of raw.split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') {
+      if (parts.length && !/^[a-zA-Z]:$/.test(parts[parts.length - 1])) parts.pop();
+      continue;
+    }
+    parts.push(seg);
+  }
+  const lead = raw.startsWith('//') ? '//' : raw.startsWith('/') ? '/' : '';
+  return (lead + parts.join('/')).replace(/\//g, sep);
+}
+
+function tabPathKey(p: string): string {
+  return canonicalTabPath(p, '/').toLowerCase();
+}
+
+function sameTabPath(a: string, b: string): boolean {
+  return tabPathKey(a) === tabPathKey(b);
+}
+
+function isSameOrUnderPath(p: string, root: string): boolean {
+  const key = tabPathKey(p);
+  const rootKey = tabPathKey(root);
+  return key === rootKey || key.startsWith(rootKey.replace(/\/+$/, '') + '/');
+}
+
+function pathSepFor(workspace: string): string {
+  return workspace.includes('/') && !workspace.includes('\\') ? '/' : '\\';
+}
+
 export const App: React.FC = () => {
   const [workspacePath, setWorkspacePath] = useState<string>('');
   const [files, setFiles] = useState<WorkspaceFile[]>([]);
@@ -243,16 +280,27 @@ export const App: React.FC = () => {
     return () => mq.removeEventListener('change', apply);
   }, []);
 
-  // Resizable Sidebar Widths
-  const [explorerWidth, setExplorerWidth] = useState<number>(DEFAULT_SETTINGS.explorerWidth ?? MIN_EXPLORER_WIDTH);
-  const [chatWidth, setChatWidth] = useState<number>(DEFAULT_SETTINGS.chatWidth ?? MIN_CHAT_WIDTH);
+  // Preferred pane sizes. Window resizes clamp the render only — they do not write settings.
+  const [explorerWidth, setExplorerWidth] = useState<number>(DEFAULT_SETTINGS.explorerWidth ?? EXPLORER_DEFAULT);
+  const [editorWidth, setEditorWidth] = useState<number>(DEFAULT_SETTINGS.editorWidth ?? EDITOR_DEFAULT);
+  const [editorHidden, setEditorHidden] = useState(DEFAULT_SETTINGS.editorHidden === true);
+  const editorHiddenRef = useRef(editorHidden);
+  editorHiddenRef.current = editorHidden;
+  /** Shown conductor / node-work widths. The rail is never written back to settings. */
+  const [shownControlWidth, setShownControlWidth] = useState<number | null>(null);
+  const [shownNodeWidth, setShownNodeWidth] = useState<number | null>(null);
+  const updateSettingsRef = useRef<(partial: Partial<AppSettings>) => void>(() => {});
   const [agentControlWidth, setAgentControlWidth] = useState<number>(
-    DEFAULT_SETTINGS.agentControlWidth || 270
+    DEFAULT_SETTINGS.agentControlWidth ?? 270
   );
   const [agentNodeWorkWidth, setAgentNodeWorkWidth] = useState<number>(
-    DEFAULT_SETTINGS.agentNodeWorkWidth || 280
+    DEFAULT_SETTINGS.agentNodeWorkWidth ?? 280
   );
-  const [resizingSide, setResizingSide] = useState<'explorer' | 'chat' | null>(null);
+  const [rowWidth, setRowWidth] = useState(() => (typeof window !== 'undefined' ? window.innerWidth : 1500));
+  const [terminalResetNonce, setTerminalResetNonce] = useState(0);
+  const layoutRowRef = useRef<HTMLDivElement>(null);
+  const explorerPaneRef = useRef<HTMLDivElement>(null);
+  const editorPaneRef = useRef<HTMLDivElement>(null);
 
   // UI & Text Scaling (Discord-style zoom factor: 0.75 to 2.0)
   const [uiScale, setUiScale] = useState<number>(DEFAULT_SETTINGS.uiScale || 1.0);
@@ -265,6 +313,8 @@ export const App: React.FC = () => {
   const chatsRevisionRef = useRef(0);
   const workspacePathRef = useRef(workspacePath);
   workspacePathRef.current = workspacePath;
+  /** Bumped whenever openWorkspace clears the tabs, so in-flight file reads can be dropped. */
+  const tabsEpochRef = useRef(0);
   const activeTabPathRef = useRef<string | undefined>(undefined);
   const applyingRemoteRef = useRef(false);
   const publishTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -276,6 +326,8 @@ export const App: React.FC = () => {
   const [remoteLive, setRemoteLive] = useState(false);
   /** False until loadSettings finishes so the first publish cannot wipe seeded totals with zeros. */
   const [settingsReady, setSettingsReady] = useState(false);
+  const settingsReadyRef = useRef(false);
+  settingsReadyRef.current = settingsReady;
   /** Desktop token totals applied on the web console. Not written back into settings. */
   const [sessionTokens, setSessionTokens] = useState<SessionTokenMirror | null>(null);
   const [chatsTick, setChatsTick] = useState(0);
@@ -386,8 +438,17 @@ export const App: React.FC = () => {
       forceNewChatRef.current = false;
       loadedWorkspaceRef.current = '';
       setWorkspaceEpoch(n => n + 1);
+      // Same as the normal folder switch: the old folder's tabs go, and a file read still in
+      // flight for the old folder must not add a tab afterwards.
+      tabsEpochRef.current += 1;
+      openTabsSnapshotRef.current = [];
+      activeTabPathRef.current = undefined;
+      setOpenTabs([]);
+      setActiveTabPath(undefined);
+      workspacePathRef.current = nextWs;
       setWorkspacePath(nextWs);
       void window.electronAPI?.readDir(nextWs).then(result => {
+        if (normalizeWorkspacePath(nextWs) !== normalizeWorkspacePath(workspacePathRef.current || '')) return;
         setFiles(Array.isArray(result) ? result : []);
       });
     } else if (chatsBumped && nextWs) {
@@ -401,36 +462,82 @@ export const App: React.FC = () => {
       typeof session.activeTabPath === 'string' && session.activeTabPath
         ? session.activeTabPath
         : '';
-    if (nextTab && nextTab !== activeTabPathRef.current) {
+    const nextTabTarget = nextTab
+      ? canonicalTabPath(nextTab, pathSepFor(nextWs || workspacePathRef.current || ''))
+      : '';
+    if (
+      nextTab &&
+      (!activeTabPathRef.current || !sameTabPath(nextTabTarget, activeTabPathRef.current))
+    ) {
+      if (editorHiddenRef.current) {
+        editorHiddenRef.current = false;
+        setEditorHidden(false);
+        // A web client's settings copy can be stale; saving it would overwrite the desktop's file.
+        if (!isRemoteClient) updateSettingsRef.current({ editorHidden: false });
+      }
       void (async () => {
         if (!window.electronAPI) return;
-        const alreadyOpen = openTabsSnapshotRef.current.some(t => t.path === nextTab);
-        if (!alreadyOpen) {
-          const res = await window.electronAPI.readFile(nextTab);
-          if (res.content !== undefined) {
-            const fileName = nextTab.split(/[\\/]/).pop() || 'Untitled';
-            setOpenTabs(prev => {
-              if (prev.some(t => t.path === nextTab)) return prev;
-              return [
-                ...prev,
-                {
-                  path: nextTab,
-                  name: fileName,
-                  content: res.content!,
-                  originalContent: res.content!,
-                  isDirty: false,
-                  language: getLanguageFromPath(nextTab)
-                }
-              ];
-            });
-          }
+        const existingTab = openTabsSnapshotRef.current.find(t => sameTabPath(t.path, nextTabTarget));
+        if (existingTab) {
+          setActiveTabPath(existingTab.path);
+          return;
         }
-        setActiveTabPath(nextTab);
+        const epochAtStart = tabsEpochRef.current;
+        const wsAtStart = normalizeWorkspacePath(workspacePathRef.current || '');
+        const res = await window.electronAPI.readFile(nextTabTarget);
+        // A folder switch while the read was in flight: this file belongs to the old folder.
+        if (
+          tabsEpochRef.current !== epochAtStart ||
+          normalizeWorkspacePath(workspacePathRef.current || '') !== wsAtStart
+        ) {
+          return;
+        }
+        if (res.content !== undefined) {
+          const fileName = nextTabTarget.split(/[\\/]/).pop() || 'Untitled';
+          setOpenTabs(prev => {
+            if (prev.some(t => sameTabPath(t.path, nextTabTarget))) return prev;
+            return [
+              ...prev,
+              {
+                path: nextTabTarget,
+                name: fileName,
+                content: res.content!,
+                originalContent: res.content!,
+                isDirty: false,
+                language: getLanguageFromPath(nextTabTarget)
+              }
+            ];
+          });
+        }
+        setActiveTabPath(nextTabTarget);
       })();
     }
 
     if (session.conductor) {
-      setPeerConductor(session.conductor);
+      let conductor = session.conductor;
+      const webSnapshot = !isRemoteClient && session.source === 'web';
+      if (webSnapshot) {
+        // Desktop owns roleRoutes. A web picker edit is the only snapshot that may change them.
+        const roleRoutesEditOk =
+          !!conductor.roleRoutes &&
+          typeof conductor.roleRoutes === 'object' &&
+          !Array.isArray(conductor.roleRoutes);
+        if (conductor.roleRoutesEdit && roleRoutesEditOk && settingsReadyRef.current) {
+          updateSettingsRef.current({ roleRoutes: normalizeRoleRoutes(conductor.roleRoutes) });
+        }
+        const { roleRoutes: _routes, roleRoutesEdit: _edit, ...rest } = conductor;
+        conductor = rest;
+      } else if (isRemoteClient && conductor.roleRoutes) {
+        const incoming = normalizeRoleRoutes(conductor.roleRoutes);
+        setSettings(prev =>
+          sameRoleRoutes(prev.roleRoutes, incoming) ? prev : { ...prev, roleRoutes: incoming }
+        );
+        if (conductor.roleRoutesEdit) {
+          const { roleRoutesEdit: _edit, ...rest } = conductor;
+          conductor = rest;
+        }
+      }
+      setPeerConductor(conductor);
     }
     if (session.chatMirror !== undefined) {
       setPeerChatMirror(session.chatMirror || null);
@@ -485,19 +592,38 @@ export const App: React.FC = () => {
         if (chat.workspacePath) recent = rememberWorkspace(recent, chat.workspacePath);
       }
       merged.recentWorkspaces = recent;
-      setSettings(merged);
+      // The project-chat loader can finish before loadSettings does. Its chats live only in
+      // state (prev is still DEFAULT_SETTINGS), so keep them instead of replacing them with
+      // the copy read from disk. settingsReadyRef semantics stay as they are.
+      const earlyWs = workspacePathRef.current || '';
+      const chatsLoadedEarly =
+        !!earlyWs && loadedWorkspaceRef.current === normalizeWorkspacePath(earlyWs);
+      setSettings(prev => {
+        if (!chatsLoadedEarly) return merged;
+        const early = conversationsForWorkspace(prev.conversations, earlyWs);
+        if (!early.length) return merged;
+        return {
+          ...merged,
+          conversations: replaceWorkspaceConversations(merged.conversations, earlyWs, early),
+          activeConversationId: prev.activeConversationId ?? merged.activeConversationId,
+          lastWorkspace: prev.lastWorkspace || merged.lastWorkspace,
+          recentWorkspaces: rememberWorkspace(merged.recentWorkspaces, earlyWs)
+        };
+      });
       setSettingsReady(true);
       if (isRemoteClient && live) {
         setSessionTokens(prev => mergeTokenMirror(prev, live));
       }
-      setExplorerWidth(merged.explorerWidth ?? MIN_EXPLORER_WIDTH);
-      setChatWidth(merged.chatWidth ?? MIN_CHAT_WIDTH);
-      if (merged.agentControlWidth) setAgentControlWidth(merged.agentControlWidth);
-      if (merged.agentNodeWorkWidth) setAgentNodeWorkWidth(merged.agentNodeWorkWidth);
+      // chatWidth stays on the merged settings object (legacy). Sizing uses editorWidth.
+      setExplorerWidth(merged.explorerWidth ?? EXPLORER_DEFAULT);
+      setEditorWidth(merged.editorWidth ?? EDITOR_DEFAULT);
+      setEditorHidden(merged.editorHidden === true);
+      setAgentControlWidth(merged.agentControlWidth ?? 270);
+      setAgentNodeWorkWidth(merged.agentNodeWorkWidth ?? 280);
 
       const initialActive =
         (live && live.activeConversationId) || merged.activeConversationId || undefined;
-      if (initialActive) setActiveConversationId(initialActive);
+      if (initialActive) setActiveConversationId(cur => cur ?? initialActive);
       if (live?.selectedAgentId) setSelectedAgentId(live.selectedAgentId);
 
       const initialScale = merged.uiScale || 1.0;
@@ -535,6 +661,7 @@ export const App: React.FC = () => {
         (await window.electronAPI.getDefaultWorkspace());
       if (live?.updatedAt) sessionAppliedAtRef.current = live.updatedAt;
       if (typeof live?.chatsRevision === 'number') chatsRevisionRef.current = live.chatsRevision;
+      workspacePathRef.current = defaultPath;
       setWorkspacePath(defaultPath);
       loadDirectory(defaultPath);
       if (isRemoteClient) setRemoteLive(true);
@@ -651,7 +778,12 @@ export const App: React.FC = () => {
       conductor: LiveConductorState;
       chatMirror: { conversationId: string; messages: ChatMessage[] } | null;
     }) => {
-      localConductorRef.current = payload.conductor;
+      let conductor = payload.conductor;
+      if (!settingsReadyRef.current) {
+        const { roleRoutes: _routes, roleRoutesEdit: _edit, ...rest } = conductor;
+        conductor = rest;
+      }
+      localConductorRef.current = conductor;
       localChatMirrorRef.current = payload.chatMirror;
       setConductorTick(t => t + 1);
     },
@@ -663,11 +795,17 @@ export const App: React.FC = () => {
     setSettings(prev => {
       const next = { ...prev, ...partial };
       if (window.electronAPI) {
-        window.electronAPI.saveSettings(next);
+        if (!settingsReadyRef.current) {
+          const { roleRoutes: _omit, ...rest } = next;
+          window.electronAPI.saveSettings(rest);
+        } else {
+          window.electronAPI.saveSettings(next);
+        }
       }
       return next;
     });
   }, []);
+  updateSettingsRef.current = updateSettings;
 
   const handleUpdateUiScale = useCallback((scale: number) => {
     const clamped = Math.max(0.75, Math.min(2.0, Math.round(scale * 100) / 100));
@@ -759,7 +897,7 @@ export const App: React.FC = () => {
           conversations,
           activeConversationId: active
         };
-        window.electronAPI.saveSettings(next);
+        if (settingsReadyRef.current) window.electronAPI.saveSettings(next);
         window.electronAPI.saveProjectChats(workspacePath, {
           conversations: conversationsForWorkspace(conversations, workspacePath),
           activeConversationId: active
@@ -774,33 +912,108 @@ export const App: React.FC = () => {
     };
   }, [workspacePath, workspaceEpoch, selectedAgentId]);
 
-  // Sidebar Drag-Resize Listeners
+  // Track the desktop row so maximize / restore reclamps without saving the clamped size.
   useEffect(() => {
-    if (!resizingSide) return;
+    if (isNarrow) return;
+    const el = layoutRowRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const publish = () => setRowWidth(el.clientWidth);
+    const obs = new ResizeObserver(publish);
+    obs.observe(el);
+    publish();
+    return () => obs.disconnect();
+  }, [isNarrow]);
 
-    const handleMouseMove = (e: MouseEvent) => {
-      if (resizingSide === 'explorer') {
-        const nextWidth = Math.max(MIN_EXPLORER_WIDTH, Math.min(MAX_EXPLORER_WIDTH, e.clientX));
-        setExplorerWidth(nextWidth);
-      } else if (resizingSide === 'chat') {
-        // Whole agent pane (transcript + Conductor + Node Work).
-        const nextWidth = Math.max(MIN_CHAT_WIDTH, Math.min(MAX_CHAT_WIDTH, window.innerWidth - e.clientX));
-        setChatWidth(nextWidth);
-      }
-    };
+  const paneLayout = useMemo(
+    () =>
+      resolveDesktopPaneLayout(rowWidth, {
+        explorerWidth,
+        editorWidth,
+        controlWidth: shownControlWidth ?? agentControlWidth,
+        nodeWorkWidth: shownNodeWidth ?? agentNodeWorkWidth,
+        editorHidden
+      }),
+    [
+      rowWidth,
+      explorerWidth,
+      editorWidth,
+      shownControlWidth,
+      shownNodeWidth,
+      agentControlWidth,
+      agentNodeWorkWidth,
+      editorHidden
+    ]
+  );
+  const paneLayoutRef = useRef(paneLayout);
+  paneLayoutRef.current = paneLayout;
+  const explorerWidthRef = useRef(explorerWidth);
+  explorerWidthRef.current = explorerWidth;
+  const editorWidthRef = useRef(editorWidth);
+  editorWidthRef.current = editorWidth;
 
-    const handleMouseUp = () => {
-      setResizingSide(null);
-      updateSettings({ explorerWidth, chatWidth, agentControlWidth, agentNodeWorkWidth });
-    };
+  const commitExplorerWidth = useCallback(
+    (next: number) => {
+      setExplorerWidth(next);
+      updateSettings({ explorerWidth: next });
+    },
+    [updateSettings]
+  );
+  const commitEditorWidth = useCallback(
+    (next: number) => {
+      setEditorWidth(next);
+      updateSettings({ editorWidth: next });
+    },
+    [updateSettings]
+  );
 
-    window.addEventListener('mousemove', handleMouseMove);
-    window.addEventListener('mouseup', handleMouseUp);
-    return () => {
-      window.removeEventListener('mousemove', handleMouseMove);
-      window.removeEventListener('mouseup', handleMouseUp);
-    };
-  }, [resizingSide, explorerWidth, chatWidth, agentControlWidth, agentNodeWorkWidth, updateSettings]);
+  const explorerDrag = usePaneDrag({
+    axis: 'x',
+    valueSide: 'before',
+    getMin: () => Math.min(EXPLORER_MIN, paneLayoutRef.current.explorer),
+    getMax: () => Math.max(paneLayoutRef.current.explorer, paneLayoutRef.current.explorerMax),
+    getValue: () => explorerWidthRef.current,
+    getPane: () => explorerPaneRef.current,
+    onPreview: next => {
+      explorerWidthRef.current = next;
+      setExplorerWidth(next);
+    },
+    onCommit: commitExplorerWidth
+  });
+  const editorDrag = usePaneDrag({
+    axis: 'x',
+    valueSide: 'before',
+    disabled: editorHidden,
+    getMin: () => Math.min(EDITOR_MIN, paneLayoutRef.current.editor),
+    getMax: () => Math.max(paneLayoutRef.current.editor, paneLayoutRef.current.editorMax),
+    getValue: () => editorWidthRef.current,
+    getPane: () => editorPaneRef.current,
+    onPreview: next => {
+      editorWidthRef.current = next;
+      setEditorWidth(next);
+    },
+    onCommit: commitEditorWidth
+  });
+
+  const resetPaneSizes = useCallback(() => {
+    setExplorerWidth(PANE_RESET.explorerWidth);
+    setEditorWidth(PANE_RESET.editorWidth);
+    setAgentControlWidth(PANE_RESET.agentControlWidth);
+    setAgentNodeWorkWidth(PANE_RESET.agentNodeWorkWidth);
+    updateSettings({
+      explorerWidth: PANE_RESET.explorerWidth,
+      editorWidth: PANE_RESET.editorWidth,
+      agentControlWidth: PANE_RESET.agentControlWidth,
+      agentNodeWorkWidth: PANE_RESET.agentNodeWorkWidth
+    });
+    setTerminalResetNonce(n => n + 1);
+  }, [updateSettings]);
+
+  const toggleCodeEditor = useCallback(() => {
+    const next = !editorHiddenRef.current;
+    editorHiddenRef.current = next;
+    setEditorHidden(next);
+    updateSettings({ editorHidden: next });
+  }, [updateSettings]);
 
   // 3. Cluster Polling — preserve user toggles/benchmarks; only merge live status fields
   const nodesRef = React.useRef(nodes);
@@ -875,6 +1088,7 @@ export const App: React.FC = () => {
   const loadDirectory = async (dirPath: string) => {
     if (!window.electronAPI) return;
     const result = await window.electronAPI.readDir(dirPath);
+    if (normalizeWorkspacePath(dirPath) !== normalizeWorkspacePath(workspacePathRef.current || '')) return;
     setFiles(Array.isArray(result) ? result : []);
   };
 
@@ -883,8 +1097,10 @@ export const App: React.FC = () => {
     forceNewChatRef.current = !!opts?.newChat;
     loadedWorkspaceRef.current = '';
     setWorkspaceEpoch(n => n + 1);
+    tabsEpochRef.current += 1;
     setOpenTabs([]);
     setActiveTabPath(undefined);
+    workspacePathRef.current = chosen;
     setWorkspacePath(chosen);
     loadDirectory(chosen);
   };
@@ -1107,26 +1323,39 @@ export const App: React.FC = () => {
 
   // 5. Editor Tabs
   const handleFileSelect = async (filePath: string) => {
-    const existing = openTabs.find(t => t.path === filePath);
+    if (editorHidden) {
+      setEditorHidden(false);
+      updateSettings({ editorHidden: false });
+    }
+    const target = canonicalTabPath(filePath, pathSepFor(workspacePathRef.current || workspacePath));
+    const existing = openTabsSnapshotRef.current.find(t => sameTabPath(t.path, target));
     if (existing) {
-      setActiveTabPath(filePath);
+      setActiveTabPath(existing.path);
       return;
     }
 
     if (!window.electronAPI) return;
-    const res = await window.electronAPI.readFile(filePath);
+    const wsAtStart = normalizeWorkspacePath(workspacePathRef.current || '');
+    const epochAtStart = tabsEpochRef.current;
+    const res = await window.electronAPI.readFile(target);
+    if (
+      tabsEpochRef.current !== epochAtStart ||
+      normalizeWorkspacePath(workspacePathRef.current || '') !== wsAtStart
+    ) {
+      return;
+    }
     if (res.content !== undefined) {
-      const fileName = filePath.split(/[\\/]/).pop() || 'Untitled';
+      const fileName = target.split(/[\\/]/).pop() || 'Untitled';
       const newTab: OpenTab = {
-        path: filePath,
+        path: target,
         name: fileName,
         content: res.content,
         originalContent: res.content,
         isDirty: false,
-        language: getLanguageFromPath(filePath)
+        language: getLanguageFromPath(target)
       };
-      setOpenTabs(prev => [...prev, newTab]);
-      setActiveTabPath(filePath);
+      setOpenTabs(prev => (prev.some(t => sameTabPath(t.path, target)) ? prev : [...prev, newTab]));
+      setActiveTabPath(target);
     }
   };
 
@@ -1175,7 +1404,9 @@ export const App: React.FC = () => {
     const res = await window.electronAPI.writeFile(path, tab.content);
     if (res.success) {
       setOpenTabs(prev =>
-        prev.map(t => (t.path === path ? { ...t, originalContent: tab.content, isDirty: false } : t))
+        prev.map(t =>
+          t.path === path ? { ...t, originalContent: tab.content, isDirty: t.content !== tab.content } : t
+        )
       );
       loadDirectory(workspacePath);
     }
@@ -1200,8 +1431,17 @@ export const App: React.FC = () => {
 
   const handleDeleteTarget = async (targetPath: string) => {
     if (!window.electronAPI) return;
-    await window.electronAPI.deleteTarget(targetPath);
-    handleCloseTab(targetPath);
+    const res = await window.electronAPI.deleteTarget(targetPath);
+    if (!res?.success) {
+      console.warn('Delete failed:', res?.error || 'unknown error');
+      return;
+    }
+    const remaining = openTabsSnapshotRef.current.filter(t => !isSameOrUnderPath(t.path, targetPath));
+    setOpenTabs(prev => prev.filter(t => !isSameOrUnderPath(t.path, targetPath)));
+    const active = activeTabPathRef.current;
+    if (active && isSameOrUnderPath(active, targetPath)) {
+      setActiveTabPath(remaining.length ? remaining[remaining.length - 1].path : undefined);
+    }
     loadDirectory(workspacePath);
   };
 
@@ -1232,21 +1472,35 @@ export const App: React.FC = () => {
       return false;
     }
 
-    const absolutePath = scoped.path || (filePath.includes(':') ? filePath : `${workspacePath}\\${filePath.replace(/^[\\/]+/, '')}`);
+    const absolutePath = canonicalTabPath(
+      scoped.path || (filePath.includes(':') ? filePath : `${workspacePath}\\${filePath.replace(/^[\\/]+/, '')}`),
+      pathSepFor(workspacePath)
+    );
     await loadDirectory(workspacePath);
     if (/(^|[/\\])package\.json$/i.test(rel.replace(/\\/g, '/'))) {
       setCanInstallDeps(true);
     }
+    const existingTab = openTabsSnapshotRef.current.find(t => sameTabPath(t.path, absolutePath));
+    if (existingTab?.isDirty && existingTab.content !== writeContent) {
+      console.warn(`${absolutePath} changed on disk while it has unsaved edits. Your unsaved buffer was kept.`);
+    }
     setOpenTabs(prev => {
-      const idx = prev.findIndex(t => t.path === absolutePath);
+      const idx = prev.findIndex(t => sameTabPath(t.path, absolutePath));
       if (idx >= 0) {
         const updated = [...prev];
-        updated[idx] = {
-          ...updated[idx],
-          content: writeContent,
-          originalContent: writeContent,
-          isDirty: false
-        };
+        const current = updated[idx];
+        updated[idx] = current.isDirty
+          ? {
+              ...current,
+              originalContent: writeContent,
+              isDirty: current.content !== writeContent
+            }
+          : {
+              ...current,
+              content: writeContent,
+              originalContent: writeContent,
+              isDirty: false
+            };
         return updated;
       }
       const fileName = absolutePath.split(/[\\/]/).pop() || 'file';
@@ -1260,7 +1514,7 @@ export const App: React.FC = () => {
       };
       return [...prev, newTab];
     });
-    setActiveTabPath(absolutePath);
+    setActiveTabPath(existingTab?.path ?? absolutePath);
     return true;
   };
 
@@ -1312,7 +1566,10 @@ export const App: React.FC = () => {
   };
 
   const handleOpenFileInEditor = (filePath: string) => {
-    const absolutePath = filePath.includes(':') ? filePath : `${workspacePath}\\${filePath.replace(/^\//, '')}`;
+    const isAbsolute = /^[a-zA-Z]:/.test(filePath) || /^[\\/]{2}/.test(filePath);
+    const absolutePath = isAbsolute
+      ? filePath
+      : `${workspacePath}${pathSepFor(workspacePath)}${filePath.replace(/^[\\/]+/, '')}`;
     handleFileSelect(absolutePath);
   };
 
@@ -1406,7 +1663,14 @@ export const App: React.FC = () => {
         frontierTokensUsed: (prev.frontierTokensUsed || 0) + frontierCount,
         workspaceTokenUsage: usage
       };
-      window.electronAPI?.saveSettings(next);
+      if (window.electronAPI) {
+        if (!settingsReadyRef.current) {
+          const { roleRoutes: _omit, ...rest } = next;
+          window.electronAPI.saveSettings(rest);
+        } else {
+          window.electronAPI.saveSettings(next);
+        }
+      }
       return next;
     });
   };
@@ -1456,6 +1720,10 @@ export const App: React.FC = () => {
     setAgentBusy(busy);
     void window.electronAPI?.setUpdateBusy?.(busy);
   }, []);
+  const runLogCopyRef = useRef<(() => void) | null>(null);
+  const registerRunLog = useCallback((api: { copy: () => void } | null) => {
+    runLogCopyRef.current = api ? () => api.copy() : null;
+  }, []);
 
   const agentChatProps = {
     agents: settings.agents,
@@ -1474,6 +1742,10 @@ export const App: React.FC = () => {
     onNodeWorkWidthChange: (w: number) => {
       setAgentNodeWorkWidth(w);
       updateSettings({ agentNodeWorkWidth: w });
+    },
+    onChromeWidthsChange: (control: number, node: number) => {
+      setShownControlWidth(prev => (prev === control ? prev : control));
+      setShownNodeWidth(prev => (prev === node ? prev : node));
     },
     onSelectNodeModel: handleSelectNodeModel,
     onApplyFileWrite: handleApplyFileWrite,
@@ -1500,8 +1772,22 @@ export const App: React.FC = () => {
     autoNodeEnabled: settings.autoSelectEndpoint !== false,
     autoApplyEnabled: settings.autoApplyWrites !== false,
     autoReviewEnabled: settings.autoReview !== false,
+    fullAutoEnabled: settings.fullAuto === true,
     cloudStrategistEnabled: settings.cloudStrategistEnabled !== false,
-    onConductorPrefsChange: updateSettings,
+    roleRoutesEnabled: settings.roleRoutes,
+    onConductorPrefsChange: (patch: Parameters<NonNullable<React.ComponentProps<typeof AgentChat>['onConductorPrefsChange']>>[0]) => {
+      if (isRemoteClient && Object.prototype.hasOwnProperty.call(patch, 'roleRoutes')) {
+        const routes = normalizeRoleRoutes(patch.roleRoutes);
+        setSettings(prev =>
+          sameRoleRoutes(prev.roleRoutes, routes) ? prev : { ...prev, roleRoutes: routes }
+        );
+        const rest = { ...patch };
+        delete rest.roleRoutes;
+        if (Object.keys(rest).length > 0) updateSettings(rest);
+        return;
+      }
+      updateSettings(patch);
+    },
     onUpdateNodes: handleUpdateNodes,
     onBusyChange: handleAgentBusyChange,
     onOpenHardware: () => {
@@ -1511,7 +1797,8 @@ export const App: React.FC = () => {
     onOpenFolder: handleSelectFolder,
     peerConductor,
     peerChatMirror,
-    onLiveConductorPublish: handleLiveConductorPublish
+    onLiveConductorPublish: handleLiveConductorPublish,
+    onRunLogApi: registerRunLog
   };
 
   const openHardwareTab = (tab: HardwareSettingsTab) => {
@@ -1579,6 +1866,25 @@ export const App: React.FC = () => {
         setIsTerminalOpen(next);
         if (isNarrow) setMobilePane(next ? 'term' : 'chat');
       }
+    },
+    {
+      id: 'reset-pane-sizes',
+      label: 'Reset pane sizes',
+      keywords: 'layout splitter width explorer editor terminal',
+      run: () => resetPaneSizes()
+    },
+    {
+      id: 'toggle-code-editor',
+      label: 'Toggle code editor',
+      hint: editorHidden ? 'Show' : 'Hide',
+      keywords: 'layout monaco hide code column',
+      run: () => toggleCodeEditor()
+    },
+    {
+      id: 'copy-run-log',
+      label: 'Copy run log',
+      keywords: 'conductor log failures paste',
+      run: () => runLogCopyRef.current?.()
     },
     { id: 'new-chat', label: 'New chat', keywords: 'conversation thread', run: () => handleNewChat() },
     {
@@ -1705,6 +2011,7 @@ export const App: React.FC = () => {
                 <TerminalPanel
                   isOpen
                   fill
+                  resetNonce={terminalResetNonce}
                   onClose={() => setMobilePane('chat')}
                   workspacePath={workspacePath}
                 />
@@ -1723,80 +2030,84 @@ export const App: React.FC = () => {
           </nav>
         </div>
       ) : (
-        <div className="flex-1 flex overflow-hidden">
-          <FileTree
-            files={files}
-            activeFilePath={activeTabPath}
-            onFileSelect={handleFileSelect}
-            onRefresh={() => loadDirectory(workspacePath)}
-            onCreateFile={handleCreateFile}
-            onCreateFolder={handleCreateFolder}
-            onDelete={handleDeleteTarget}
-            onOpenFolder={handleSelectFolder}
-            rootPath={workspacePath}
-            width={explorerWidth}
-          />
-
-          <SplitHandle
-            orientation="vertical"
-            label="Resize explorer"
-            value={explorerWidth}
-            min={MIN_EXPLORER_WIDTH}
-            max={MAX_EXPLORER_WIDTH}
-            active={resizingSide === 'explorer'}
-            onDragStart={() => setResizingSide('explorer')}
-            onChange={setExplorerWidth}
-            onCommit={next =>
-              updateSettings({
-                explorerWidth: next,
-                chatWidth,
-                agentControlWidth,
-                agentNodeWorkWidth
-              })
-            }
-          />
-
-          <div className="flex-1 flex flex-col overflow-hidden min-w-[260px]">
-            <GitPanel workspacePath={workspacePath} />
-            <EditorView
-              tabs={openTabs}
-              activeTabPath={activeTabPath}
-              onSelectTab={setActiveTabPath}
-              onCloseTab={handleCloseTab}
-              onContentChange={handleContentChange}
-              onSaveTab={handleSaveTab}
-              onCursorLine={handleCursorLine}
+        <div ref={layoutRowRef} className="flex-1 flex overflow-hidden min-h-0 min-w-0">
+          <div ref={explorerPaneRef} style={{ width: paneLayout.explorer }} className="h-full shrink-0">
+            <FileTree
+              files={files}
+              activeFilePath={activeTabPath}
+              onFileSelect={handleFileSelect}
+              onRefresh={() => loadDirectory(workspacePath)}
+              onCreateFile={handleCreateFile}
+              onCreateFolder={handleCreateFolder}
+              onDelete={handleDeleteTarget}
               onOpenFolder={handleSelectFolder}
-              workspacePath={workspacePath}
-            />
-
-            <TerminalPanel
-              isOpen={isTerminalOpen}
-              onClose={() => setIsTerminalOpen(false)}
-              workspacePath={workspacePath}
+              rootPath={workspacePath}
+              width="100%"
             />
           </div>
 
           <SplitHandle
             orientation="vertical"
-            label="Resize agent panel"
-            value={chatWidth}
-            min={MIN_CHAT_WIDTH}
-            max={MAX_CHAT_WIDTH}
-            active={resizingSide === 'chat'}
-            onDragStart={() => setResizingSide('chat')}
-            onChange={setChatWidth}
-            onCommit={next =>
-              updateSettings({
-                explorerWidth,
-                chatWidth: next,
-                agentControlWidth,
-                agentNodeWorkWidth
-              })
-            }
+            label="Resize explorer"
+            value={paneLayout.explorer}
+            min={Math.min(EXPLORER_MIN, paneLayout.explorer)}
+            max={Math.max(paneLayout.explorer, paneLayout.explorerMax)}
+            valueSide="before"
+            resetValue={PANE_RESET.explorerWidth}
+            active={explorerDrag.dragging}
+            onPointerDown={explorerDrag.onPointerDown}
+            onChange={next => {
+              explorerWidthRef.current = next;
+              setExplorerWidth(next);
+            }}
+            onCommit={commitExplorerWidth}
           />
 
-          <AgentChat {...agentChatProps} width={chatWidth} />
+          {!editorHidden && (
+            <div
+              ref={editorPaneRef}
+              style={{ width: paneLayout.editor }}
+              className="shrink-0 h-full min-h-0 flex flex-col overflow-hidden"
+            >
+              <GitPanel workspacePath={workspacePath} />
+              <EditorView
+                tabs={openTabs}
+                activeTabPath={activeTabPath}
+                onSelectTab={setActiveTabPath}
+                onCloseTab={handleCloseTab}
+                onContentChange={handleContentChange}
+                onSaveTab={handleSaveTab}
+                onCursorLine={handleCursorLine}
+                onOpenFolder={handleSelectFolder}
+                workspacePath={workspacePath}
+              />
+
+              <TerminalPanel
+                isOpen={isTerminalOpen}
+                onClose={() => setIsTerminalOpen(false)}
+                workspacePath={workspacePath}
+                resetNonce={terminalResetNonce}
+              />
+            </div>
+          )}
+
+          {!editorHidden && (
+            <SplitHandle
+              orientation="vertical"
+              label="Resize code editor"
+              value={paneLayout.editor}
+              min={Math.min(EDITOR_MIN, paneLayout.editor)}
+              max={Math.max(paneLayout.editor, paneLayout.editorMax)}
+              valueSide="before"
+              resetValue={PANE_RESET.editorWidth}
+              active={editorDrag.dragging}
+              onPointerDown={editorDrag.onPointerDown}
+              onChange={setEditorWidth}
+              onCommit={commitEditorWidth}
+            />
+          )}
+
+          <AgentChat {...agentChatProps} />
         </div>
       )}
 

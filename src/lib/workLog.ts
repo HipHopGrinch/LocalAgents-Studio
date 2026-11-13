@@ -37,8 +37,17 @@ function oneLine(text: string, max = 220): string {
   return stripKeepFixingPrefix(text).slice(0, max);
 }
 
-function fileNames(text: string): string[] {
-  return [...text.matchAll(/[A-Za-z0-9_.-]+\.(?:py|ts|tsx|js|jsx|json|md|html|css|go|rs)/g)].map(m =>
+/**
+ * Lowercased file names mentioned in text. Longest extension first with an end boundary,
+ * so App.tsx is not read as app.ts and package.json is not read as package.js (B-82).
+ * Shared with continuationReview so the matcher lives in one place.
+ */
+export function fileNamesIn(text: string): string[] {
+  return [
+    ...text.matchAll(
+      /[A-Za-z0-9_.-]+\.(?:tsx|ts|jsx|json|js|py|md|html|css|go|rs|cpp|cxx|cc|cs|hpp|h)(?![A-Za-z0-9_])/g
+    )
+  ].map(m =>
     m[0].toLowerCase()
   );
 }
@@ -58,7 +67,7 @@ export function isDurableStep(text: string): boolean {
   if (!line) return false;
   if (isInspectionOnly(line)) return false;
   if (/^wrote\s+\S+/i.test(line) || /^edited\s+\S+/i.test(line)) return true;
-  if (FIX_VERB.test(line) && (fileNames(line).length > 0 || BUG_REPORT.test(line))) return true;
+  if (FIX_VERB.test(line) && (fileNamesIn(line).length > 0 || BUG_REPORT.test(line))) return true;
   if (/\b(run|ran|command|test|build|compile|tsc|npm)\b/i.test(line)) return true;
   if (BUG_REPORT.test(line) && FIX_VERB.test(line)) return true;
   return false;
@@ -78,8 +87,8 @@ export function stepsTooSimilar(a: string, b: string): boolean {
   const shorter = na.length < nb.length ? na : nb;
   const longer = na.length < nb.length ? nb : na;
   if (shorter.length > 18 && longer.includes(shorter)) return true;
-  const fa = fileNames(a);
-  const fb = new Set(fileNames(b));
+  const fa = fileNamesIn(a);
+  const fb = new Set(fileNamesIn(b));
   if (!fa.length || !fa.some(f => fb.has(f))) return false;
   const verb = /\b(create|write|implement|add|build|start|finish|fix|edit|patch)\b/i;
   return verb.test(a) && verb.test(b);
@@ -128,7 +137,7 @@ function section(md: string, name: string, until?: string): string {
 }
 
 function isNoiseLog(line: string): boolean {
-  return /HTTP\/1\.[01]/.test(line) || /File not found/.test(line) && /404/.test(line);
+  return /HTTP\/1\.[01]["']?\s+[45]\d\d\b/.test(line) || (/File not found/.test(line) && /404/.test(line));
 }
 
 function bullets(block: string): string[] {
@@ -148,7 +157,10 @@ export function parseWorkLog(md: string): WorkLog {
       ? oneLine(bugSection, 400)
       : '';
   return {
-    request: (requestMatch?.[1] || '').trim(),
+    request: (() => {
+      const request = (requestMatch?.[1] || '').trim();
+      return request === '(none yet)' ? '' : request;
+    })(),
     bug,
     done: bullets(section(text, 'Done', 'Next'))
       .filter(step => !isInspectionOnly(step))
@@ -170,7 +182,7 @@ export function hasWorkLog(log: WorkLog): boolean {
 /** First real user request seeds the log. Bug reports stick until a related file is saved. */
 export function noteUserTurn(log: WorkLog, text: string): WorkLog {
   const line = text.replace(/\s+/g, ' ').trim();
-  if (!line || isNoiseLog(line)) return log;
+  if (!line) return log;
   const request = log.request || line.slice(0, 800);
   if (/^continue:/i.test(line)) return { ...log, request };
 
@@ -222,7 +234,7 @@ export function stickyBugCleared(
   if (!bug) return false;
   if (verifyFingerprintChanged(fingerprints?.previous, fingerprints?.next)) return true;
   if (!paths.length) return false;
-  const bugFiles = fileNames(bug);
+  const bugFiles = fileNamesIn(bug);
   if (!bugFiles.length) return false;
   const saved = paths.map(p => p.replace(/\\/g, '/').toLowerCase());
   return bugFiles.some(f => saved.some(p => p === f || p.endsWith('/' + f)));
@@ -291,11 +303,11 @@ export function rememberAsked(log: WorkLog, text: string): WorkLog {
 }
 
 export function repeatsFinishedFile(done: string[], text: string): boolean {
-  const files = fileNames(text);
+  const files = fileNamesIn(text);
   if (!files.length) return false;
   if (!/\b(create|write|implement|add|build|start|fix|edit|patch)\b/i.test(text)) return false;
   return files.every(file =>
-    done.some(step => step.toLowerCase().includes(file) && /\b(wrote|edited|saved|created|implemented)\b/i.test(step))
+    done.some(step => fileNamesIn(step).includes(file) && /\b(wrote|edited|saved|created|implemented)\b/i.test(step))
   );
 }
 

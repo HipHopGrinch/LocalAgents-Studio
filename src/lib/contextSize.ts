@@ -20,7 +20,7 @@ export const CTX_CHAT_TURN_TOKENS = 400;
 
 /** Common Ollama num_ctx presets shown in Hardware Settings. */
 export const COMMON_CTX_SIZES = [
-  2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144
+  2048, 4096, 8192, 12288, 16384, 24576, 32768, 65536, 131072, 262144
 ] as const;
 
 /** Local Ollama default ceiling when the user has not set a per-model pref. */
@@ -124,6 +124,23 @@ export function snapNumCtxToOption(value: number, maxCtx?: number): number {
     }
   }
   return best;
+}
+
+/**
+ * Option list and selected value for a model context dropdown.
+ * The selected value is the stored ceiling when it is allowed, otherwise the nearest preset.
+ */
+export function modelContextSelect(
+  modelName: string,
+  model: Pick<OllamaModel, 'details'> | null | undefined,
+  storedMax: number
+): { nativeMax?: number; value: number; options: number[] } {
+  const nativeMax = resolveModelMaxContext(modelName, model);
+  const stored = clampNumCtx(storedMax, nativeMax);
+  let options = ctxSizeOptions(nativeMax, stored);
+  const value = options.includes(stored) ? stored : snapNumCtxToOption(stored, nativeMax);
+  if (!options.includes(value)) options = ctxSizeOptions(nativeMax, value);
+  return { nativeMax, value, options };
 }
 
 /**

@@ -5,6 +5,7 @@ import { shadowOwnedPath } from './projectBrain';
 import { coderModelToRewarm, pickImageTarget, placeholderSvg } from './imageRouting';
 import { pinnedNumCtx } from './contextSize';
 import { symbolHitsForQuery, type RepoMap } from './repoMap';
+import { commandOutputFailed } from './verifyGate';
 
 /** Fallback when settings.maxAgentSteps is missing. */
 export const MAX_TOOL_CONTINUATIONS = 12;
@@ -24,20 +25,35 @@ export function toolContinuationLimit(maxAgentSteps?: number): number {
   return Math.max(4, Math.min(n, 24));
 }
 
-const DESTRUCTIVE_CMD =
-  /\brm\s+-rf\b|\bformat\s+[a-z]:|\bdiskpart\b|\bmkfs\b|\bdd\s+if=|\bshutdown\b|\breboot\b|\bgit\s+push\b[^\n]*(--force|\s-f\b)|\bgit\s+reset\b[^\n]*--hard|\bgit\s+clean\b[^\n]*-[a-z]*f|\bgit\s+checkout\s+--\s+\./i;
+/** `git` or `git.exe`, then any global options (`-C x`, `-c k=v`) up to the subcommand. */
+const GIT = String.raw`(?<![\w.\-])git(?:\.exe)?(?![\w.\-])[^\n;&|]*?`;
 
-/** PowerShell / cmd destructive deletes with flags in any order. */
+const DESTRUCTIVE_CMD = new RegExp(
+  [
+    String.raw`\brm\s+-rf\b`,
+    String.raw`\bformat\s+[a-z]:`,
+    String.raw`\b(?:format-volume|clear-disk|initialize-disk|remove-partition)\b`,
+    String.raw`\bdiskpart\b`,
+    String.raw`\bmkfs\b`,
+    String.raw`\bdd\s+if=`,
+    String.raw`\bshutdown\b`,
+    String.raw`\breboot\b`,
+    `${GIT}\\bpush\\b[^\\n]*(?:--force|\\s-f\\b)`,
+    `${GIT}\\breset\\b[^\\n]*--hard`,
+    `${GIT}\\bclean\\b[^\\n]*-[a-z]*f`,
+    `${GIT}\\bcheckout\\b[^\\n]*\\s--\\s+\\.`
+  ].join('|'),
+  'i'
+);
+
+/** `rm`, `del`, `rd`, `erase`, `rmdir`, `ri` and `remove-item` are one group in PowerShell. */
+const DELETE_ALIAS = /(?<![\w.\-\\/:])(?<!\bgit(?:\.exe)? )(?:remove-item|rmdir|erase|del|rm|rd|ri)(?=\s|$)/i;
+const RECURSE_FLAG = /\s-(?:r|re|rec|recu|recur|recurs|recurse|rf|fr)(?![\w-])|\s\/s(?![\w-])/i;
+
+/** PowerShell / cmd recursive deletes, with or without -Force. */
 function isDestructiveDelete(cmd: string): boolean {
   const c = cmd.replace(/\s+/g, ' ');
-  if (/\b(remove-item|ri)\b/i.test(c) && /(-\s*recurse|\s-r\b)/i.test(c) && /(-\s*force|\s-fo\b)/i.test(c)) {
-    return true;
-  }
-  if (/\b(del|erase|rd|rmdir)\b/i.test(c) && /\/s\b/i.test(c) && /\/[fq]\b/i.test(c)) {
-    return true;
-  }
-  if (/\bdel\s+\/s\b/i.test(c) || /\brmdir\s+\/s\b/i.test(c)) return true;
-  return false;
+  return DELETE_ALIAS.test(c) && RECURSE_FLAG.test(c);
 }
 
 /** Encoded PowerShell, Invoke-Expression, and cmd /c wrappers hide a destructive payload. */
@@ -299,10 +315,22 @@ export interface ToolExecutorDeps {
    * `buildContinuationUserPrompt` as `{ tier }` once the routed model is known.
    */
   toolResultTier?: ToolResultTier;
+  /** Called once with the finished tool. Must not change the result. */
+  onTool?: (tool: ToolCall) => void;
 }
 
 /** Execute one tool without mutating the input; returns a new ToolCall. */
 export async function executeTool(tool: ToolCall, deps: ToolExecutorDeps): Promise<ToolCall> {
+  const finished = await executeToolBody(tool, deps);
+  try {
+    deps.onTool?.(finished);
+  } catch {
+    /* observers must not change the tool result */
+  }
+  return finished;
+}
+
+async function executeToolBody(tool: ToolCall, deps: ToolExecutorDeps): Promise<ToolCall> {
   if (tool.status === 'done') return tool;
 
   let next: ToolCall = { ...tool, status: 'running' };
@@ -420,7 +448,7 @@ export async function executeTool(tool: ToolCall, deps: ToolExecutorDeps): Promi
         };
       }
       const output = await deps.onExecuteToolCommand(cmd);
-      const failed = /Exit code:\s*(?!0\b)\d+/i.test(output) || /timed out/i.test(output);
+      const failed = commandOutputFailed(output);
       return {
         ...next,
         status: failed ? 'error' : 'done',
@@ -587,29 +615,35 @@ async function maybeInstallAfterPackageJsonWrite(
       timeoutMs: 300000
     });
     const rewrite = res.rewritten?.length ? `\nRewrote: ${res.rewritten.join('; ')}` : '';
-    return [
-      ...tools,
-      {
-        ...installTool,
-        status: res.ok ? 'done' : 'error',
-        result: res.ok
-          ? `Exit code: 0\n(auto) npm install after package.json${rewrite}\n${(res.output || '').slice(-4000)}`
-          : `Exit code: ${res.code ?? 1}\n(auto) npm install failed${rewrite}\n${(
-              res.output ||
-              res.error ||
-              ''
-            ).slice(-4000)}`
-      }
-    ];
+    const finished: ToolCall = {
+      ...installTool,
+      status: res.ok ? 'done' : 'error',
+      result: res.ok
+        ? `Exit code: 0\n(auto) npm install after package.json${rewrite}\n${(res.output || '').slice(-4000)}`
+        : `Exit code: ${res.code ?? 1}\n(auto) npm install failed${rewrite}\n${(
+            res.output ||
+            res.error ||
+            ''
+          ).slice(-4000)}`
+    };
+    notifyTool(deps, finished);
+    return [...tools, finished];
   } catch (err: any) {
-    return [
-      ...tools,
-      {
-        ...installTool,
-        status: 'error',
-        result: `(auto) npm install error: ${err?.message || err}`
-      }
-    ];
+    const finished: ToolCall = {
+      ...installTool,
+      status: 'error',
+      result: `(auto) npm install error: ${err?.message || err}`
+    };
+    notifyTool(deps, finished);
+    return [...tools, finished];
+  }
+}
+
+function notifyTool(deps: ToolExecutorDeps, tool: ToolCall): void {
+  try {
+    deps.onTool?.(tool);
+  } catch {
+    /* observers must not change the tool result */
   }
 }
 

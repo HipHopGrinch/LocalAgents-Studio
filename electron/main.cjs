@@ -59,6 +59,21 @@ const FRONTIER_MAX_OUTPUT_TOKENS = 8192;
 
 let mainWindow = null;
 
+// One app per user profile: two instances would race on settings.json and the web console port.
+// Must run after userData is set (the lock is keyed on it) and before any window exists.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  console.warn('Another LocalAgents Studio instance is already running. Exiting.');
+  app.exit(0);
+} else {
+  app.on('second-instance', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    if (!mainWindow.isVisible()) mainWindow.show();
+    mainWindow.focus();
+  });
+}
+
 // ==========================================
 // WINDOW
 // ==========================================
@@ -116,7 +131,14 @@ function createWindow() {
 }
 
 let quitDrainStarted = false;
-function drainChildrenAndExit(code) {
+// Longer than the per-pid taskkill timeout, so a slow taskkill can still finish before exit.
+const QUIT_CAP_MS = 6000;
+/**
+ * @param {number} code
+ * @param {Promise<unknown>} [alsoWaitFor] extra work (for example log flush) that exit also
+ *   waits for, inside the same cap
+ */
+function drainChildrenAndExit(code, alsoWaitFor) {
   if (quitDrainStarted) {
     try {
       app.exit(code);
@@ -138,24 +160,34 @@ function drainChildrenAndExit(code) {
   } catch {
     /* ignore */
   }
-  const cap = new Promise(resolve => setTimeout(resolve, 2000));
-  Promise.race([Promise.resolve().then(() => killAllProcesses()), cap]).then(exit, exit);
+  const cap = new Promise(resolve => setTimeout(resolve, QUIT_CAP_MS));
+  const work = Promise.all([
+    Promise.resolve().then(() => killAllProcesses()),
+    Promise.resolve(alsoWaitFor).catch(() => {})
+  ]);
+  Promise.race([work, cap]).then(exit, exit);
 }
 
+let crashExitStarted = false;
 process.on('uncaughtException', err => {
   const text = err && err.stack ? err.stack : String(err);
+  let logged = null;
   try {
-    appendLog('error', `uncaughtException: ${text}`);
+    logged = appendLog('error', `uncaughtException: ${text}`);
   } catch {
     /* logging itself failed */
   }
-  const exit = () => drainChildrenAndExit(1);
+  // A second exception (or one during a normal quit) only logs: the cap already bounds the exit.
+  if (crashExitStarted || quitDrainStarted) return;
+  crashExitStarted = true;
+  // Same agent/user process-tree cleanup as a normal quit, bounded by the same cap.
+  // The backstop fires only if the drain itself could not start or hung past the cap.
+  setTimeout(() => process.exit(1), QUIT_CAP_MS + 1500);
   try {
-    Promise.resolve(typeof logChain !== 'undefined' ? logChain : null).then(exit, exit);
+    drainChildrenAndExit(1, logged);
   } catch {
-    exit();
+    process.exit(1);
   }
-  setTimeout(exit, 1500);
 });
 process.on('unhandledRejection', reason => {
   const text = reason && reason.stack ? reason.stack : String(reason);
@@ -163,6 +195,7 @@ process.on('unhandledRejection', reason => {
 });
 
 app.whenReady().then(async () => {
+  if (!gotSingleInstanceLock) return;
   createWindow();
   setupAutoUpdater();
   try {
@@ -296,8 +329,11 @@ async function invokeRpc(channel, args = []) {
   return listener({ webConsole: true }, ...(Array.isArray(args) ? args : []));
 }
 
+const WEB_SHELL_ONLY_CHANNELS = new Set(['terminal:output', 'terminal:state']);
+
 const send = (channel, payload) => {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
+  if (WEB_SHELL_ONLY_CHANNELS.has(channel) && !webConsole.allowShell()) return;
   const webPayload =
     channel === 'session:changed' && payload && typeof payload === 'object'
       ? { ...payload, nodes: stripNodeApiKeys(payload.nodes) }
@@ -323,7 +359,8 @@ const settingsPath = () => path.join(app.getPath('userData'), 'settings.json');
 /** Serialize overlapping atomic writes to the same path. */
 const writeQueues = new Map();
 function withWriteLock(filePath, fn) {
-  const key = path.resolve(String(filePath || ''));
+  const resolved = path.resolve(String(filePath || ''));
+  const key = process.platform === 'win32' ? resolved.toLowerCase() : resolved;
   const prev = writeQueues.get(key) || Promise.resolve();
   const next = prev.then(fn, fn);
   writeQueues.set(
@@ -777,9 +814,9 @@ ipcMain.handle('settings:save', async (e, settings) => {
       ) {
         settings.agents = existing.agents;
       }
-      // Web clients persist a settings snapshot that can still say 0 tokens and
-      // wipe the desktop counters. Never store a lower total from the web console.
-      if (e?.webConsole && existing) {
+      // A stale snapshot (web console, or a desktop that hasn't seen web-raised
+      // totals yet) can still say fewer tokens. Never store a lower total.
+      if (existing) {
         const keepHigher = key => {
           const prev = Number(existing[key]);
           const next = Number(settings[key]);
@@ -808,6 +845,23 @@ ipcMain.handle('settings:save', async (e, settings) => {
           }
           settings.workspaceTokenUsage = nextUsage;
         }
+      }
+      // roleRoutesEdit is a live-session signal, never a settings field.
+      delete settings.roleRoutesEdit;
+      // Web saves keep the desktop's stored picks. Picker edits arrive on the
+      // live session (roleRoutesEdit) and the desktop writes them itself.
+      if (e?.webConsole) {
+        if (existing && Object.prototype.hasOwnProperty.call(existing, 'roleRoutes')) {
+          settings.roleRoutes = existing.roleRoutes;
+        } else {
+          delete settings.roleRoutes;
+        }
+      } else if (
+        existing &&
+        Object.prototype.hasOwnProperty.call(existing, 'roleRoutes') &&
+        !Object.prototype.hasOwnProperty.call(settings, 'roleRoutes')
+      ) {
+        settings.roleRoutes = existing.roleRoutes;
       }
     const prevNodes = Array.isArray(existing?.nodes) ? existing.nodes : [];
     const sealed = {
@@ -946,7 +1000,22 @@ ipcMain.handle('session:publish', (e, snapshot = {}) => {
         ? snapshot.openTabPaths
         : liveSession.openTabPaths || [],
       // Last writer wins for conductor / chat mirror (each publish carries full snapshot).
-      conductor: snapshot.conductor !== undefined ? snapshot.conductor : liveSession.conductor,
+      // A web publish must not replace roleRoutes unless it is a deliberate picker edit.
+      conductor: (() => {
+        const incoming = snapshot.conductor !== undefined ? snapshot.conductor : liveSession.conductor;
+        if (!fromWeb || !incoming || typeof incoming !== 'object') return incoming;
+        if (incoming.roleRoutesEdit === true) {
+          const routes = incoming.roleRoutes;
+          const plain = !!routes && typeof routes === 'object' && !Array.isArray(routes);
+          if (plain) return { ...incoming };
+        }
+        const next = { ...incoming };
+        delete next.roleRoutesEdit;
+        const prev = liveSession.conductor;
+        if (prev && typeof prev === 'object' && prev.roleRoutes) next.roleRoutes = prev.roleRoutes;
+        else delete next.roleRoutes;
+        return next;
+      })(),
       chatMirror: snapshot.chatMirror !== undefined ? snapshot.chatMirror : liveSession.chatMirror,
       ...(localTokensGenerated != null ? { localTokensGenerated } : {}),
       ...(frontierTokensUsed != null ? { frontierTokensUsed } : {}),
@@ -1048,6 +1117,8 @@ function redactLog(text) {
     .replace(/AIzaSy[A-Za-z0-9_\-]{20,}/g, 'AIzaSy[redacted]')
     .replace(/Bearer\s+[A-Za-z0-9._\-+/=]+/gi, 'Bearer [redacted]')
     .replace(/"apiKey"\s*:\s*"[^"]*"/gi, '"apiKey":"[redacted]"')
+    .replace(/([?&](?:key|api_key|apikey|token|access_token)=)[^&\s"']+/gi, '$1[redacted]')
+    .replace(/\/\/[^/\s:@]+:[^@\s/]+@/g, '//[redacted]@')
     .replace(/(api[_-]?key|token|password|passphrase|authorization)\s*[=:]\s*\S+/gi, '$1=[redacted]');
 }
 
@@ -1717,11 +1788,16 @@ async function atomicWriteFile(filePath, body) {
       }
       await fsp.rename(tmp, dest);
     } catch (err) {
-      if (err && /symlink|junction|outside the open workspace/i.test(err.message || '')) {
+      if (err && /symlink|junction|hardlink|outside the open workspace/i.test(err.message || '')) {
         await fsp.unlink(tmp).catch(() => {});
         throw err;
       }
-      dest = recheckWorkspaceLeaf(dest);
+      try {
+        dest = recheckWorkspaceLeaf(dest);
+      } catch (recheckErr) {
+        await fsp.unlink(tmp).catch(() => {});
+        throw recheckErr;
+      }
       await fsp.copyFile(tmp, dest);
       await fsp.unlink(tmp).catch(() => {});
     }
@@ -1895,12 +1971,117 @@ async function toolListDir(root, args) {
   return { content: out.length ? out.join('\n') : '(empty directory)' };
 }
 
+/** Longest line a regex search will test. Longer lines are tested on their first part only. */
+const SEARCH_REGEX_LINE_CAP = 4000;
+const SEARCH_REGEX_MAX_LENGTH = 500;
+
+/**
+ * True when the pattern repeats a group without bound (+, *, {n,}) and that group can end on an
+ * unbounded quantifier with nothing required after it, such as `(a+)+`, `(\w+\s*)+` or `(.*)*x`.
+ * Those backtrack catastrophically and the search runs on the main process.
+ * A required atom after the inner quantifier (`(\d+\.)+`), a group with no inner quantifier
+ * (`(foo|bar)+`) or an optional repeat (`(a+)?b`) is safe and allowed. Optional trailing atoms
+ * (`?`, `{0,n}`) do not count as "something required".
+ */
+function hasNestedQuantifier(pattern) {
+  const src = String(pattern || '');
+  // Per open group: `tail` = the current alternative can end on an unbounded quantifier;
+  // `any` = an earlier alternative of the group can.
+  const stack = [{ tail: false, any: false }];
+  // Reads a quantifier at index j. `len` is 0 when there is none.
+  const quantAt = j => {
+    const ch = src[j];
+    let len = 0;
+    let unbounded = false;
+    let optional = false;
+    if (ch === '*') {
+      len = 1;
+      unbounded = true;
+      optional = true;
+    } else if (ch === '+') {
+      len = 1;
+      unbounded = true;
+    } else if (ch === '?') {
+      len = 1;
+      optional = true;
+    } else if (ch === '{') {
+      const m = /^\{(\d+)(,(\d*))?\}/.exec(src.slice(j, j + 24));
+      if (m) {
+        len = m[0].length;
+        unbounded = m[2] !== undefined && m[3] === '';
+        optional = Number(m[1]) === 0;
+      }
+    }
+    // A trailing `?` makes the quantifier lazy; it is not another quantifier.
+    if (len && src[j + len] === '?') len++;
+    return { len, unbounded, optional };
+  };
+  const applyAtom = (frame, q) => {
+    if (q.unbounded) frame.tail = true;
+    else if (!q.optional) frame.tail = false;
+  };
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    const frame = stack[stack.length - 1];
+    if (ch === '(') {
+      stack.push({ tail: false, any: false });
+      const prefix = /^\?(?::|=|!|<=|<!|<[^>]*>)/.exec(src.slice(i + 1, i + 80));
+      if (prefix) i += prefix[0].length;
+      continue;
+    }
+    if (ch === ')') {
+      if (stack.length < 2) continue;
+      const closed = stack.pop();
+      const parent = stack[stack.length - 1];
+      const groupTail = closed.any || closed.tail;
+      const q = quantAt(i + 1);
+      i += q.len;
+      if (q.unbounded && groupTail) return true;
+      if (q.unbounded) parent.tail = true;
+      else if (q.optional) parent.tail = parent.tail || groupTail;
+      else parent.tail = groupTail;
+      continue;
+    }
+    if (ch === '|') {
+      frame.any = frame.any || frame.tail;
+      frame.tail = false;
+      continue;
+    }
+    if (ch === '^' || ch === '$') {
+      frame.tail = false;
+      continue;
+    }
+    if (ch === '\\') {
+      i++;
+    } else if (ch === '[') {
+      i++;
+      if (src[i] === '^') i++;
+      while (i < src.length && src[i] !== ']') {
+        if (src[i] === '\\') i++;
+        i++;
+      }
+    }
+    const q = quantAt(i + 1);
+    i += q.len;
+    applyAtom(frame, q);
+  }
+  return false;
+}
+
 async function toolSearch(root, args) {
   const base = resolveScoped(root, args.path || '.', { allowRoot: true });
   const query = args.query || '';
   if (!query) throw new Error('search requires a query');
   const useRegex = String(args.regex).toLowerCase() === 'true';
   let re;
+  if (useRegex) {
+    if (query.length > SEARCH_REGEX_MAX_LENGTH) {
+      throw new Error(`Regex is too long (max ${SEARCH_REGEX_MAX_LENGTH} characters). Use a simpler pattern or a plain-text search.`);
+    }
+    if (hasNestedQuantifier(query)) {
+      throw new Error('Regex rejected: a repeated group that ends in + or * (for example (a+)+) can backtrack catastrophically. Simplify the pattern or use a plain-text search.');
+    }
+  }
   try {
     re = useRegex ? new RegExp(query, 'i') : null;
   } catch (err) {
@@ -1911,6 +2092,22 @@ async function toolSearch(root, args) {
   let filesScanned = 0;
   let yieldTicks = 0;
   const MAX_RESULTS = 150;
+  // One extra hit tells us the list was really cut off.
+  const SCAN_LIMIT = MAX_RESULTS + 1;
+  const lineMatches = line =>
+    re
+      ? re.test(line.length > SEARCH_REGEX_LINE_CAP ? line.slice(0, SEARCH_REGEX_LINE_CAP) : line)
+      : line.toLowerCase().includes(needle);
+  const scanBuffer = (buf, full) => {
+    const lines = buf.toString('utf-8').split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (lineMatches(line)) {
+        results.push(`${path.relative(root || base, full)}:${i + 1}: ${line.trim().slice(0, 220)}`);
+        if (results.length >= SCAN_LIMIT) break;
+      }
+    }
+  };
 
   const yieldNow = async () => {
     if (++yieldTicks % 25 === 0) await new Promise(resolve => setImmediate(resolve));
@@ -1926,7 +2123,7 @@ async function toolSearch(root, args) {
   };
 
   async function walk(dir) {
-    if (results.length >= MAX_RESULTS || filesScanned > 25000) return;
+    if (results.length >= SCAN_LIMIT || filesScanned > 25000) return;
     let entries;
     try {
       entries = await fsp.readdir(dir, { withFileTypes: true });
@@ -1934,7 +2131,7 @@ async function toolSearch(root, args) {
       return;
     }
     for (const e of entries) {
-      if (results.length >= MAX_RESULTS) return;
+      if (results.length >= SCAN_LIMIT) return;
       await yieldNow();
       const full = path.join(dir, e.name);
       if (escaped(full)) continue;
@@ -1948,14 +2145,7 @@ async function toolSearch(root, args) {
         if (stat.size > 1024 * 1024) continue;
         const buf = await fsp.readFile(full);
         if (isBinary(buf)) continue;
-        const lines = buf.toString('utf-8').split(/\r?\n/);
-        for (let i = 0; i < lines.length; i++) {
-          const line = lines[i];
-          if (re ? re.test(line) : line.toLowerCase().includes(needle)) {
-            results.push(`${path.relative(root || base, full)}:${i + 1}: ${line.trim().slice(0, 220)}`);
-            if (results.length >= MAX_RESULTS) break;
-          }
-        }
+        scanBuffer(buf, full);
       } catch {
         /* unreadable file */
       }
@@ -1966,15 +2156,15 @@ async function toolSearch(root, args) {
   if (stat.isFile()) {
     if (stat.size > READ_CAP_BYTES) throw new Error('File too large to search');
     filesScanned = 0;
-    const lines = (await fsp.readFile(base, 'utf-8')).split(/\r?\n/);
-    lines.forEach((line, i) => {
-      if (re ? re.test(line) : line.toLowerCase().includes(needle)) results.push(`${path.relative(root || base, base)}:${i + 1}: ${line.trim()}`);
-    });
+    const buf = await fsp.readFile(base);
+    if (!isBinary(buf)) scanBuffer(buf, base);
   } else {
     await walk(base);
   }
-  const suffix = results.length >= MAX_RESULTS ? `\n[stopped after ${MAX_RESULTS} matches - narrow the query or path]` : '';
-  return { content: results.length ? results.join('\n') + suffix : `No matches for "${query}"` };
+  const stopped = results.length > MAX_RESULTS;
+  const shown = stopped ? results.slice(0, MAX_RESULTS) : results;
+  const suffix = stopped ? `\n[stopped after ${MAX_RESULTS} matches - narrow the query or path]` : '';
+  return { content: shown.length ? shown.join('\n') + suffix : `No matches for "${query}"` };
 }
 
 async function toolWriteFile(root, args) {
@@ -2127,9 +2317,12 @@ ipcMain.handle('web:search', async (e, baseUrl, query) => {
   }
 });
 
-ipcMain.handle('image:generate', async (_e, nodeUrl, model, prompt) => {
+ipcMain.handle('image:generate', async (e, nodeUrl, model, prompt) => {
   try {
-    const base = String(nodeUrl || '').replace(/\/+$/, '');
+    const denied = await webNodeUrlDenial(e, nodeUrl);
+    if (denied) return { ok: false, error: denied };
+    const base = String(nodeUrl || '').trim().replace(/\/+$/, '');
+    if (!/^https?:\/\//i.test(base)) return { ok: false, error: 'Image node URL must be http or https' };
     const resp = await fetch(`${base}/api/generate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2137,6 +2330,7 @@ ipcMain.handle('image:generate', async (_e, nodeUrl, model, prompt) => {
       signal: AbortSignal.timeout(180000)
     });
     if (!resp.ok) {
+      if (e?.webConsole) return { ok: false, error: `Image HTTP ${resp.status}` };
       const text = await readCappedBody(resp);
       return { ok: false, error: `Image HTTP ${resp.status}: ${text.slice(0, 300)}` };
     }
@@ -2211,9 +2405,7 @@ function runTsc(cwd, args, timeoutMs = 90000) {
     }
 
     const onData = d => {
-      if (output.length >= OUTPUT_CAP_BYTES) return;
-      output += d.toString();
-      if (output.length > OUTPUT_CAP_BYTES) output = output.slice(0, OUTPUT_CAP_BYTES) + '\n[output capped at 1 MB]';
+      output = appendCapped(output, d.toString());
     };
     proc.stdout.on('data', onData);
     proc.stderr.on('data', onData);
@@ -2230,6 +2422,37 @@ function runTsc(cwd, args, timeoutMs = 90000) {
       resolve({ code: -1, output: output + err.message, timedOut, skipped: false });
     });
   });
+}
+
+/**
+ * Keeps only the tsc (non-pretty) diagnostics that belong to `file`, plus errors with no file.
+ * Indented continuation lines follow whichever diagnostic they belong to.
+ */
+function filterTscDiagnosticsToFile(output, root, file) {
+  const norm = p => path.resolve(root, String(p)).replace(/\\/g, '/').toLowerCase();
+  const target = norm(file);
+  const kept = [];
+  let keepCurrent = true;
+  let keptErrors = 0;
+  let droppedErrors = 0;
+  for (const line of String(output || '').split(/\r?\n/)) {
+    const diag = /^(.+?)\((\d+),(\d+)\): (error|warning) TS\d+/.exec(line);
+    const global = !diag && /^(error|warning) TS\d+/.test(line);
+    if (diag) {
+      keepCurrent = norm(diag[1]) === target;
+      if (diag[4] === 'error') {
+        if (keepCurrent) keptErrors++;
+        else droppedErrors++;
+      }
+    } else if (global) {
+      keepCurrent = true;
+      keptErrors++;
+    } else if (!/^\s/.test(line)) {
+      keepCurrent = true;
+    }
+    if (keepCurrent) kept.push(line);
+  }
+  return { output: kept.join('\n'), keptErrors, droppedErrors };
 }
 
 /**
@@ -2285,11 +2508,14 @@ ipcMain.handle('workspace:typecheck', async (_e, root, opts = {}) => {
           mode: 'contract'
         };
       }
-      const tail = (res.output || '').slice(-14000);
+      // tsc follows imports, so errors from files the contract merely imports must not fail it.
+      const scoped = filterTscDiagnosticsToFile(res.output, root, abs);
+      const contractOk = res.code === 0 || (scoped.droppedErrors > 0 && scoped.keptErrors === 0 && res.code === 2);
+      const tail = scoped.output.slice(-14000);
       return {
-        ok: res.code === 0 && !res.timedOut,
-        code: res.code,
-        output: tail || (res.code === 0 ? '' : 'tsc failed with no output'),
+        ok: contractOk && !res.timedOut,
+        code: contractOk ? 0 : res.code,
+        output: tail || (contractOk ? '' : 'tsc failed with no output'),
         timedOut: res.timedOut,
         mode: 'contract'
       };
@@ -2369,7 +2595,8 @@ ipcMain.handle('workspace:installDeps', async (e, root, opts = {}) => {
     const res = await runPowerShell('npm install', root, {
       timeoutMs,
       echo: true,
-      capture: true
+      capture: true,
+      idleMs: timeoutMs
     });
     const tail =
       (res.output || '').length > 16000
@@ -2568,27 +2795,29 @@ function getTerminalSnapshot(maxChars = 12000) {
   };
 }
 
+const TASKKILL_TIMEOUT_MS = 2000;
+
 function taskkillPid(pid) {
   return new Promise(resolve => {
     if (!pid) {
-      resolve();
+      resolve(false);
       return;
     }
     let settled = false;
-    const finish = () => {
+    const finish = ok => {
       if (settled) return;
       settled = true;
-      resolve();
+      resolve(ok);
     };
-    const timer = setTimeout(finish, 2000);
+    const timer = setTimeout(() => finish(false), TASKKILL_TIMEOUT_MS);
     try {
-      execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => {
+      execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, err => {
         clearTimeout(timer);
-        finish();
+        finish(!err);
       });
     } catch {
       clearTimeout(timer);
-      finish();
+      finish(false);
     }
   });
 }
@@ -2596,7 +2825,15 @@ function taskkillPid(pid) {
 function killTree(proc) {
   if (!proc || proc.exitCode !== null) return Promise.resolve();
   // proc.kill() on Windows does not kill grandchildren (npm, node, python...). taskkill /T does.
-  return taskkillPid(proc.pid);
+  // If taskkill fails or times out, at least take down the direct child.
+  return taskkillPid(proc.pid).then(ok => {
+    if (ok || proc.exitCode !== null) return;
+    try {
+      proc.kill();
+    } catch {
+      /* already gone */
+    }
+  });
 }
 
 function killUserProcesses() {
@@ -2626,11 +2863,14 @@ function jailAgentCwd(cwd) {
   return resolveJailedPath(pin, start, { allowRoot: true });
 }
 
+const OUTPUT_TRUNCATED_PREFIX = '[earlier output truncated]\n';
+
+/** Keeps the last 1 MB of output: the failing line is almost always at the end. */
 function appendCapped(output, text) {
-  if (output.length >= OUTPUT_CAP_BYTES) return output;
-  const next = output + text;
-  if (next.length <= OUTPUT_CAP_BYTES) return next;
-  return next.slice(0, OUTPUT_CAP_BYTES) + '\n[output capped at 1 MB]';
+  const truncated = output.startsWith(OUTPUT_TRUNCATED_PREFIX);
+  const body = (truncated ? output.slice(OUTPUT_TRUNCATED_PREFIX.length) : output) + text;
+  if (!truncated && body.length <= OUTPUT_CAP_BYTES) return body;
+  return OUTPUT_TRUNCATED_PREFIX + body.slice(-OUTPUT_CAP_BYTES);
 }
 
 function runPowerShell(command, cwd, { timeoutMs = 0, echo = true, capture = false, idleMs = 0, kind = 'agent' } = {}) {
@@ -2655,7 +2895,9 @@ function runPowerShell(command, cwd, { timeoutMs = 0, echo = true, capture = fal
     const bucket = isUser ? userProcs : agentProcs;
     const wrapped =
       `$env:CI='1'; $env:NONINTERACTIVE='1'; $env:TERM='dumb'; ` +
-      `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $ProgressPreference = 'SilentlyContinue'; ${command}`;
+      `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $ProgressPreference = 'SilentlyContinue'\n` +
+      `${command}\n` +
+      `if (-not $?) { if ($LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 } }; if ($LASTEXITCODE) { exit $LASTEXITCODE }`;
     let proc;
     try {
       proc = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', wrapped], {
@@ -2747,7 +2989,9 @@ ipcMain.handle('terminal:getBuffer', (e, opts) => {
   return getTerminalSnapshot(opts?.maxChars);
 });
 
-ipcMain.handle('terminal:clearBuffer', () => {
+ipcMain.handle('terminal:clearBuffer', e => {
+  const shellDenied = webShellDenial(e);
+  if (shellDenied) return { error: shellDenied };
   terminalBuffer = '';
   return { success: true };
 });
@@ -2777,12 +3021,14 @@ async function fetchJson(url, { timeoutMs = 2500, method = 'GET', body } = {}) {
 
 function normalizeFrontierEndpoint(rawUrl) {
   let endpoint = (rawUrl || '').trim().replace(/\/+$/, '');
+  // A pasted full chat or models URL is a base URL plus a suffix the callers add themselves.
+  endpoint = endpoint.replace(/\/(?:chat\/completions|models)$/i, '').replace(/\/+$/, '');
   if (endpoint.includes('googleapis.com')) {
-    if (!endpoint.includes('/v1beta')) {
-      endpoint = `${endpoint}/v1beta`;
-    }
-    if (!endpoint.includes('/openai')) {
-      endpoint = `${endpoint}/openai`;
+    const origin = /^(https?:\/\/[^/]+)/i.exec(endpoint);
+    if (origin) endpoint = `${origin[1]}/v1beta/openai`;
+    else {
+      if (!endpoint.includes('/v1beta')) endpoint = `${endpoint}/v1beta`;
+      if (!endpoint.includes('/openai')) endpoint = `${endpoint}/openai`;
     }
   }
   return endpoint;
@@ -3061,7 +3307,6 @@ async function streamNdjson(requestId, url, body, channel, onLine, deadlines) {
       if (done) break;
       armIdle();
       buffer += decoder.decode(value, { stream: true });
-      if (buffer.length > OUTPUT_CAP_BYTES) throw new Error('Stream line exceeded 1 MB');
       let idx;
       while ((idx = buffer.indexOf('\n')) >= 0) {
         const line = buffer.slice(0, idx).trim();
@@ -3072,6 +3317,7 @@ async function streamNdjson(requestId, url, body, channel, onLine, deadlines) {
         if (parsed.error) throw new Error(parsed.error);
         onLine(parsed);
       }
+      if (buffer.length > OUTPUT_CAP_BYTES) throw new Error('Stream line exceeded 1 MB');
     }
     if (buffer.trim()) {
       try { onLine(JSON.parse(buffer)); } catch { /* trailing junk */ }
@@ -3377,7 +3623,6 @@ async function streamOpenAI(requestId, url, apiKey, body, channel) {
       if (done) break;
       armIdle();
       buffer += decoder.decode(value, { stream: true });
-      if (buffer.length > OUTPUT_CAP_BYTES) throw new Error('Stream line exceeded 1 MB');
       let idx;
       while ((idx = buffer.indexOf('\n')) >= 0) {
         const line = buffer.slice(0, idx).trim();
@@ -3407,6 +3652,7 @@ async function streamOpenAI(requestId, url, apiKey, body, channel) {
           }
         } catch { /* skip malformed SSE */ }
       }
+      if (buffer.length > OUTPUT_CAP_BYTES) throw new Error('Stream line exceeded 1 MB');
     }
 
     const extra = writeTagsFromToolCalls(toolAcc);
@@ -3859,28 +4105,73 @@ function run(cmd, args) {
 
 ipcMain.handle('app:getVersion', () => app.getVersion());
 
+/** nvidia-smi csv rows ("name, memory.total"): report the card with the most memory. */
+function parseNvidiaSmiGpus(text) {
+  let best = null;
+  for (const row of String(text || '').split(/\r?\n/)) {
+    const cut = row.lastIndexOf(',');
+    if (cut < 0) continue;
+    const name = row.slice(0, cut).trim();
+    const memMiB = parseInt(row.slice(cut + 1).trim(), 10);
+    if (!name || !Number.isFinite(memMiB) || memMiB <= 0) continue;
+    if (!best || memMiB > best.memMiB) best = { name, memMiB };
+  }
+  return best;
+}
+
+// AdapterRAM is a 32-bit WMI value (caps near 4 GB). The display class registry keys carry the
+// real 64-bit size in HardwareInformation.qwMemorySize. Output rows: name|adapterRam|qwMemorySize.
+const VIDEO_CONTROLLER_PS = [
+  "$ErrorActionPreference = 'SilentlyContinue'",
+  '$qw = @{}',
+  "Get-ChildItem 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}' | ForEach-Object {",
+  '  $p = Get-ItemProperty -LiteralPath $_.PSPath',
+  "  $v = $p.'HardwareInformation.qwMemorySize'",
+  '  if ($p.DriverDesc -and $null -ne $v) {',
+  '    if ($v -is [byte[]]) { $v = [BitConverter]::ToUInt64(($v + (New-Object byte[] 8))[0..7], 0) }',
+  '    $n = [uint64]$v',
+  '    if ($n -gt 0 -and (-not $qw.ContainsKey($p.DriverDesc) -or $qw[$p.DriverDesc] -lt $n)) { $qw[$p.DriverDesc] = $n }',
+  '  }',
+  '}',
+  "Get-CimInstance Win32_VideoController | Where-Object { $_.Name -and $_.Name -notmatch 'Microsoft Basic' } | ForEach-Object {",
+  '  $q = $qw[$_.Name]; if (-not $q) { $q = 0 }',
+  '  "$($_.Name)|$($_.AdapterRAM)|$q"',
+  '}'
+].join('\n');
+
+/** Pick the adapter with the most memory. A 64-bit registry size wins; AdapterRAM only counts as "at least" that much. */
+function pickVideoController(text) {
+  let best = null;
+  for (const row of String(text || '').split(/\r?\n/)) {
+    const [name = '', ram = '', qw = ''] = row.split('|').map(s => s.trim());
+    if (!name) continue;
+    const adapterBytes = Number(ram);
+    const qwBytes = Number(qw);
+    let bytes = 0;
+    if (Number.isFinite(qwBytes) && qwBytes > 0) bytes = qwBytes;
+    else if (Number.isFinite(adapterBytes) && adapterBytes > 0) bytes = adapterBytes;
+    if (!best || bytes > best.bytes) best = { name, bytes };
+  }
+  return best;
+}
+
 ipcMain.handle('system:detect-hardware', async () => {
   const cpu = (os.cpus()[0]?.model || 'Unknown CPU').replace(/\s+/g, ' ').trim();
   const ramGB = Math.round(os.totalmem() / 1024 ** 3);
   let gpu = '';
   let vramGB = 0;
   const smi = await run('nvidia-smi', ['--query-gpu=name,memory.total', '--format=csv,noheader,nounits']);
-  if (smi.trim()) {
-    const [name, mem] = smi.trim().split('\n')[0].split(',').map(s => s.trim());
-    gpu = name.replace(/^NVIDIA\s+/i, '').replace(/^GeForce\s+/i, '');
-    vramGB = Math.round(parseInt(mem, 10) / 1024);
+  const smiBest = parseNvidiaSmiGpus(smi);
+  if (smiBest) {
+    gpu = smiBest.name.replace(/^NVIDIA\s+/i, '').replace(/^GeForce\s+/i, '');
+    vramGB = Math.round(smiBest.memMiB / 1024);
   } else {
     // AMD / Intel Arc / iGPU fallback via WMI when nvidia-smi is absent.
-    const video = await run('powershell.exe', [
-      '-NoProfile',
-      '-Command',
-      '(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -and $_.Name -notmatch "Microsoft Basic" } | Select-Object -First 1 Name, AdapterRAM) | ForEach-Object { "$($_.Name)|$($_.AdapterRAM)" }'
-    ]);
-    if (video.trim()) {
-      const [name, ram] = video.trim().split('|').map(s => s.trim());
-      gpu = (name || '').replace(/^AMD\s+/i, '');
-      const bytes = parseInt(ram, 10);
-      if (Number.isFinite(bytes) && bytes > 0) vramGB = Math.max(1, Math.round(bytes / 1024 ** 3));
+    const video = await run('powershell.exe', ['-NoProfile', '-Command', VIDEO_CONTROLLER_PS]);
+    const best = pickVideoController(video);
+    if (best) {
+      gpu = best.name.replace(/^AMD\s+/i, '');
+      if (best.bytes > 0) vramGB = Math.max(1, Math.round(best.bytes / 1024 ** 3));
     }
   }
   // RAM speed -> approximate dual-channel bandwidth: MT/s * 8 bytes * channels

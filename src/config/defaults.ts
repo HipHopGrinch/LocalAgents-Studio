@@ -1,5 +1,20 @@
 import { AgentPersona, AppSettings, HardwareProfile, NodeConfig } from '../types';
+import { normalizeRoleRoutes } from '../lib/roleRoutes';
 import { normalizeClusterNodes } from '../lib/tools';
+import {
+  CONTROL_DEFAULT,
+  CONTROL_MAX,
+  CONTROL_MIN,
+  EDITOR_DEFAULT,
+  EDITOR_MAX_STORED,
+  EDITOR_MIN,
+  EXPLORER_DEFAULT,
+  EXPLORER_MAX,
+  EXPLORER_MIN,
+  NODE_WORK_DEFAULT,
+  NODE_WORK_MAX,
+  NODE_WORK_MIN
+} from '../lib/paneLayout';
 
 export const SETTINGS_VERSION = 6;
 
@@ -134,13 +149,13 @@ Do NOT edit or write project files. Do not invent a new product roadmap. For Pla
 ];
 
 /**
- * Agent pane that fits a ≥320px transcript beside the 270px Conductor and
- * 280px Node Work columns (plus the inner splitters) at 1080p.
+ * Legacy outer agent-pane clamp. Live layout uses `editorWidth` (see paneLayout).
+ * Kept so old settings files still load `chatWidth`.
  */
 export const MIN_CHAT_WIDTH = 880;
 export const MAX_CHAT_WIDTH = 1600;
-export const MIN_EXPLORER_WIDTH = 160;
-export const MAX_EXPLORER_WIDTH = 540;
+export const MIN_EXPLORER_WIDTH = EXPLORER_MIN;
+export const MAX_EXPLORER_WIDTH = EXPLORER_MAX;
 
 function clampStoredWidth(value: unknown, min: number, max: number, fallback: number): number {
   const n = typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : fallback;
@@ -160,10 +175,12 @@ export const DEFAULT_SETTINGS: AppSettings = {
   frontierTokensUsed: 0,
   tokenStatsScope: 'global',
   workspaceTokenUsage: {},
-  explorerWidth: 240,
+  explorerWidth: EXPLORER_DEFAULT,
   chatWidth: MIN_CHAT_WIDTH,
-  agentControlWidth: 270,
-  agentNodeWorkWidth: 280,
+  editorWidth: EDITOR_DEFAULT,
+  editorHidden: false,
+  agentControlWidth: CONTROL_DEFAULT,
+  agentNodeWorkWidth: NODE_WORK_DEFAULT,
   uiScale: 1.0,
   recentWorkspaces: [],
   conversations: [],
@@ -174,7 +191,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   autoSelectEndpoint: false,
   autoApplyWrites: false,
   autoReview: false,
+  fullAuto: false,
   cloudStrategistEnabled: false,
+  roleRoutes: {},
   webConsole: {
     enabled: false,
     port: 3847,
@@ -221,14 +240,24 @@ export function mergeSettings(saved: Partial<AppSettings> | null): AppSettings {
       };
     }),
     conversations: Array.isArray(saved.conversations) ? saved.conversations : [],
-    explorerWidth: clampStoredWidth(saved.explorerWidth, MIN_EXPLORER_WIDTH, MAX_EXPLORER_WIDTH, 240),
+    explorerWidth: clampStoredWidth(saved.explorerWidth, EXPLORER_MIN, EXPLORER_MAX, EXPLORER_DEFAULT),
     chatWidth: clampStoredWidth(saved.chatWidth, MIN_CHAT_WIDTH, MAX_CHAT_WIDTH, MIN_CHAT_WIDTH),
+    editorWidth: clampStoredWidth(saved.editorWidth, EDITOR_MIN, EDITOR_MAX_STORED, EDITOR_DEFAULT),
+    editorHidden: saved.editorHidden === true,
+    agentControlWidth: clampStoredWidth(saved.agentControlWidth, CONTROL_MIN, CONTROL_MAX, CONTROL_DEFAULT),
+    agentNodeWorkWidth: clampStoredWidth(
+      saved.agentNodeWorkWidth,
+      NODE_WORK_MIN,
+      NODE_WORK_MAX,
+      NODE_WORK_DEFAULT
+    ),
     webConsole: {
       enabled: false,
       port: 3847,
       lanEnabled: false,
       allowShell: false,
       ...(saved.webConsole || {})
-    }
+    },
+    roleRoutes: normalizeRoleRoutes(saved.roleRoutes)
   };
 }

@@ -15,6 +15,8 @@ export interface AutomationDrawerProps {
   onAutoApply: (next: boolean) => void;
   autoReview: boolean;
   onAutoReview: (next: boolean) => void;
+  fullAuto: boolean;
+  onFullAuto: (next: boolean) => void;
 }
 
 function Toggle({
@@ -22,23 +24,47 @@ function Toggle({
   onChange,
   label,
   helpTitle,
-  help
+  help,
+  disabled = false,
+  hint,
+  prominent = false
 }: {
   checked: boolean;
   onChange: (next: boolean) => void;
   label: string;
   helpTitle: string;
   help: string;
+  disabled?: boolean;
+  hint?: string;
+  prominent?: boolean;
 }) {
   return (
-    <label className="flex items-center gap-1.5 cursor-pointer text-zinc-300 hover:text-zinc-100">
+    <label
+      className={
+        prominent
+          ? `flex items-start gap-1.5 rounded border border-amber-500/50 bg-amber-500/10 px-1.5 py-1 ${
+              disabled ? 'cursor-not-allowed text-zinc-400' : 'cursor-pointer text-zinc-100'
+            }`
+          : `flex items-center gap-1.5 ${
+              disabled
+                ? 'cursor-not-allowed text-zinc-400'
+                : 'cursor-pointer text-zinc-300 hover:text-zinc-100'
+            }`
+      }
+    >
       <input
         type="checkbox"
         checked={checked}
+        disabled={disabled}
         onChange={e => onChange(e.target.checked)}
-        className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
+        className={`rounded border-[#31313e] bg-[#1e1e24] text-indigo-500 ${prominent ? 'mt-0.5' : ''}`}
       />
-      <span className="flex-1 leading-snug">{label}</span>
+      <span className="flex-1 leading-snug">
+        {label}
+        {hint ? (
+          <span className="block text-[10px] font-normal text-zinc-400 leading-snug mt-0.5">{hint}</span>
+        ) : null}
+      </span>
       <HelpTip title={helpTitle} align="right">
         <p>{help}</p>
       </HelpTip>
@@ -59,19 +85,35 @@ export const AutomationDrawer: React.FC<AutomationDrawerProps> = ({
   autoApply,
   onAutoApply,
   autoReview,
-  onAutoReview
+  onAutoReview,
+  fullAuto,
+  onFullAuto
 }) => {
   const cloudNote = cloudCount > 0 ? ` · ${cloudCount} cloud` : '';
+  const summary = fullAuto
+    ? 'Full auto'
+    : swarmOn || autoNode || autoApply || autoReview || cloudOn
+      ? 'On'
+      : 'Off';
   return (
     <details className="group rounded-md border border-[#2a2a36] bg-[#14141a]">
       <summary className="flex cursor-pointer list-none items-center justify-between gap-2 px-2 py-1.5 text-[11px] font-semibold text-zinc-200 [&::-webkit-details-marker]:hidden">
         <span>Automation</span>
         <span className="flex items-center gap-1 text-zinc-500 font-normal">
-          {swarmOn || autoNode || autoApply || autoReview || cloudOn ? 'On' : 'Off'}
+          {summary}
           <ChevronDown className="w-3 h-3 transition group-open:rotate-180" />
         </span>
       </summary>
       <div className="px-2 pb-2 space-y-1.5 text-[11px]">
+        <Toggle
+          checked={fullAuto}
+          onChange={onFullAuto}
+          prominent
+          label="Full auto (accept everything)"
+          hint="Saves files, accepts verdicts and plan picks, and keeps going past failed steps. Destructive commands and paid API calls still need you."
+          helpTitle="Full auto"
+          help="Saves files, accepts verdicts and plan picks, and keeps going past failed steps. Destructive commands and paid API calls still need you."
+        />
         <Toggle
           checked={swarmOn}
           onChange={onSwarm}
@@ -91,18 +133,20 @@ export const AutomationDrawer: React.FC<AutomationDrawerProps> = ({
           onChange={onAutoNode}
           label="Choose a computer for me"
           helpTitle="Choose a computer for me"
-          help="Picks an online computer and model for each task. Off keeps the computer you selected above."
+          help="For roles left on Auto, picks an online computer and model. A Planner, Coder, or Reviewer pick above is used either way."
         />
         <Toggle
-          checked={autoApply}
+          checked={fullAuto || autoApply}
           onChange={onAutoApply}
+          disabled={fullAuto}
           label="Save files automatically"
           helpTitle="Save files automatically"
           help="Writes the agent's file edits to disk without an extra click."
         />
         <Toggle
-          checked={autoReview}
+          checked={fullAuto || autoReview}
           onChange={onAutoReview}
+          disabled={fullAuto}
           label="Continue after review"
           helpTitle="Continue after review"
           help="After a pass or fail, keeps going. Off waits for you to accept the review."

@@ -79,7 +79,7 @@ export function noteFreeTierRpmRequest(nodeId: string, now = Date.now()): void {
  */
 export async function waitForFreeTierRpm(
   node: Pick<EndpointNode, 'id' | 'freeTierRpm'>,
-  opts?: { signal?: { aborted?: boolean }; onWait?: (ms: number) => void }
+  opts?: { signal?: { readonly aborted?: boolean }; onWait?: (ms: number) => void }
 ): Promise<number> {
   const rpm = freeTierRpm(node);
   let waited = 0;
@@ -97,8 +97,14 @@ export async function waitForFreeTierRpm(
     }
     opts?.onWait?.(need);
     const slice = Math.min(need, 5_000);
-    await new Promise<void>(resolve => setTimeout(resolve, slice));
-    waited += slice;
+    let slept = 0;
+    while (slept < slice) {
+      const tick = Math.min(250, slice - slept);
+      await new Promise<void>(resolve => setTimeout(resolve, tick));
+      slept += tick;
+      waited += tick;
+      if (opts?.signal?.aborted) return waited;
+    }
   }
 }
 

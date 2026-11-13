@@ -15,7 +15,9 @@ import {
   resolveVerifyCommand,
   typesCannotResolve,
   typescriptVerifyUsesCompiler,
-  VERIFY_ERROR_PREVIEW
+  VERIFY_ERROR_PREVIEW,
+  commandOutputFailed,
+  verifyOutputFailed
 } from './verifyGate';
 
 const moved = errorFingerprint([
@@ -92,5 +94,14 @@ const head = formatErrorsForCoder([], raw);
 assert.match(head, /line-0/);
 assert.doesNotMatch(head, /line-99/);
 assert.match(head, /…and 75 more/);
+
+// B-45: timeouts and non-zero / null / negative exit codes fail the gate
+assert.equal(verifyOutputFailed('Exit code: null (timed out and was killed)'), true);
+assert.equal(verifyOutputFailed('Exit code: -1\nspawn powershell.exe ENOENT'), true);
+assert.equal(verifyOutputFailed('Exit code: 2\nboom'), true);
+assert.equal(verifyOutputFailed('Exit code: 0'), false);
+assert.equal(commandOutputFailed('Exit code: 0\nall good'), false);
+assert.equal(commandOutputFailed('Exit code: -1'), true);
+assert.equal(commandOutputFailed('command timed out'), true);
 
 console.log('verifyGate.selftest ok');

@@ -31,7 +31,7 @@ export function assignSwarmDiagnostics(
       append(owner, err);
       continue;
     }
-    const importers = owned.filter(o => fileImportedBy(bodies.get(o.raw) || '', file));
+    const importers = owned.filter(o => fileImportedBy(bodies.get(o.raw) || '', o.key, file));
     if (!importers.length) {
       unmatched.push(err);
       continue;
@@ -44,15 +44,44 @@ export function assignSwarmDiagnostics(
   return { owned: ownedErrors, unmatched };
 }
 
-function fileImportedBy(body: string, importedFile: string): boolean {
-  const stem = (importedFile.split(/[/\\]/).pop() || '').replace(/\.[^.]+$/, '');
-  if (!stem || stem.length < 2) return false;
-  const want = stem.toLowerCase();
+function normPath(p: string): string {
+  return p.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+}
+
+function stripModuleExt(p: string): string {
+  return p.replace(/\.(?:d\.ts|tsx|ts|jsx|js|mjs|cjs|json)$/, '');
+}
+
+function resolveSpecifier(importer: string, spec: string): string {
+  const relative = spec.startsWith('./') || spec.startsWith('../');
+  const parts = relative ? importer.split('/').slice(0, -1) : [];
+  const source = relative ? spec : spec.replace(/^(?:@|~)?\//, '');
+  for (const seg of source.split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') parts.pop();
+    else parts.push(seg);
+  }
+  return stripModuleExt(parts.join('/'));
+}
+
+function fileImportedBy(body: string, importerPath: string, importedFile: string): boolean {
+  const imported = stripModuleExt(normPath(importedFile));
+  const importedDir = imported.replace(/\/index$/, '');
+  if (!imported || imported.length < 2) return false;
+  const importer = normPath(importerPath);
+  const absolute = /^(?:[a-z]:)?\//.test(imported);
   const specs = body.matchAll(/(?:from|import)\s+['"]([^'"]+)['"]|require\(\s*['"]([^'"]+)['"]/g);
   for (const match of specs) {
-    const spec = match[1] || match[2] || '';
-    const specStem = (spec.split('/').pop() || '').replace(/\.[^.]+$/, '').toLowerCase();
-    if (specStem === want) return true;
+    const spec = (match[1] || match[2] || '').trim();
+    if (!spec) continue;
+    const relative = spec.startsWith('.');
+    if (!relative && !spec.includes('/')) continue;
+    const resolved = resolveSpecifier(importer, spec).toLowerCase();
+    if (!resolved) continue;
+    for (const candidate of [imported, importedDir]) {
+      if (candidate === resolved) return true;
+      if ((!relative || absolute) && candidate.endsWith('/' + resolved)) return true;
+    }
   }
   return false;
 }

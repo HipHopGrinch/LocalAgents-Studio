@@ -63,7 +63,7 @@ function withoutFileBodies(message: ChatMessage): ChatMessage {
 
 function toolOneLiners(message: ChatMessage): string[] {
   const notes: string[] = [];
-  const take = (name: string, path?: string, status?: string, result?: string) => {
+  const take = (name: string, path?: string, status?: string, result?: string, command?: string) => {
     if (name === 'write_file' || name === 'edit_file') {
       if (!path) return;
       notes.push(
@@ -72,7 +72,7 @@ function toolOneLiners(message: ChatMessage): string[] {
       return;
     }
     if (name === 'run_command') {
-      const cmd = (result || '').split('\n')[0]?.slice(0, 80) || path || 'command';
+      const cmd = (command || '').trim().split('\n')[0]?.slice(0, 80) || path || 'command';
       const exit = /Exit code:\s*(\d+)/i.exec(result || '');
       notes.push(`Tool: Ran command (${exit ? `exit ${exit[1]}` : status || 'done'}) — ${cmd}`);
       return;
@@ -81,11 +81,11 @@ function toolOneLiners(message: ChatMessage): string[] {
     if (name === 'list_dir' && path) notes.push(`Tool: Listed ${path}`);
   };
   for (const tool of message.toolCalls || []) {
-    take(tool.name, tool.args?.path, tool.status, tool.result || tool.body);
+    take(tool.name, tool.args?.path, tool.status, tool.result, tool.args?.command || tool.body);
   }
   for (const step of message.pipelineSteps || []) {
     for (const tool of step.toolCalls || []) {
-      take(tool.name, tool.args?.path || step.targetFile, tool.status, tool.result || tool.body);
+      take(tool.name, tool.args?.path || step.targetFile, tool.status, tool.result, tool.args?.command || tool.body);
     }
   }
   return notes;

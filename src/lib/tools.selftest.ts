@@ -16,7 +16,9 @@ import {
   pickFailoverTarget,
   rankModelsForWeight,
   routingActiveParamsB,
-  truncatedWriteToolCall
+  truncatedWriteToolCall,
+  hasUnclosedWrite,
+  selectBestEndpointForTask
 } from './tools';
 
 const agent = (partial: Partial<AgentPersona> = {}): AgentPersona => ({
@@ -440,5 +442,54 @@ assert.equal(avoidedSpill?.model, 'gemma4:e2b');
 const partialFit = pickFailoverTarget([spillOnly], 'gone', 'gemma4:12b');
 assert.equal(partialFit?.node.id, 'spill-only');
 assert.equal(partialFit?.model, 'gemma4:12b');
+
+// B-22: routing uses the real size of dense qwen3 tags, not the MoE active params
+const denseNode = node({
+  id: 'dense',
+  name: 'dense',
+  hardware: hw(48),
+  models: [
+    { name: 'qwen3:32b', size: 20e9, details: { parameter_size: '32B' } },
+    { name: 'qwen3:4b', size: 2.6e9, details: { parameter_size: '4B' } }
+  ]
+});
+assert.ok(Math.abs(routingActiveParamsB(denseNode, 'qwen3:32b') - 32) < 0.5);
+assert.ok(Math.abs(routingActiveParamsB(denseNode, 'qwen3:4b') - 4) < 0.5);
+assert.equal(rankModelsForWeight([denseNode], 'heavy', { role: 'coder' })?.model, 'qwen3:32b');
+
+// B-23: coder turns ignore the quick/css keyword shortcuts
+const archNode = node({
+  id: 'arch',
+  name: 'arch',
+  specialty: 'architect',
+  hardware: hw(16),
+  models: [{ name: 'qwen2.5-coder:14b', size: 9e9, details: { parameter_size: '14.8B' } }]
+});
+const scoutNode = node({
+  id: 'scout',
+  name: 'scout',
+  specialty: 'scout',
+  hardware: hw(8),
+  models: [{ name: 'qwen2.5-coder:7b', size: 4.7e9, details: { parameter_size: '7.6B' } }]
+});
+assert.equal(selectBestEndpointForTask('quick fix the css color', 'coder', [archNode, scoutNode])?.id, 'arch');
+assert.equal(selectBestEndpointForTask('quick fix the css color', '', [archNode, scoutNode])?.id, 'scout');
+
+// B-24: tool tags are case-insensitive
+const upperTag = parseResponse('<Write_file path="a.ts">x</Write_file>', 'm-upper');
+assert.equal(upperTag.toolCalls.length, 1);
+assert.equal(upperTag.toolCalls[0].name, 'write_file');
+assert.equal(parseResponse('<RUN_COMMAND>npm test</RUN_COMMAND>', 'm-cmd').toolCalls[0]?.name, 'run_command');
+assert.deepEqual(hasUnclosedWrite('<WRITE_FILE path="a.ts">partial'), { name: 'write_file', path: 'a.ts' });
+
+// B-25: tags inside a closed body and self-closing tags are not truncation
+const readmeBody = '<write_file path="README.md">\nUse <write_file path="a.ts"> to create files.\n</write_file>';
+assert.equal(parseResponse(readmeBody, 'm-readme').toolCalls.length, 1);
+assert.equal(hasUnclosedWrite(readmeBody), null);
+assert.equal(hasUnclosedWrite('<write_file path="x"/>'), null);
+assert.deepEqual(
+  hasUnclosedWrite('<write_file path="a.ts">ok</write_file>\n<write_file path="b.ts">cut'),
+  { name: 'write_file', path: 'b.ts' }
+);
 
 console.log('tools.selftest ok');

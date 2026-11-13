@@ -5,7 +5,7 @@ import { installedModelSizeB } from './recommender';
 import { isFullGpuFit } from './modelFit';
 import { fileContextCapsForTier, type ModelFitTier } from './clusterInventory';
 import { getEnabledModelsForNode, isFrontierNode, nodeAllowsRole, rankModelsForWeight } from './tools';
-import { isDurableStep, isInspectionOnly } from './workLog';
+import { fileNamesIn, isDurableStep, isInspectionOnly } from './workLog';
 import type { NodeRole } from '../types';
 
 /** Extra coding steps the app may run without asking. Then it stops and shows choices. */
@@ -130,6 +130,10 @@ export function pickFinalSourceReviewTarget(nodes: EndpointNode[]): ReviewTarget
   return pickCapableReviewTarget(nodes, 'reviewer');
 }
 
+const NEGATION_PREFIX = String.raw`\b(?:not|no|never|cannot|can'?t|(?:do|does|did|should|would|is|are|was)n'?t)\s+(?:(?:yet|really|quite|fully|further|just|be|been|look|looks)\s+)?`;
+const NEGATED_RESULT = new RegExp(`${NEGATION_PREFIX}(?:pass|passed|ok|okay|clean|good)\\b`, 'i');
+const NEGATED_DECISION = new RegExp(`${NEGATION_PREFIX}(?:continue|done|complete|completed)\\b`, 'i');
+
 export function parseFinalReview(raw: string): { result: 'pass' | 'issues'; notes: string } | null {
   const block = raw.match(/<final_review\b[^>]*>([\s\S]*?)<\/final_review\s*>/i);
   const body = block?.[1] || '';
@@ -139,7 +143,8 @@ export function parseFinalReview(raw: string): { result: 'pass' | 'issues'; note
   const blob = `${resultRaw}\n${notes}`.toLowerCase();
   const result =
     /\b(pass|ok|clean)\b/.test(resultRaw) &&
-    !/\b(issue|fail|gap|blank|white page|unstyled|not wired)\b/.test(blob)
+    !NEGATED_RESULT.test(resultRaw) &&
+    !/\b(issue|fail\w*|broken|gap|blank|white page|unstyled|not wired)\b/.test(blob)
       ? 'pass'
       : 'issues';
   return { result, notes: notes.slice(0, 4000) };
@@ -209,14 +214,9 @@ export function liveRoutePin(
   return { node: live, model: pin.model };
 }
 
-const FILE_NAME = /[A-Za-z0-9_.-]+\.(?:py|ts|tsx|js|jsx|json|md|html|css|go|rs)/g;
 const FIX_LANGUAGE =
   /\b(fix|polish|bug|bugs|broken|repair|correct|missing|incomplete|does not|doesn't|fail|fails|failing|error|errors)\b/i;
 const NEW_WORK = /\b(add|create|build|implement|introduce)\b/i;
-
-function fileNamesIn(text: string): string[] {
-  return [...text.matchAll(FILE_NAME)].map(m => m[0].toLowerCase());
-}
 
 function knownPaths(writtenPaths: string[]): Set<string> {
   const known = new Set<string>();
@@ -394,11 +394,13 @@ export function parseNextStep(raw: string): NextStepDecision | null {
     return null;
   }
   const word = (innerTag(block, 'decision') || block).toLowerCase();
-  const decision: NextDecision = /\bcontinue\b/.test(word)
-    ? 'continue'
-    : /\bdone\b|\bcomplete\b/.test(word)
-      ? 'done'
-      : 'ask';
+  const decision: NextDecision = NEGATED_DECISION.test(word)
+    ? 'ask'
+    : /\bcontinue\b/.test(word)
+      ? 'continue'
+      : /\bdone\b|\bcomplete\b/.test(word)
+        ? 'done'
+        : 'ask';
   const reason = innerTag(block, 'reason') || stripNextStepMarkup(text);
   const task = innerTag(block, 'task');
   if (decision === 'continue' && task.length < 8) {

@@ -208,6 +208,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
             >
               <MonacoEditor
                 height="100%"
+                path={activeTab.path}
                 language={activeTab.language}
                 theme="vs-dark"
                 value={activeTab.content}

@@ -87,6 +87,21 @@ export interface BenchmarkResult {
 
 export type NodeRole = 'coder' | 'reviewer' | 'docs' | 'planner';
 
+/** Conductor side-panel roles. Docs uses the coder pick. */
+export type ConductorRoleId = 'planner' | 'coder' | 'reviewer';
+
+/** Explicit computer + model for one Conductor role. Both fields are required. */
+export interface RoleRoutePick {
+  nodeId: string;
+  model: string;
+}
+
+/**
+ * Saved per-role routing. A missing role means Auto (the existing automatic
+ * routing). An old single Computer/Model selection is not copied in.
+ */
+export type RoleRoutes = Partial<Record<ConductorRoleId, RoleRoutePick>>;
+
 /** Hardware-matched specialized tier badge assigned by Smart Cluster Auto-Configurator / Cloud Strategist. */
 export type NodeSpecialty =
   | 'architect'
@@ -326,8 +341,15 @@ export interface AppSettings {
     { localTokensGenerated: number; frontierTokensUsed: number }
   >;
   explorerWidth?: number;
-  /** Outer Agent Conductor pane (conversation + orchestration columns) */
+  /**
+   * Legacy outer agent-pane width. The code column is `editorWidth` and the
+   * agent pane flexes. Still loaded so old settings files keep the key.
+   */
   chatWidth?: number;
+  /** Preferred code-column width. The agent pane takes leftover horizontal space. */
+  editorWidth?: number;
+  /** Hide the code column so the agent pane uses the full row. */
+  editorHidden?: boolean;
   /** Right orchestration column inside Agent Conductor */
   agentControlWidth?: number;
   /** Far-right Node Work column inside Agent Conductor */
@@ -344,8 +366,15 @@ export interface AppSettings {
   autoApplyWrites?: boolean;
   /** Reviewer continues without waiting. Missing on old settings files means on. */
   autoReview?: boolean;
+  /** Accept verdicts, plan picks, and failed steps without stopping. Missing means off. */
+  fullAuto?: boolean;
   /** Cloud Strategist: use Frontier model for Pass-1 Swarm task routing & node assignment when online. */
   cloudStrategistEnabled?: boolean;
+  /**
+   * Planner / Coder / Reviewer computer and model. Omit a role for Auto.
+   * Does not migrate the old single dropdown (that choice was not saved).
+   */
+  roleRoutes?: RoleRoutes;
   /**
    * Local MCP servers (stdio). JSON array: [{ "name", "command", "args": [] }].
    * Remote URLs are ignored. Empty = no MCP tools.
@@ -670,6 +699,7 @@ export interface ElectronAPI {
     output?: string;
     error?: string;
     timedOut?: boolean;
+    missingTsc?: boolean;
     mode?: string;
   }>;
   installWorkspaceDeps: (
@@ -812,12 +842,23 @@ export interface LiveConductorState {
   autoSelectEndpoint: boolean;
   autoApplyWrites: boolean;
   autoReview: boolean;
+  /** Saved Full auto toggle. Missing on a peer snapshot means off. */
+  fullAuto: boolean;
   includeActiveFile: boolean;
   /** True while this surface is running an agent/swarm turn. */
   isStreaming: boolean;
   activityLabel?: string;
+  /** @deprecated Replaced by roleRoutes. Ignored by current clients. */
   targetNodeId?: string;
+  /** @deprecated Replaced by roleRoutes. Ignored by current clients. */
   targetModel?: string;
+  /** Per-role computer and model. Missing role means Auto. */
+  roleRoutes?: RoleRoutes;
+  /**
+   * Web console only: this publish is a deliberate picker edit.
+   * Desktop persists it. Never stored in settings.json.
+   */
+  roleRoutesEdit?: boolean;
   executingPlanNotice?: string | null;
   /** Worker cards for the Node Work column, mirrored to the web console. */
   nodeWork?: PipelineStep[];

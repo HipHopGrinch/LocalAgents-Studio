@@ -13,7 +13,8 @@ import {
   inferTaskDependsOn,
   partitionSwarmTasksIntoWaves,
   type SwarmManifest,
-  type SwarmTask
+  type SwarmTask,
+  groupTscErrorsByFile
 } from './swarmContract';
 
 function task(partial: Partial<SwarmTask> & Pick<SwarmTask, 'filePath'>): SwarmTask {
@@ -239,5 +240,18 @@ assert.doesNotMatch(fileRepair, /SECRET_BODY_LINE/);
 assert.doesNotMatch(fileRepair, /DEVELOPMENT HOST/);
 assert.match(fileRepair, /<edit_file/);
 assert.match(fileRepair, /Do not rewrite the whole file/);
+
+// B-27: a sibling folder sharing the root's name prefix is not stripped
+const siblingErrors = groupTscErrorsByFile('D:/work/app2/src/a.ts(1,1): error TS2322: x', 'D:/work/app');
+assert.deepEqual([...siblingErrors.keys()], ['D:/work/app2/src/a.ts']);
+const insideErrors = groupTscErrorsByFile('D:\\work\\app\\src\\a.ts(1,1): error TS2322: x', 'D:/work/app');
+assert.deepEqual([...insideErrors.keys()], ['src/a.ts']);
+
+// B-28: unknown VRAM (0) is not described as 1 GB
+const noVramPrompt = buildLeadArchitectPrompt('task', 'tree', '', null, null, null, [
+  { ...roster[0], id: 'novram', hardware: hw(0) }
+]);
+assert.match(noVramPrompt, /15GB usable VRAM/);
+assert.doesNotMatch(noVramPrompt, / 1GB usable VRAM/);
 
 console.log('swarmContract.selftest ok');

@@ -2,6 +2,71 @@
 
 All notable changes to LocalAgents Studio are listed here. Older releases are summarized in [`AGENTS.md`](AGENTS.md) §6 and the [wiki](https://github.com/HipHopGrinch/LocalAgents-Studio/wiki/Whats-new).
 
+## Unreleased
+
+### Added
+
+- **Planner, Coder, and Reviewer each pick a computer and model.** Auto leaves that role on the usual routing, including Cloud for Swarm Pass 1. A model you pick is the one that runs, including a cloud model, and a finished turn no longer switches the selection. Each row sets that model's context window. The control waits while a run is streaming, because a context change reloads the model.
+- **Full auto (accept everything).** A new first checkbox in Automation, off by default. It saves files, accepts verdicts and plan picks, and keeps going past failed steps instead of pausing. A Reviewer reply with no Pass/Fail tag gets one re-ask, then counts as a Fail with the Reviewer's notes. Destructive commands, paid API calls, and a red typecheck still stop for you, and every retry cap still applies.
+- **Run log.** The **Log** button beside Compact (and Ctrl+K **Copy run log**) copies a summary and timeline of the Conductor session: each turn's node, model, context size, tokens and speed, retries and failovers, context shrinks, tool results, verify output, verdicts, heals, pauses, and errors. It is saved to `.localagents/logs/run-<chat>.md` in the project. Prompts, replies, file contents, command text, and API keys are never written.
+- **Resizable layout for large and full-screen windows.** Extra width now goes to the chat, and the code column keeps the width you drag it to. Splitters are easier to grab, double-click resets one, and arrow keys move it the way it points. Ctrl+K adds **Reset pane sizes** and **Toggle code editor** (opening a file shows it again). The terminal height follows the window.
+
+### Security
+
+- **Command denylist bypasses closed.**
+  - Recursive deletes through `rm`, `del`, `rd`, `ri`, `erase` and `rmdir` are blocked, as are `git reset --hard` / full-tree checkout variants and `Format-Volume`, `Clear-Disk`, `Initialize-Disk` and `Remove-Partition`.
+  - The renderer and main-process lists now agree.
+- **Workspace jail:** a file with more than one hardlink, or a dangling junction, is refused.
+- **In-app git:** the repository config can no longer run programs through GPG signing or clean/smudge filters, including filters defined in included config files.
+- **Web console:**
+  - Parallel logins can no longer bypass the lockout.
+  - Terminal output and Clear terminal require **Allow shell**.
+  - `image:generate` only reaches http(s) node URLs.
+- **Log redaction:** covers single-quoted secrets, `?key=` URL parameters and `user:pass@` URLs, and it runs before output is shortened.
+
+### Fixed
+
+- **A failed command could report `Exit code: 0`** when anything ran after it on the same line, so a failing verify could pass. A verify that timed out or never started also counted as a pass. Both now fail.
+- **Negated verdicts were read as approvals.** Replies such as "do not approve", "not ok", "do not continue" and "not complete" are now read correctly.
+- **Swarm reported success after Stop or with no file written.**
+  - Pass 1 no longer writes or locks the contract after Stop.
+  - A worker that wrote nothing is marked failed instead of "Completed".
+  - Aborted turns no longer show as Done.
+  - Stale "running" cards are cleared.
+- **Editor data loss:**
+  - An agent write to an open file now keeps your unsaved edits.
+  - Ctrl+Z after a tab switch no longer pastes in the other file.
+  - Ctrl+S no longer marks text typed during the save as saved.
+  - A failed delete keeps the tab.
+  - A deleted folder's open files can no longer recreate it.
+- **Chat and plan races:** a finished follow-up could be replaced by an older copy. Stop, chat switches and late reviews could also pause, log into or clear the status of a newer run. Undo could write a plan into the wrong chat.
+- **Routing:**
+  - Dense Qwen3 models were treated as the 30B MoE.
+  - `mixtral:8x7b` was treated as a small model.
+  - Words like "test" or "css" in a prompt sent coding work to the small scout GPU.
+  - Smart Auto-Configure can now pick 12K and 24K contexts.
+  - Hardware detection now reads every GPU and real VRAM above 4 GB.
+- **Desktop app:**
+  - A second launch focuses the running window.
+  - Quitting or crashing kills agent process trees first.
+  - `npm install` is no longer killed after 45 s without output.
+  - A pathological search regex can't freeze the app.
+  - The contract typecheck ignores errors in files it only imports.
+  - A project-chat save that ran before settings loaded could write defaults over `settings.json`.
+- **Writes into a new folder failed with "Path is outside the open workspace"** (1.3.0 regression). In a fresh project, Swarm stopped after Pass 1 because the contract (for example `src/types/swarm-contract.ts`) could not be written until `src/types/` already existed. The workspace check now validates the nearest existing folder, creates the missing ones, and checks again.
+- **The Run log now says why a Swarm stopped:** a contract that could not be written, no Lead Architect, no workers assigned, a failed contract repair, or a Pass 1 reply that fell back to the default task list. Send, Play and Retry are logged inside their run instead of before it.
+- **Reviews passed without a verdict.** A Reviewer that read a file used up its one follow-up, and the allowance was never reset between reviews, so later reviews got no turn to answer. An empty review then counted as clean. Each review now gets its own reads plus one final no-tools turn for the verdict, and a review that still gives none is logged as a missing verdict. The files a review starts with are sized to the Reviewer model's context, and an unclosed `<review_plan>` or `<review_delta>` is read.
+- **Web projects missing their setup files.** A request like "3d connect four webapp" got no `tsconfig.json`, `vite.config.ts`, `index.html` or `src/main.tsx`, and the follow-up steps created them one per step. After Pass 1, a project with a real web signal (`.tsx` files, React, Vite, "webapp", "website") gets the files no worker owns. Node, Electron, C# and C++ requests do not. `npm install` runs once after the last `package.json` change.
+- **Finished work was never typechecked.** When the follow-up steps finish, a TypeScript project is typechecked and gets at most two automatic fixes. A skipped or timed-out typecheck is reported as a failure, not a pass.
+- **Stuck escalation fired while a run was making progress,** and could "escalate" to the same model. A step that wrote a different file is not stuck, same-model escalations move to the next stage, and an explicit Coder pick is only left when you choose another model.
+- **"Work looks complete" after Stop,** and notices logged into the next run.
+- **"Step #N needs an explicit Pass or Fail" pause loop.** A verdict on the Reviewer's follow-up message (after it read files) was ignored, and Play re-ran the same review. The newest verdict for the active step is now used, a verdict naming a different step is ignored, and an unclosed `<step_verdict>` is read.
+- **Saved Coder writes treated as unsaved.** The check ran before the message list caught up, so a step that wrote its files paused (or failed) as if it had not.
+- **Accept, Retry, and Looks good / Continue did nothing after Stop.** They now start their own run.
+- **A stopped run could pause or join the next one,** including the final source review and Electron packaging.
+- **Restarting Studio with an active plan** shows the "Paused at …" checkpoint again.
+- **Review fixes, plan option picks, "Retry differently" and the paid-API solution kept running after Stop, or ran inside a new message.** Each of these runs a Planner or Coder turn and then a review, but each turn started its own run. A Send made between the turns cleared Stop, and the next turn then ran as part of that new message. When they ran inside another run, they could also cancel a Stop pressed just before. They now hold one run from start to finish, so Stop ends them and a new Send never picks them up.
+
 ## 1.3.1 — 2026-11-11
 
 Bug-fix release: Studio no longer shows work as still running after it has finished, failed, or been stopped. See [PR #5](https://github.com/HipHopGrinch/LocalAgents-Studio/pull/5).

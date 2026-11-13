@@ -83,4 +83,12 @@ const stay = pickImageTarget([imagePrimary, scout]);
 assert.equal(stay?.node.id, 'arch', 'a node whose primary is already the image model wins');
 assert.equal(coderModelToRewarm(stay!), null);
 
+const twoImageModels = node({
+  ...architect,
+  activeModel: 'flux-schnell',
+  models: [model('sdxl', 4), model('flux-schnell', 4)]
+});
+const pinnedWins = pickImageTarget([twoImageModels]);
+assert.equal(pinnedWins?.model, 'flux-schnell', 'only the exact pinned image model counts as primary');
+
 console.log('imageRouting.selftest ok');
